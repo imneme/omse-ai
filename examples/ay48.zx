@@ -1,0 +1,15 @@
+# 48 BASIC on a 128, typed with keyword entry, playing the AY by OUT.
+# A rising arpeggio on channel A: registers 0/1 = period, 7 = mixer, 8 = volume.
+boot128
+menu 48
+enter 10 LET s=65533: LET d=49149
+enter 20 OUT s,7: OUT d,62: OUT s,8: OUT d,15
+enter 30 FOR n=0 TO 24 STEP 4: LET p=INT (1773450/16/(261.63*2^(n/12)))
+enter 40 OUT s,0: OUT d,p-256*INT (p/256): OUT s,1: OUT d,INT (p/256): PAUSE 10: NEXT n
+enter 50 OUT s,8: OUT d,0
+ay
+enter RUN
+ready 400
+roll arpeggio 200
+aywav arpeggio
+screen

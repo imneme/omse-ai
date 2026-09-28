@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+# the built core
+lib/
+# what the tool (and the tests, in tests/out/) write when run from here
+out/
+snaps/
+# a virtual environment, if you make one here
+.venv/
+# scratch work
+scratch/
+# bring your own ROMs: they are not part of this repository
+roms/*.rom

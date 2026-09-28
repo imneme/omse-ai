@@ -1,0 +1,17 @@
+# SAVE to a TAP through the ROM, then LOAD it back on a fresh machine.
+#   ./speccy.py run examples/roundtrip.zx  -> out/roundtrip/roundtrip.tap
+# With tzxtools installed, list what was saved:
+#   tzxls out/roundtrip/roundtrip.tap ; tzxcat -B -b 1 out/roundtrip/roundtrip.tap
+# ($OUT in a step is the script's output folder.)
+enter 10 PRINT "saved and loaded"
+enter 20 BORDER 4
+enter SAVE "roundtrip" LINE 10
+ready 200
+say (the ROM says: Start tape, then press any key.)
+key ENTER
+ready 200
+savetape roundtrip
+boot
+load $OUT/roundtrip.tap
+wait 20
+screen

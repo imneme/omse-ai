@@ -1,0 +1,7 @@
+# Assemble a little Z80 program with pasmo and run it: border stripes racing
+# the beam.  Needs pasmo (MANUAL.md, "Optional tools").
+#   ./speccy.py run examples/stripes.zx     -> out/stripes/
+asm examples/stripes.asm
+load
+wait 5
+shot stripes

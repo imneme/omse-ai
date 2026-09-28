@@ -1,0 +1,16 @@
+# The smallest useful script: type a program, run it, look.
+#   ./speccy.py run examples/hello.zx      -> out/hello/
+enter 10 FOR i=0 TO 7: BORDER i: PRINT PAPER i; INK 9; " colour "; i; " ": BEEP 0.05, i*2: NEXT i
+enter 20 PRINT AT 12,4; FLASH 1; "hello from omse-ai"
+audio
+wait 2
+grab typed
+every 5
+enter RUN
+ready 200
+grab done
+sheet hello_run 4 hello.zx: typed in, then RUN
+wait 50
+shot hello_end
+screen
+wav hello
