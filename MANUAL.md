@@ -71,7 +71,7 @@ One step per line. `#` starts a comment. Frame counts take seconds too (`wait 2s
 | `joy RLDUF [N]` | Kempston joystick: the letters of the directions held, `F` for fire |
 | `tape PATH` / `load [PATH]` / `tapbas PATH.bas` | put a TAP in the deck / (insert it and) `LOAD ""` / a .bas made into a TAP in memory, then `LOAD ""` |
 | `asm PATH.asm [code]` | assemble with pasmo into `out/NAME.tap` with a BASIC loader (or a bare CODE block), put in the deck; `load` runs it |
-| `savetape NAME` | write what the program has SAVEd as a .tap |
+| `savetape NAME` | write what has been SAVEd as a .tap: every SAVE since the machine was booted, not only the latest |
 | `shot NAME [noborder] [xN]` | a PNG of the screen (2× unless `xN`) |
 | `every N` / `grab [LABEL]` / `sheet NAME [cols] [title]` | collect a frame every N frames while running / collect this one / write them as a contact sheet (`.png` and a `_960.jpg` preview) |
 | `gif NAME [fps] [scale]` | the collected frames as an animated GIF in the Spectrum's 16 colours (`every 2` gives 25 fps) |
@@ -179,7 +179,7 @@ You can't hear it, but you can measure it: pitch, timing, which channel, how lou
 
 ## Tapes and snapshots
 
-**LOAD is instant** through a trap on the ROM's LD-BYTES (an opcode fetch at `0x0562`, returning through `0x0555`). A block that doesn't match (wrong flag or length) is skipped whole, the way the real ROM skips a data block after an unwanted header. With no tape left, the ROM waits for edges, as a real machine does with the recorder stopped. **SAVE** goes through SA-BYTES (`0x04C2`) into `saved_tape()`, and `savetape` writes it out.
+**LOAD is instant** through a trap on the ROM's LD-BYTES (an opcode fetch at `0x0562`, returning through `0x0555`). A block that doesn't match (wrong flag or length) is skipped whole, the way the real ROM skips a data block after an unwanted header. With no tape left, the ROM waits for edges, as a real machine does with the recorder stopped. **SAVE** goes through SA-BYTES (`0x04C2`) into `saved_tape()`, and `savetape` writes it out. What's saved accumulates: after two SAVEs, a second `savetape` writes both, with the newest last, so a script that saves more than once wants the last header and data block of the file. From Python, `saved_tape(clear=True)` empties it after reading.
 
 **Only TAP files** are read. Convert a TZX with tzxtools' `tzxtap`; a `.z80` snapshot needs converting to SNA with another tool first.
 
