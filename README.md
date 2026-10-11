@@ -101,7 +101,7 @@ curl -fLO "$base/48.rom" && curl -fLO "$base/128-0.rom" && curl -fLO "$base/128-
 | `zxdis.py` | Z80 disassembly of the ROM or a file |
 | `src/zxcore.cpp` | the machine itself, a C library: Z80, ULA, keyboard, tape traps, 128K paging, AY, logs |
 | `src/z80.h`, `src/ay38910.h` | the Z80 and AY-3-8912 cores from Andre Weissflog's [chips](https://github.com/floooh/chips) |
-| `examples/` | scripts (`hello`, `roundtrip`, `ay48`, `stripes`) and `tour.py` |
+| `examples/` | scripts (`hello`, `roundtrip`, `ay48`, `stripes`), `tour.py`, and `film.py` (a tape filmed as an MP4 and a contact sheet) |
 | `tests/` | the tests, and `torture.bas` (every keyword on the keyboard) and `illegal.bas` (lines the ROM refuses) |
 | `roms/` | where your ROMs go |
 

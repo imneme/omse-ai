@@ -107,7 +107,7 @@ zx.record_ay(); ...; zxay.ay_notes(zx) # (128) [(channel, start_s, dur_s, midi, 
 zx.insert_tape('x.tap'); zx.saved_tape(); zx.save_sna('x.sna')
 ```
 
-`examples/tour.py` types a short program, runs it and reports what it did as text and numbers: the screen, the ROM's report, the notes the beeper played, a colour. It's a good place to start. For anything the script steps can do, `zxscript.Runner` runs a step from Python: `r = Runner('out/mine'); r.zx = zx; r.step('menu 48')`.
+`examples/tour.py` types a short program, runs it and reports what it did as text and numbers: the screen, the ROM's report, the notes the beeper played, a colour. It's a good place to start. `examples/film.py` films a tape (or a snapshot) from `LOAD ""` until the editor is waiting again, as an MP4 for people to watch (with ffmpeg; `--gif` without) and a contact sheet of twelve moments; its header says what it can't do: it types nothing, and it's silent. For anything the script steps can do, `zxscript.Runner` runs a step from Python: `r = Runner('out/mine'); r.zx = zx; r.step('menu 48')`.
 
 ## Adding your own steps
 
