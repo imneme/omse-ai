@@ -127,6 +127,13 @@ struct ZX {
     uint16_t hit_pc = 0;
 
     bool tape_traps = true;   // LD-BYTES / SA-BYTES served from the tape deck
+
+    // contention (docs/contention.md): on, where it starts, and the tracking it needs
+    bool contention = true;
+    int cont_start = 14335;   // T-states after INT goes up: 14335 on a 48K, 14361 on a 128
+    bool prev_mreq = false, prev_io = false;
+    int io_phase = 0;
+    uint64_t stalled = 0;     // T-states the ULA has held the CPU, since power-on
     bool nmi = false;         // an NMI requested: one tick of the NMI pin
 
     // divMMC: fitted or not, the EEPROM's write-protect jumper, port E3, the
@@ -421,6 +428,88 @@ static inline void redirect(ZX& z, uint16_t pc) {
 
 // -- the clock ------------------------------------------------------------------
 
+// The beam: 8 pixels every 4 T-states across the visible part of a line.
+static inline void beam(ZX& z) {
+    if (z.cyc < COLUMNS * 4 && (z.cyc & 3) == 0) {
+        int first = fb_first_line(z);
+        if (z.line >= first && z.line < first + FB_H) draw8(z);
+    }
+}
+
+// One T-state of the clock: the AY, the counters, the INT pin, the frame.
+static inline void advance(ZX& z) {
+    if (z.ay_record && z.model == 128 && (z.t & 1) == 0) {
+        if (ay38910_tick(&z.ay)) z.ay_samples.push_back(z.ay.sample);
+    }
+
+    z.t++;
+    z.cyc++;
+    if (z.line == 0) {
+        if (z.cyc == INT_AT) z.pins |= Z80_INT;
+        else if (z.cyc == INT_AT + z.int_len) z.pins &= ~Z80_INT;
+    }
+    if (z.cyc == z.t_line) {
+        z.cyc = 0;
+        if (++z.line == z.lines) {
+            z.line = 0;
+            z.frame++;
+            if (--z.flash_count == 0) {
+                z.flash_count = FLASH_FRAMES;
+                z.flash_inv = !z.flash_inv;
+            }
+        }
+    }
+}
+
+// -- contention ---------------------------------------------------------------
+// The ULA stops the CPU's clock while it reads the screen, when the CPU wants a
+// contended address at the wrong moment (docs/contention.md has the rule and its
+// sources). These are the pieces; tick() applies them.
+
+// Is this address contended?  4000-7FFF always (bank 5); on the 128, C000-FFFF
+// too while an odd bank (1, 3, 5, 7) is paged there.
+static inline bool contended(const ZX& z, uint16_t a) {
+    if ((a & 0xC000) == 0x4000) return true;
+    return z.model == 128 && (a & 0xC000) == 0xC000 && (z.slot3 & 1);
+}
+
+// The ULA's delay for a CPU T-state that wants a contended address now: 6, 5,
+// 4, 3, 2, 1, 0, 0 by position in each 8 T-states of the first 128 T of each of
+// the 192 screen lines, counted from cont_start T-states after INT goes up.
+static inline int contend_delay(const ZX& z) {
+    static const int PATTERN[8] = {6, 5, 4, 3, 2, 1, 0, 0};
+    int rel = z.line * z.t_line + z.cyc - INT_AT - z.cont_start;
+    if (rel < 0) return 0;
+    int col = rel % z.t_line;
+    if (rel / z.t_line >= 192 || col >= 128) return 0;
+    return PATTERN[col & 7];
+}
+
+// Does the ULA check the T-state the CPU has just shown on its pins?  Memory: a
+// cycle's T1 (MREQ with RD or WR: this core clears its control pins every tick,
+// so T2 shows MREQ alone and T3 nothing), or an internal T-state that doesn't
+// follow an MREQ T-state (so never T2 or T3, nor the fetch's T4 after the
+// refresh), when the address on the bus is contended. I/O (this core raises
+// IORQ from T1): by phase and port, as the ULA does it (port bit 0 low is its
+// own port; a contended high byte counts as memory).
+static inline bool contend_check(ZX& z, uint64_t p) {
+    const uint16_t a = Z80_GET_ADDR(p);
+    bool check;
+    if ((p & Z80_IORQ) && !(p & Z80_M1)) {
+        z.io_phase = z.prev_io ? z.io_phase + 1 : 1;
+        bool hc = contended(z, a);
+        if (!(a & 1)) check = z.io_phase == 2 || (hc && z.io_phase == 1);    // C:1, C:3 or N:1, C:3
+        else check = hc;                                                    // C:1 x4, or N:4
+    } else if (p & Z80_MREQ) {
+        check = (p & (Z80_RD | Z80_WR)) && !(p & Z80_RFSH) && contended(z, a);
+    } else {
+        check = !z.prev_mreq && !(p & Z80_IORQ) && contended(z, a);
+    }
+    z.prev_mreq = p & Z80_MREQ;
+    z.prev_io = (p & Z80_IORQ) && !(p & Z80_M1);
+    return check;
+}
+
 static inline void tick(ZX& z) {
     if (z.nmi) {                            // one tick of the NMI pin: the core takes the edge
         z.pins = z80_tick(&z.cpu, z.pins | Z80_NMI) & ~Z80_NMI;
@@ -428,12 +517,16 @@ static inline void tick(ZX& z) {
     } else {
         z.pins = z80_tick(&z.cpu, z.pins);
     }
-
-    // The beam: 8 pixels every 4 T-states across the visible part of a line.
-    if (z.cyc < COLUMNS * 4 && (z.cyc & 3) == 0) {
-        int first = fb_first_line(z);
-        if (z.line >= first && z.line < first + FB_H) draw8(z);
+    // contention: the ULA holds the CPU, and everything else runs on
+    if (z.contention && contend_check(z, z.pins)) {
+        for (int d = contend_delay(z); d > 0; d--) {
+            beam(z);
+            advance(z);
+            z.stalled++;
+        }
     }
+
+    beam(z);
 
     uint64_t p = z.pins;
     if (p & Z80_MREQ) {
@@ -519,27 +612,7 @@ static inline void tick(ZX& z) {
         z.pins = p;
     }
 
-    if (z.ay_record && z.model == 128 && (z.t & 1) == 0) {
-        if (ay38910_tick(&z.ay)) z.ay_samples.push_back(z.ay.sample);
-    }
-
-    z.t++;
-    z.cyc++;
-    if (z.line == 0) {
-        if (z.cyc == INT_AT) z.pins |= Z80_INT;
-        else if (z.cyc == INT_AT + z.int_len) z.pins &= ~Z80_INT;
-    }
-    if (z.cyc == z.t_line) {
-        z.cyc = 0;
-        if (++z.line == z.lines) {
-            z.line = 0;
-            z.frame++;
-            if (--z.flash_count == 0) {
-                z.flash_count = FLASH_FRAMES;
-                z.flash_inv = !z.flash_inv;
-            }
-        }
-    }
+    advance(z);
 }
 
 // Draw a whole frame from memory as it stands (no beam racing), so there is a
@@ -615,6 +688,7 @@ void zx_make_128(ZX* z, const uint8_t* rom0, const uint8_t* rom1) {
     z->lines = 311;
     z->screen_line0 = 63;
     z->int_len = 36;
+    z->cont_start = 14361;
     z->clock = 3546900;
     memcpy(z->rom[0], rom0, 0x4000);
     memcpy(z->rom[1], rom1, 0x4000);
@@ -931,6 +1005,12 @@ void zx_sd_log_get(ZX* z, uint64_t* out) {
     memcpy(out, z->sd.log.data(), z->sd.log.size() * sizeof(uint64_t));
 }
 void zx_sd_log_clear(ZX* z) { z->sd.log.clear(); }
+
+// Contention: on (the default, as a real machine) or off; and how many T-states
+// the ULA has held the CPU since power-on.
+void zx_contention(ZX* z, int on) { z->contention = on != 0; }
+int zx_contention_on(ZX* z) { return z->contention; }
+uint64_t zx_stalled(ZX* z) { return z->stalled; }
 
 int zx_text_len(ZX* z) { return (int)z->text.size(); }
 void zx_text_get(ZX* z, uint8_t* out) { memcpy(out, z->text.data(), z->text.size()); }

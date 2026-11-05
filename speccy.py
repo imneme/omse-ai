@@ -165,6 +165,7 @@ def _load_lib():
         'zx_sd_sectors': ([P], ctypes.c_uint32), 'zx_sd_timing': ([P, I, I, I, I], None),
         'zx_sd_log_len': ([P], I), 'zx_sd_log_get': ([P, ctypes.POINTER(ctypes.c_uint64)], None),
         'zx_sd_log_clear': ([P], None),
+        'zx_contention': ([P, I], None), 'zx_contention_on': ([P], I), 'zx_stalled': ([P], U64),
     }
     for name, (args, res) in sigs.items():
         f = getattr(lib, name)
@@ -586,6 +587,20 @@ class Speccy:
         if clear:
             self.lib.zx_tape_out_clear(self.z)
         return bytes(buf[:n])
+
+    # -- contention -----------------------------------------------------------
+    def contention(self, on=True):
+        """The ULA's contention, as a real 48K or 128 has it: on by default. While
+        the ULA reads the screen, the CPU waits to reach contended memory
+        (4000-7FFF, and on a 128 the odd banks at C000) and the ULA's port.
+        docs/contention.md has the rule and its sources. Off, every T-state is
+        the CPU's, as omse-ai was before."""
+        self.lib.zx_contention(self.z, 1 if on else 0)
+
+    @property
+    def stalled(self):
+        """T-states the ULA has held the CPU since power-on."""
+        return self.lib.zx_stalled(self.z)
 
     # -- divMMC and its SD card ------------------------------------------------
     def fit_divmmc(self, eeprom=None, card=None, writable=False, ram_kb=128, write_protect=True,

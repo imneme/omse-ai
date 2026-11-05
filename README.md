@@ -103,6 +103,7 @@ curl -fLO "$base/48.rom" && curl -fLO "$base/128-0.rom" && curl -fLO "$base/128-
 | `src/zxcore.cpp` | the machine itself, a C library: Z80, ULA, keyboard, tape traps, 128K paging, AY, divMMC, logs |
 | `src/sdcard.h` | the divMMC's SD card, in SPI mode |
 | `tools/mkfat.py` | SD-card images for the divMMC: FAT16 or FAT32 from a folder, and reading them back |
+| `docs/contention.md` | contention: the rule, its sources, how it's tested, and what's finessed |
 | `docs/divmmc.md` | the divMMC: how to drive it, the hardware it's held to, with sources, and its limits |
 | `src/z80.h`, `src/ay38910.h` | the Z80 and AY-3-8912 cores from Andre Weissflog's [chips](https://github.com/floooh/chips) |
 | `examples/` | scripts (`hello`, `roundtrip`, `ay48`, `stripes`), `tour.py`, and `film.py` (a tape filmed as an MP4 and a contact sheet) |
