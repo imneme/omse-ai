@@ -154,6 +154,34 @@ class Runner:
         """boot128: fresh Spectrum 128 (128-0.rom and 128-1.rom), at its menu"""
         self.zx = self.Speccy(model=128)
 
+    def do_divmmc(self, arg):
+        """divmmc EEPROM [CARD]: fit a divMMC (a power cycle) with that 8K EEPROM image (esxDOS's ESXMMC.BIN) and SD-card image, and boot it"""
+        parts = arg.split()
+        if not parts:
+            raise ValueError('divmmc needs an EEPROM image: divmmc ESXMMC.BIN [CARD.img]')
+        zx = self.need()
+        zx.fit_divmmc(self.path(parts[0]), card=self.path(parts[1]) if len(parts) > 1 else None)
+        n = zx.wait_ready(max_frames=1500)
+        self.say(f'divMMC fitted, ready after {n} frames' if n is not None else 'divMMC fitted (not at the editor yet)')
+
+    def do_sd(self, arg):
+        """sd IMAGE: put an SD-card image in the divMMC (not written: its writes stay in memory)"""
+        self.need().sd_insert(self.path(arg))
+
+    def do_dot(self, arg):
+        """dot .COMMAND ARGS: type an esxDOS dot command (dot .ls, dot .tapein game.tap) and wait for it to run"""
+        n = self.need().dot(arg.strip())
+        self.say(f'{arg.strip()}: done after {n} frames' if n is not None else f'{arg.strip()}: still running')
+
+    def do_nmi(self, arg):
+        """nmi: press the divMMC's NMI button (esxDOS's file browser)"""
+        self.need().nmi()
+
+    def do_sdlog(self, arg):
+        """sdlog: every command the SD card has been sent, with its R1"""
+        for name, a, r1 in self.need().sd_log():
+            print(f'{name:7s} {a:08X}  ' + ('ignored' if r1 is None else f'R1 {r1:02X}'))
+
     def do_menu(self, arg):
         """menu tape|128|calc|48|tester: pick from the 128's boot menu (tape = Tape Loader: LOAD "")"""
         items = ['tape', '128', 'calc', '48', 'tester']

@@ -19,6 +19,13 @@
 // and the bank store.  Banks 5 and 2 live in the flat view at 0x4000/0x8000;
 // if one is also paged in at 0xC000, writes are mirrored to both copies.
 //
+// divMMC (fitted on request): the interface's paging, automap and SPI, and an
+// SD card on its card-select 0 (sdcard.h).  Paging is by copying too: while
+// divMMC memory is mapped, the flat view's lower 16K holds the EEPROM (or RAM
+// bank 3) and the selected 8K RAM bank, and writes the hardware allows land
+// there; the bank is copied home when it's unmapped.  The details, each with
+// its source, are in docs/divmmc.md.
+//
 // Z80 and AY cores: floooh's chips z80.h and ay38910.h (zlib licence; the
 // licence text is at the top of each, and z80.h carries OMSE's modification
 // notice).  They are OMSE's copies, unchanged.
@@ -26,7 +33,9 @@
 #define CHIPS_IMPL
 #include "z80.h"
 #include "ay38910.h"
+#include "sdcard.h"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -42,6 +51,8 @@ constexpr int FLASH_FRAMES = 16;
 constexpr int FB_W = COLUMNS * 8;         // 352
 constexpr int FB_H = 288;                 // 48 lines of border above and below
 constexpr int AY_RATE = 44100;
+
+constexpr int DIV_EEPROM = -1;            // div_lower: the EEPROM, not a RAM bank
 
 // ROM addresses (48K ROM, which is ROM 1 on a 128)
 constexpr uint16_t ROM_RETN = 0x0072;      // RETN at the end of the NMI handler
@@ -114,6 +125,26 @@ struct ZX {
     std::vector<std::pair<uint16_t, uint16_t>> breaks;
     bool hit = false;
     uint16_t hit_pc = 0;
+
+    bool tape_traps = true;   // LD-BYTES / SA-BYTES served from the tape deck
+    bool nmi = false;         // an NMI requested: one tick of the NMI pin
+
+    // divMMC: fitted or not, the EEPROM's write-protect jumper, port E3, the
+    // automap latch, and what the flat view's lower 16K holds while mapped
+    bool div_fitted = false;
+    bool div_wp = true;
+    uint8_t div_ctrl = 0;
+    bool div_automap = false;
+    bool div_mapped = false;
+    int div_lower = DIV_EEPROM;   // DIV_EEPROM or RAM bank 3, at 0x0000
+    int div_upper = 0;            // the RAM bank at 0x2000
+    bool div_lower_wr = false, div_upper_wr = false;
+    int div_banks = 16;           // 8K RAM banks: 16 (128K) or 64 (512K)
+    uint8_t div_eeprom[0x2000];
+    std::vector<std::array<uint8_t, 0x2000>> div_ram;
+    uint8_t div_cs = 0xFF;        // port E7: card selects, active low
+    uint8_t div_spi = 0xFF;       // what the last SPI transfer received
+    SDCard sd;
 };
 
 // -- 128K paging --------------------------------------------------------------
@@ -129,7 +160,7 @@ static void page_slot3(ZX& z, int nb) {
 
 static void page_rom(ZX& z, int r) {
     if (r == z.rom_sel) return;
-    memcpy(z.mem, z.rom[r], 0x4000);
+    if (!z.div_mapped) memcpy(z.mem, z.rom[r], 0x4000);   // else it's copied in at divMMC's unmap
     z.rom_sel = r;
 }
 
@@ -150,8 +181,75 @@ static uint8_t* bank_ptr(ZX& z, int b) {
     return z.bank[b];
 }
 
+// -- divMMC paging -------------------------------------------------------------
+
+static const uint8_t* rom_now(const ZX& z) { return z.rom[z.model == 48 ? 1 : z.rom_sel]; }
+
+// The live 8K pages, back to their homes (only what could have been written).
+static void div_save(ZX& z) {
+    if (!z.div_mapped) return;
+    if (z.div_lower_wr) memcpy(z.div_eeprom, z.mem, 0x2000);
+    if (z.div_upper_wr) memcpy(z.div_ram[z.div_upper].data(), z.mem + 0x2000, 0x2000);
+}
+
+// What should be at 0x0000-0x3FFF now, from port E3, the automap latch and the
+// write-protect jumper (Fuse's divxxx_refresh_page_state and memory_map):
+//   CONMEM: always mapped; EEPROM below, writable only without write-protect,
+//     the selected bank above, writable.
+//   else, while automapped, and only with write-protect on or MAPRAM set:
+//     MAPRAM: bank 3 below, read-only; the bank above, read-only if it's 3.
+//     no MAPRAM: EEPROM below, read-only; the bank above, writable.
+static void div_refresh(ZX& z) {
+    bool map = false, lw = false, uw = false;
+    int lo = DIV_EEPROM, up = z.div_ctrl & (z.div_banks - 1);
+    if (z.div_ctrl & 0x80) {
+        map = true;
+        lw = !z.div_wp;
+        uw = true;
+    } else if (z.div_automap && (z.div_wp || (z.div_ctrl & 0x40))) {
+        map = true;
+        if (z.div_ctrl & 0x40) {
+            lo = 3;
+            uw = up != 3;
+        } else {
+            uw = true;
+        }
+    }
+    if (map == z.div_mapped && (!map || (lo == z.div_lower && up == z.div_upper
+                                         && lw == z.div_lower_wr && uw == z.div_upper_wr))) return;
+    div_save(z);
+    if (map) {
+        memcpy(z.mem, lo == DIV_EEPROM ? z.div_eeprom : z.div_ram[lo].data(), 0x2000);
+        memcpy(z.mem + 0x2000, z.div_ram[up].data(), 0x2000);
+    } else if (z.div_mapped) {
+        memcpy(z.mem, rom_now(z), 0x4000);
+    }
+    z.div_mapped = map;
+    z.div_lower = lo;
+    z.div_upper = up;
+    z.div_lower_wr = lw;
+    z.div_upper_wr = uw;
+}
+
+// Power on: port E3 cleared (MAPRAM too), automap off, the card powered up.
+static void div_power(ZX& z) {
+    if (z.div_mapped) {
+        div_save(z);
+        memcpy(z.mem, rom_now(z), 0x4000);
+        z.div_mapped = false;
+    }
+    z.div_ctrl = 0;
+    z.div_automap = false;
+    z.div_cs = 0xFF;
+    z.div_spi = 0xFF;
+    z.sd.power();
+}
+
 static inline void mem_write(ZX& z, uint16_t a, uint8_t v) {
-    if (a < 0x4000) return;
+    if (a < 0x4000) {
+        if (z.div_mapped && (a < 0x2000 ? z.div_lower_wr : z.div_upper_wr)) z.mem[a] = v;
+        return;
+    }
     z.mem[a] = v;
     if (z.slot3 == 5) {
         if (a >= 0xC000) z.mem[a - 0x8000] = v;
@@ -222,6 +320,13 @@ static uint8_t io_read(ZX& z, uint16_t addr) {
         return v | (z.ear ? 0x40 : 0);
     }
     if (z.model == 128 && (addr & 0x8002) == 0x8000) return ay_read(z, addr);
+    if (z.div_fitted && (addr & 0xFF) == 0xEB) {
+        // SPI: an IN returns what the *previous* transfer received, and starts
+        // a new one sending FF (the Next's spi_master.vhd, the ZX-Uno's spi.v)
+        uint8_t v = z.div_spi;
+        z.div_spi = z.sd.xfer(0xFF, (z.div_cs & 3) == 2);
+        return v;
+    }
     if ((addr & 0xE0) == 0) return z.kempston;  // Kempston joystick, 0x1F
     return 0xFF;
 }
@@ -238,6 +343,22 @@ static void io_write(ZX& z, uint16_t addr, uint8_t v) {
     if (z.model == 128) {
         if ((addr & 0x8002) == 0x8000) ay_write(z, addr, v);
         else if ((addr & 0x8002) == 0x0000) write_7ffd(z, v);
+    }
+    if (z.div_fitted) {                     // decoded on A0-A7 only
+        switch (addr & 0xFF) {
+        case 0xE3:                          // control; MAPRAM can be set, never cleared
+            z.div_ctrl = v | (z.div_ctrl & 0x40);
+            div_refresh(z);
+            break;
+        case 0xE7:                          // card selects: bit 0 is card 0, active low
+            z.div_cs = v;
+            break;
+        case 0xEB:                          // SPI: send v, keep what comes back
+            z.div_spi = z.sd.xfer(v, (z.div_cs & 3) == 2);
+            break;
+        default:
+            break;
+        }
     }
 }
 
@@ -301,7 +422,12 @@ static inline void redirect(ZX& z, uint16_t pc) {
 // -- the clock ------------------------------------------------------------------
 
 static inline void tick(ZX& z) {
-    z.pins = z80_tick(&z.cpu, z.pins);
+    if (z.nmi) {                            // one tick of the NMI pin: the core takes the edge
+        z.pins = z80_tick(&z.cpu, z.pins | Z80_NMI) & ~Z80_NMI;
+        z.nmi = false;
+    } else {
+        z.pins = z80_tick(&z.cpu, z.pins);
+    }
 
     // The beam: 8 pixels every 4 T-states across the visible part of a line.
     if (z.cyc < COLUMNS * 4 && (z.cyc & 3) == 0) {
@@ -313,9 +439,15 @@ static inline void tick(ZX& z) {
     if (p & Z80_MREQ) {
         const uint16_t a = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
+            // divMMC's instant automap: an opcode fetch at 3D00-3DFF reads divMMC memory
+            if ((p & Z80_M1) && z.div_fitted && (a & 0xFF00) == 0x3D00 && !z.div_automap) {
+                z.div_automap = true;
+                div_refresh(z);
+            }
             Z80_SET_DATA(p, z.mem[a]);
             z.pins = p;
             if (p & Z80_M1) {
+                bool trapped = false;
                 if (z.execmap_on && (z.execmap_bank < 0 || z.slot3 == z.execmap_bank)) z.execmap[a]++;
                 for (auto& br : z.breaks) {
                     if (a >= br.first && a <= br.second) {
@@ -323,15 +455,21 @@ static inline void tick(ZX& z) {
                         z.hit_pc = a;
                     }
                 }
-                // ROM traps: only when the 48K BASIC ROM is paged in
-                if (a < 0x4000 && (z.model == 48 || z.rom_sel == 1)) {
+                // ROM traps: only when the 48K BASIC ROM is paged in (and not divMMC's memory)
+                if (a < 0x4000 && !z.div_mapped && (z.model == 48 || z.rom_sel == 1)) {
                     switch (a) {
                         case ROM_LD_BYTES_IN:
-                            if (trap_ld_bytes(z)) redirect(z, ROM_RET);
+                            if (z.tape_traps && trap_ld_bytes(z)) {
+                                redirect(z, ROM_RET);
+                                trapped = true;
+                            }
                             break;
                         case ROM_SA_BYTES:
-                            trap_sa_bytes(z);
-                            redirect(z, ROM_RET);
+                            if (z.tape_traps) {
+                                trap_sa_bytes(z);
+                                redirect(z, ROM_RET);
+                                trapped = true;
+                            }
                             break;
                         case ROM_CHAN_OPEN:
                             z.cur_stream = z.cpu.a;
@@ -344,6 +482,23 @@ static inline void tick(ZX& z) {
                             break;
                         default:
                             break;
+                    }
+                }
+                // divMMC's automap, after this fetch: the entry points map it in,
+                // the off-area 1FF8-1FFF maps it out (a fetch the tape deck served
+                // with a redirect never reached 0562's code, so doesn't count)
+                if (z.div_fitted && !trapped) {
+                    if ((a & 0xFFF8) == 0x1FF8) {
+                        if (z.div_automap) {
+                            z.div_automap = false;
+                            div_refresh(z);
+                        }
+                    } else if (a == 0x0000 || a == 0x0008 || a == 0x0038 || a == 0x0066
+                               || a == 0x04C6 || a == 0x0562) {
+                        if (!z.div_automap) {
+                            z.div_automap = true;
+                            div_refresh(z);
+                        }
                     }
                 }
             }
@@ -409,6 +564,7 @@ static void ay_setup(ZX& z) {
 }
 
 static void power_on(ZX& z) {
+    div_power(z);
     z.pins = z80_init(&z.cpu);
     memset(z.keys, 0xFF, sizeof z.keys);
     z.kempston = 0;
@@ -477,6 +633,7 @@ int zx_paging(ZX* z) { return z->last_7ffd | (z->slot3 & 7) | (z->rom_sel << 4) 
 void zx_reset(ZX* z) {
     memset(z->mem + 0x4000, 0, 0xC000);
     memset(z->bank, 0, sizeof z->bank);
+    for (auto& b : z->div_ram) b.fill(0);
     power_on(*z);
 }
 
@@ -692,6 +849,85 @@ void zx_ay_log_get(ZX* z, uint64_t* out) {
     memcpy(out, z->ay_log.data(), z->ay_log.size() * sizeof(uint64_t));
 }
 void zx_ay_log_clear(ZX* z) { z->ay_log.clear(); }
+
+// -- divMMC and its SD card ------------------------------------------------------
+
+// Fit a divMMC: its 8K EEPROM (eeprom NULL: blank, all FF), 128 or 512 K of RAM,
+// and the EEPROM's write-protect jumper (wp 1, as in use: automap needs it, or
+// MAPRAM).  Then a power cycle, as fitting one takes.  Choose the model first.
+// Returns 0, or -1 if ram_kb is neither 128 nor 512.
+int zx_div_fit(ZX* z, const uint8_t* eeprom, int len, int ram_kb, int wp) {
+    if (ram_kb != 128 && ram_kb != 512) return -1;
+    div_power(*z);
+    z->div_fitted = true;
+    z->div_wp = wp != 0;
+    z->div_banks = ram_kb / 8;
+    z->div_ram.assign(z->div_banks, {});
+    memset(z->div_eeprom, 0xFF, sizeof z->div_eeprom);
+    if (eeprom) memcpy(z->div_eeprom, eeprom, len < 0x2000 ? len : 0x2000);
+    zx_reset(z);
+    return 0;
+}
+
+// Take it off again (and power-cycle).
+void zx_div_unfit(ZX* z) {
+    div_power(*z);
+    z->div_fitted = false;
+    zx_reset(z);
+}
+
+void zx_div_wp(ZX* z, int wp) {
+    z->div_wp = wp != 0;
+    div_refresh(*z);
+}
+
+// fitted, port E3, automap, mapped, lower (-1 EEPROM, else a bank), upper bank,
+// port E7, write-protect, RAM banks, lower writable, upper writable
+void zx_div_state(ZX* z, int* out) {
+    int v[11] = {z->div_fitted, z->div_ctrl, z->div_automap, z->div_mapped, z->div_lower,
+                 z->div_upper, z->div_cs, z->div_wp, z->div_banks, z->div_lower_wr, z->div_upper_wr};
+    memcpy(out, v, sizeof v);
+}
+
+// The EEPROM's 8K, brought up to date first.
+uint8_t* zx_div_eeprom(ZX* z) {
+    div_save(*z);
+    return z->div_eeprom;
+}
+
+// RAM bank b's 8K wherever it is now (the flat view, while mapped there).
+uint8_t* zx_div_ram(ZX* z, int b) {
+    if (!z->div_fitted) return nullptr;
+    b &= z->div_banks - 1;
+    if (z->div_mapped && z->div_upper == b) return z->mem + 0x2000;
+    if (z->div_mapped && z->div_lower == b) return z->mem;
+    return z->div_ram[b].data();
+}
+
+// The divMMC's NMI button (esxDOS's browser): one pulse on the Z80's NMI.
+void zx_nmi(ZX* z) { z->nmi = true; }
+
+// omse-ai's tape deck traps LD-BYTES and SA-BYTES; off, they run as on a real
+// machine (so esxDOS's tape emulation sees every LOAD and SAVE).
+void zx_tape_traps(ZX* z, int on) { z->tape_traps = on != 0; }
+
+// An image of 512-byte sectors, as the card in slot 0.  Read-only, writes go to
+// memory and the file is untouched.  0, or -1 (can't open) or -2 (not whole
+// sectors).
+int zx_sd_insert(ZX* z, const char* path, int writable) { return z->sd.insert(path, writable != 0); }
+void zx_sd_eject(ZX* z) { z->sd.eject(); }
+uint32_t zx_sd_sectors(ZX* z) { return z->sd.sectors; }
+void zx_sd_timing(ZX* z, int ncr, int nac, int busy, int init_tries) {
+    z->sd.ncr = ncr;
+    z->sd.nac = nac;
+    z->sd.busy = busy;
+    z->sd.init_tries = init_tries;
+}
+int zx_sd_log_len(ZX* z) { return (int)z->sd.log.size(); }
+void zx_sd_log_get(ZX* z, uint64_t* out) {
+    memcpy(out, z->sd.log.data(), z->sd.log.size() * sizeof(uint64_t));
+}
+void zx_sd_log_clear(ZX* z) { z->sd.log.clear(); }
 
 int zx_text_len(ZX* z) { return (int)z->text.size(); }
 void zx_text_get(ZX* z, uint8_t* out) { memcpy(out, z->text.data(), z->text.size()); }

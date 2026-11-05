@@ -26,7 +26,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LIB_PATH = HERE / 'lib' / ('libzxcore.dylib' if sys.platform == 'darwin' else 'libzxcore.so')
-LIB_SOURCES = [HERE / 'src' / n for n in ('zxcore.cpp', 'z80.h', 'ay38910.h')]
+LIB_SOURCES = [HERE / 'src' / n for n in ('zxcore.cpp', 'z80.h', 'ay38910.h', 'sdcard.h')]
 
 # The ROMs: a folder holding 48.rom, 128-0.rom and 128-1.rom (the names OMSE
 # and most emulators use).  $OMSE_AI_ROMS, or roms/ next to this file.
@@ -157,6 +157,14 @@ def _load_lib():
         'zx_ear': ([P], I),
         'zx_text_len': ([P], I), 'zx_text_get': ([P, U8P], None), 'zx_text_clear': ([P], None),
         'zx_execmap': ([P, I, I], None), 'zx_execmap_get': ([P], P),
+        'zx_div_fit': ([P, ctypes.c_char_p, I, I, I], I), 'zx_div_unfit': ([P], None),
+        'zx_div_wp': ([P, I], None), 'zx_div_state': ([P, ctypes.POINTER(ctypes.c_int)], None),
+        'zx_div_eeprom': ([P], P), 'zx_div_ram': ([P, I], P), 'zx_nmi': ([P], None),
+        'zx_tape_traps': ([P, I], None),
+        'zx_sd_insert': ([P, ctypes.c_char_p, I], I), 'zx_sd_eject': ([P], None),
+        'zx_sd_sectors': ([P], ctypes.c_uint32), 'zx_sd_timing': ([P, I, I, I, I], None),
+        'zx_sd_log_len': ([P], I), 'zx_sd_log_get': ([P, ctypes.POINTER(ctypes.c_uint64)], None),
+        'zx_sd_log_clear': ([P], None),
     }
     for name, (args, res) in sigs.items():
         f = getattr(lib, name)
@@ -505,6 +513,8 @@ class Speccy:
             pc = self.run_until(*stops, frames=max_frames - (self.frame - start))
             if pc is None:
                 return False
+            if self.divmmc_mapped():
+                continue              # divMMC's own code at that address, not the ROM's
             if pc == 0x1F3D:
                 return True
             if not (self.peek(FLAGS) & 0x20) and not (self.peek(TV_FLAG) & 0x08):
@@ -576,6 +586,112 @@ class Speccy:
         if clear:
             self.lib.zx_tape_out_clear(self.z)
         return bytes(buf[:n])
+
+    # -- divMMC and its SD card ------------------------------------------------
+    def fit_divmmc(self, eeprom=None, card=None, writable=False, ram_kb=128, write_protect=True,
+                   boot_frames=None):
+        """Fit a divMMC, as on a real machine: power off, plug it in, power on.
+        eeprom is its 8K EEPROM image (a path or bytes; None: blank, all FF),
+        card an SD-card image to put in it first (sd_insert), ram_kb 128 or 512,
+        write_protect the EEPROM's jumper (on, as in use: automap needs it).
+        Then it boots (esxDOS looks at the card) for boot_frames frames."""
+        data = Path(eeprom).read_bytes() if isinstance(eeprom, (str, Path)) else eeprom
+        if data is not None and len(data) != 8192:
+            raise ValueError(f'a divMMC EEPROM image is 8192 bytes, not {len(data)}')
+        if card is not None:
+            self.sd_insert(card, writable)
+        if self.lib.zx_div_fit(self.z, data, len(data) if data else 0, ram_kb,
+                               1 if write_protect else 0) != 0:
+            raise ValueError(f'a divMMC has 128 or 512 K of RAM, not {ram_kb}')
+        self._keys_down.clear()
+        self._apply_keys()
+        if boot_frames is None:
+            boot_frames = 150 if self.model == 48 else 200
+        if boot_frames:
+            self.run(boot_frames)
+
+    def sd_insert(self, path, writable=False):
+        """Put an SD-card image (whole 512-byte sectors) in the divMMC's slot.
+        Not writable (the default), the card still takes writes, into memory,
+        and the file is left as it was."""
+        r = self.lib.zx_sd_insert(self.z, str(path).encode(), 1 if writable else 0)
+        if r == -1:
+            raise FileNotFoundError(f'{path}: cannot open it' + (' for writing' if writable else ''))
+        if r == -2:
+            raise ValueError(f'{path}: an SD-card image is whole 512-byte sectors')
+
+    def sd_eject(self):
+        self.lib.zx_sd_eject(self.z)
+
+    def sd_timing(self, ncr=1, nac=1, busy=2, init_tries=2):
+        """The card's delays, in SPI bytes: before a response (N_CR, 0-8 on a
+        real SD card), before a data block (N_AC), busy after a write; and how
+        many ACMD41s it takes to leave the idle state."""
+        self.lib.zx_sd_timing(self.z, ncr, nac, busy, init_tries)
+
+    def sd_log(self, clear=False):
+        """Every command the card has had: (name, argument, R1), where name is
+        'CMD17' or 'ACMD41', and R1 is None when the card ignored it (before
+        it's awake and in SPI mode)."""
+        n = self.lib.zx_sd_log_len(self.z)
+        buf = (ctypes.c_uint64 * max(n, 1))()
+        self.lib.zx_sd_log_get(self.z, buf)
+        if clear:
+            self.lib.zx_sd_log_clear(self.z)
+        out = []
+        for v in buf[:n]:
+            r1 = v & 0xFF
+            name = ('ACMD' if v >> 47 & 1 else 'CMD') + str(v >> 40 & 0x3F)
+            out.append((name, v >> 8 & 0xFFFFFFFF, None if r1 == 0xFF else r1))
+        return out
+
+    def divmmc_state(self):
+        """The divMMC as it stands: fitted, port E3 (conmem, mapram, bank),
+        automap, mapped, what's at 0000 ('eeprom' or a RAM bank) and the bank
+        at 2000 and whether each can be written now, the card selects (port E7)
+        and the write-protect jumper."""
+        v = (ctypes.c_int * 11)()
+        self.lib.zx_div_state(self.z, v)
+        return {'fitted': bool(v[0]), 'control': v[1], 'conmem': bool(v[1] & 0x80),
+                'mapram': bool(v[1] & 0x40), 'bank': v[1] & (v[8] - 1) if v[8] else 0,
+                'automap': bool(v[2]), 'mapped': bool(v[3]),
+                'lower': 'eeprom' if v[4] < 0 else v[4], 'upper': v[5], 'cs': v[6],
+                'write_protect': bool(v[7]), 'banks': v[8],
+                'lower_writable': bool(v[3] and v[9]), 'upper_writable': bool(v[3] and v[10])}
+
+    def divmmc_mapped(self):
+        """True while divMMC memory is at 0000-3FFF, so an address there is
+        divMMC's code, not the ROM's (a breakpoint can't tell them apart)."""
+        v = (ctypes.c_int * 11)()
+        self.lib.zx_div_state(self.z, v)
+        return bool(v[3])
+
+    def divmmc_eeprom(self):
+        return bytes((ctypes.c_uint8 * 8192).from_address(self.lib.zx_div_eeprom(self.z)))
+
+    def divmmc_ram(self, bank):
+        a = self.lib.zx_div_ram(self.z, bank)
+        if not a:
+            raise ValueError('no divMMC fitted')
+        return bytes((ctypes.c_uint8 * 8192).from_address(a))
+
+    def dot(self, command, max_frames=1000):
+        """Type an esxDOS dot command (`.ls`, `.tapein game.tap`) and wait for it
+        to finish: type() it, then wait_ready(). Returns the frames it took, or
+        None if it hadn't finished after max_frames."""
+        start = self.frame
+        self.type(command if command.endswith('\n') else command + '\n')
+        return None if self.wait_ready(max_frames=max_frames) is None else self.frame - start
+
+    def nmi(self):
+        """The divMMC's NMI button (esxDOS's file browser), or any NMI: one pulse."""
+        self.lib.zx_nmi(self.z)
+
+    def tape_traps(self, on=True):
+        """omse-ai's tape deck serves LOAD and SAVE by trapping LD-BYTES and
+        SA-BYTES. Off, they run as on a real machine, so esxDOS's tape
+        emulation (.tapein, .tapeout) sees them."""
+        self.lib.zx_tape_traps(self.z, 1 if on else 0)
 
     # -- sound ---------------------------------------------------------------
     def record_ay(self, on=True):

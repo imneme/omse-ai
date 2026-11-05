@@ -2,7 +2,7 @@
 
 omse-ai is a ZX Spectrum 48K and 128K with no window, no speaker and no keyboard. You drive it from a script or from Python, and it tells you what happened: as text, as numbers, and as pictures and sound files you can open later. This manual covers everything; README.md is the short version, and AGENTS.md has the rules that matter most if you're an agent driving it.
 
-Contents: [Running it](#running-it) · [Settings](#settings) · [Script steps](#script-steps) · [Python](#python) · [Adding your own steps](#adding-your-own-steps) · [How typing works](#how-typing-works) · [What fights you](#what-fights-you) · [Seeing](#seeing) · [Hearing](#hearing) · [Tapes and snapshots](#tapes-and-snapshots) · [The 128](#the-128) · [Spectrum BASIC, learned the hard way](#spectrum-basic-learned-the-hard-way) · [Machine code](#machine-code) · [Optional tools](#optional-tools) · [The core](#the-core) · [Limits](#limits)
+Contents: [Running it](#running-it) · [Settings](#settings) · [Script steps](#script-steps) · [Python](#python) · [Adding your own steps](#adding-your-own-steps) · [How typing works](#how-typing-works) · [What fights you](#what-fights-you) · [Seeing](#seeing) · [Hearing](#hearing) · [Tapes and snapshots](#tapes-and-snapshots) · [The 128](#the-128) · [divMMC and esxDOS](#divmmc-and-esxdos) · [Spectrum BASIC, learned the hard way](#spectrum-basic-learned-the-hard-way) · [Machine code](#machine-code) · [Optional tools](#optional-tools) · [The core](#the-core) · [Limits](#limits)
 
 ## Running it
 
@@ -194,6 +194,12 @@ You can't hear it, but you can measure it: pitch, timing, which channel, how lou
 - **Typing in 128 BASIC isn't supported yet**: its editor is a different program, in ROM 0, and `type()` knows the 48K one. Use `menu 48`, or make a TAP (speccy-basic knows the PLAY keyword) and use Tape Loader. Plain keystrokes do work, since the 128 editor tokenises the line on ENTER; its idle loop is at ROM 0 `0x3683`.
 - **128 programs play the AY**, so record it: `ay`, run, then `roll` and `aywav`.
 
+## divMMC and esxDOS
+
+`fit_divmmc(eeprom, card=...)` fits a **divMMC**, the interface that puts an SD card on a Spectrum, and power-cycles, so the EEPROM's firmware boots. With esxDOS's `ESXMMC.BIN` (from esxdos.org; it isn't included) and a card image holding esxDOS's `SYS` and `BIN`, it boots to esxDOS, and BASIC gets dot commands: `zx.dot('.ls')`, then `zx.dot('.tapein game.tap')` and `zx.type('LOAD ""\n')` loads from the card. `tools/mkfat.py build esx.img FOLDER` makes a card image from a folder (FAT16, as real cards are formatted; plain Python). `nmi()` presses the NMI button, and `sd_log()` lists every command the card was sent.
+
+**It's held to the hardware**: the paging and automap as Fuse and the Next's FPGA core do them, and the SPI port as the Next's and ZX-Uno's cores do it (a read returns the byte from the *previous* transfer, which Fuse gets wrong in the kind direction). The card is a strict SDHC card: it wants its wake-up clocks, correct CRCs on CMD0 and CMD8, polling for its responses, and a loop while it initialises. **docs/divmmc.md** has every detail with its source, the card's command set, how the tape deck and esxDOS's tape emulation share LD-BYTES, and the limits (snapshots don't hold the divMMC).
+
 ## Spectrum BASIC, learned the hard way
 
 **Loading a TAP skips the syntax check that typing does.** `FOR ii = …` passed speccy-basic and loaded from a TAP without complaint, then stopped at RUN with "C Nonsense in BASIC". So typing a program in (`basic`) is the stricter test, and `lint` does it for a whole file. **FOR variables, string variables and array names must be single letters** (`FOR ii`, `LET ab$`, `DIM ab(3)` are all refused); long *numeric* names like `score` are fine. `lint tests/illegal.bas` accepts 5 of 8 lines; `lint tests/illegal.bas min` accepts all 8, because `min` renames `ii` to `I` and `ab$` to `A$` first. A good workflow: write readable long names, let speccy-basic's `--minimize` rename them, then lint what the ROM will actually see.
@@ -230,14 +236,15 @@ Code called from BASIC with `USR` must **preserve the alternate HL'**, which the
 
 ## The core
 
-`src/zxcore.cpp` is the machine, as a C library with no dependencies beyond the two chips headers: the Z80, the ULA racing the beam, the keyboard matrix, Kempston joystick, 128K paging and the AY, tape traps, and the logs (beeper edges, AY register writes, printed text). `make` builds `lib/libzxcore.dylib` on macOS or `lib/libzxcore.so` elsewhere, and `speccy.py` rebuilds it by itself when the source is newer. The functions are all `zx_*` and all listed, with their C types, in `_load_lib()` in `speccy.py`; `zx.lib` gives you them directly.
+`src/zxcore.cpp` is the machine, as a C library with no dependencies beyond the two chips headers: the Z80, the ULA racing the beam, the keyboard matrix, Kempston joystick, 128K paging and the AY, the divMMC (with its SD card in `src/sdcard.h`), tape traps, and the logs (beeper edges, AY register writes, printed text). `make` builds `lib/libzxcore.dylib` on macOS or `lib/libzxcore.so` elsewhere, and `speccy.py` rebuilds it by itself when the source is newer. The functions are all `zx_*` and all listed, with their C types, in `_load_lib()` in `speccy.py`; `zx.lib` gives you them directly.
 
 It began as OMSE, Melissa O'Neill's emulator. The beam-racing ULA, the timing and the SNA loading come from a stripped-down 48K version of it (including loading a snapshot by jumping to the ROM's `RETN` at `0x0072`, so the snapshot's own stack supplies the PC). The tape traps, print interception, 128K paging, port decoding and AY hookup come from OMSE itself. What changed: no SDL; the screen goes into an indexed framebuffer; the keyboard matrix is set by the caller; sound is logged rather than played; snapshots can be saved at any frame; tapes come in as bytes.
 
 ## Limits
 
 - **No contention.** Memory and I/O contention aren't emulated, so code that races the beam to the exact T-state (some demos, some multicolour effects) will be slightly off.
-- **TAP and SNA only.** No TZX, `.z80` or disk images.
+- **TAP and SNA only**, and SD-card images on a divMMC. No TZX, `.z80` or floppy images.
+- **Snapshots don't hold the divMMC** (SNA has no room): loading one power-cycles the interface.
 - **Typing is for the 48K editor** (on a 48K, or in 48 BASIC on a 128). 128 BASIC takes plain keystrokes only.
 - **`screen` reads 8×8 characters only**, in the current font.
 - **The AY exists only on the 128.** A 48K has the beeper.

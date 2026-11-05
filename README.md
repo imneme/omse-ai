@@ -22,6 +22,7 @@ The name means it. omse-ai is accessibility technology for a mind that has no ey
 - **Keys that land.** Typing follows the ROM's keyboard modes (K, L, C, E, G), with every table read out of the ROM itself. Each keystroke is closed-loop: it waits until the ROM has taken the last key before pressing the next, then checks the edit line byte for byte. If the ROM rejects a line, you get its error with its own `?` marker, so the ROM doubles as a linter for BASIC.
 - **Sound as numbers.** The beeper comes back as notes (`notes`): start, length, frequency, and the nearest note with how many cents off. On the 128, every write to the AY sound chip is logged, then replayed into notes per channel, a piano roll and a note list. You can't hear it, but you can check a tune note for note against what was written.
 - **Time you control.** Run to a breakpoint, run until the editor wants a key, save the whole machine to a snapshot and carry on in a later call (`go`), exactly where it was.
+- **A divMMC and an SD card.** Fit one, give it esxDOS and a card image, and it boots to esxDOS: dot commands, tapes loaded from the card, the NMI browser. It's held to the real hardware, port by port (docs/divmmc.md), and the card logs every command it's sent.
 
 ![A contact sheet: the hello example typed in, then run, the border changing colour each line](docs/hello-sheet.png)
 
@@ -99,7 +100,10 @@ curl -fLO "$base/48.rom" && curl -fLO "$base/128-0.rom" && curl -fLO "$base/128-
 | `zxkeys.py` | the keyboard tables, read from the ROM; BASIC text to tokens and back; the screen reader |
 | `zxay.py` | the AY made visible: register log to notes, a piano roll, a note list, a WAV |
 | `zxdis.py` | Z80 disassembly of the ROM or a file |
-| `src/zxcore.cpp` | the machine itself, a C library: Z80, ULA, keyboard, tape traps, 128K paging, AY, logs |
+| `src/zxcore.cpp` | the machine itself, a C library: Z80, ULA, keyboard, tape traps, 128K paging, AY, divMMC, logs |
+| `src/sdcard.h` | the divMMC's SD card, in SPI mode |
+| `tools/mkfat.py` | SD-card images for the divMMC: FAT16 or FAT32 from a folder, and reading them back |
+| `docs/divmmc.md` | the divMMC: how to drive it, the hardware it's held to, with sources, and its limits |
 | `src/z80.h`, `src/ay38910.h` | the Z80 and AY-3-8912 cores from Andre Weissflog's [chips](https://github.com/floooh/chips) |
 | `examples/` | scripts (`hello`, `roundtrip`, `ay48`, `stripes`), `tour.py`, and `film.py` (a tape filmed as an MP4 and a contact sheet) |
 | `tests/` | the tests, and `torture.bas` (every keyword on the keyboard) and `illegal.bas` (lines the ROM refuses) |
