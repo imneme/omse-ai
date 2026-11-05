@@ -155,18 +155,20 @@ class Runner:
         self.zx = self.Speccy(model=128)
 
     def do_divmmc(self, arg):
-        """divmmc EEPROM [CARD]: fit a divMMC (a power cycle) with that 8K EEPROM image (esxDOS's ESXMMC.BIN) and SD-card image, and boot it"""
+        """divmmc EEPROM [CARD [KIND]]: fit a divMMC (a power cycle) with that 8K EEPROM image (esxDOS's ESXMMC.BIN) and SD-card image (KIND sdhc, sdsc, sdv1 or mmc), and boot it"""
         parts = arg.split()
         if not parts:
             raise ValueError('divmmc needs an EEPROM image: divmmc ESXMMC.BIN [CARD.img]')
         zx = self.need()
-        zx.fit_divmmc(self.path(parts[0]), card=self.path(parts[1]) if len(parts) > 1 else None)
+        zx.fit_divmmc(self.path(parts[0]), card=self.path(parts[1]) if len(parts) > 1 else None,
+                      kind=parts[2] if len(parts) > 2 else 'sdhc')
         n = zx.wait_ready(max_frames=1500)
         self.say(f'divMMC fitted, ready after {n} frames' if n is not None else 'divMMC fitted (not at the editor yet)')
 
     def do_sd(self, arg):
-        """sd IMAGE: put an SD-card image in the divMMC (not written: its writes stay in memory)"""
-        self.need().sd_insert(self.path(arg))
+        """sd IMAGE [KIND]: put an SD-card image in the divMMC (KIND sdhc, sdsc, sdv1 or mmc; not written: its writes stay in memory)"""
+        parts = arg.split()
+        self.need().sd_insert(self.path(parts[0]), kind=parts[1] if len(parts) > 1 else 'sdhc')
 
     def do_dot(self, arg):
         """dot .COMMAND ARGS: type an esxDOS dot command (dot .ls, dot .tapein game.tap) and wait for it to run"""

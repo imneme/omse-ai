@@ -911,10 +911,13 @@ void zx_nmi(ZX* z) { z->nmi = true; }
 // machine (so esxDOS's tape emulation sees every LOAD and SAVE).
 void zx_tape_traps(ZX* z, int on) { z->tape_traps = on != 0; }
 
-// An image of 512-byte sectors, as the card in slot 0.  Read-only, writes go to
-// memory and the file is untouched.  0, or -1 (can't open) or -2 (not whole
-// sectors).
-int zx_sd_insert(ZX* z, const char* path, int writable) { return z->sd.insert(path, writable != 0); }
+// An image of 512-byte sectors, as the card in slot 0: kind 0 SDHC, 1 SDSC, 2 SD
+// 1.x, 3 MMC (sdcard.h).  Read-only, writes go to memory and the file is
+// untouched.  0, or -1 (can't open), -2 (not whole sectors, or under 512K), -3
+// (over 2 GB, for a standard-capacity card), -4 (no such kind).
+int zx_sd_insert(ZX* z, const char* path, int writable, int kind) {
+    return z->sd.insert(path, writable != 0, kind);
+}
 void zx_sd_eject(ZX* z) { z->sd.eject(); }
 uint32_t zx_sd_sectors(ZX* z) { return z->sd.sectors; }
 void zx_sd_timing(ZX* z, int ncr, int nac, int busy, int init_tries) {

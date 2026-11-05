@@ -2,8 +2,14 @@
 //
 // One byte in, one byte out, per SPI transfer: xfer() is the eight clocks of
 // one transfer, taking the byte the host sends (MOSI) and returning the byte
-// the card sends at the same time (MISO).  The card is an SDHC card (block
-// addressing, CCS set), backed by an image file of 512-byte sectors.
+// the card sends at the same time (MISO).  It's backed by an image file of
+// 512-byte sectors, and it's one of four kinds of card, as drivers meet them:
+//   SDHC  SD 2.0, high capacity: block addresses, CCS set, CSD version 2.0
+//   SDSC  SD 2.0, standard capacity (2 GB at most): byte addresses, CCS
+//         clear, CSD version 1.0, block length 512 (CMD16: 1 to 512, a read
+//         mustn't cross a 512-byte block; writes are whole aligned blocks)
+//   SDV1  SD 1.x: as SDSC, but CMD8 is an illegal command
+//   MMC   MultiMediaCard: CMD8 and CMD55 illegal; CMD1 initialises it
 //
 // What it holds to, from the SD Physical Layer Simplified Specification's SPI
 // mode and ChaN's "How to Use MMC/SDC" (http://elm-chan.org/docs/mmc/mmc_e.html):
@@ -19,10 +25,12 @@
 //   - CMD12 stops a multiple-block read with a stuff byte (the next byte
 //     of the block it interrupts), then R1b;
 //   - while it's initialising (idle), only CMD0, 1, 8, 55, 58, 59 and ACMD41
-//     are legal; an SDHC card leaves idle on ACMD41 only if CMD8 came first
-//     and ACMD41's HCS bit is set, after init_tries tries (default 2: the
-//     first answers "still idle", so a host has to loop as on a real card).
-// Commands: 0, 1, 8, 9, 10, 12, 13, 16, 17, 18, 24, 25, 55, 58, 59, ACMD41.
+//     are legal; it leaves idle after init_tries tries (default 2: the first
+//     answers "still idle", so a host has to loop as on a real card) of
+//     ACMD41 (an SD card; an SDHC card only if CMD8 came first and ACMD41's
+//     HCS bit is set) or CMD1 (an MMC, SDSC or SD 1.x card; never SDHC).
+// Commands: 0, 1, 8, 9, 10, 12, 13, 16, 17, 18, 24, 25, 55, 58, 59, and ACMD
+// 13, 22, 23, 41, 42, 51.
 // Anything else gets R1 with the illegal-command bit.  Every command is logged
 // (cmd, ACMD or not, argument, R1) for the instrument side.
 //
@@ -41,8 +49,11 @@
 #include <unordered_map>
 #include <vector>
 
+enum { SD_HC = 0, SD_SC = 1, SD_V1 = 2, SD_MMC = 3 };
+
 struct SDCard {
-    // the image
+    // the image, and the kind of card
+    int kind = SD_HC;
     int fd = -1;
     bool writable = false;
     uint32_t sectors = 0;
@@ -64,6 +75,8 @@ struct SDCard {
     uint8_t cmd[6];
     int cmd_n = 0;
 
+    uint32_t blen = 512;        // the block length (CMD16), byte-addressed cards
+
     // what the card sends next, and a multiple-block read in progress
     std::deque<uint8_t> out;
     int64_t read_next = -1;
@@ -81,12 +94,17 @@ struct SDCard {
 
     ~SDCard() { eject(); }
 
-    int insert(const char* path, bool rw) {
+    // 0, or -1 (can't open), -2 (not whole sectors, or under 512K), -3 (over
+    // 2 GB, too big for a standard-capacity card), -4 (no such kind)
+    int insert(const char* path, bool rw, int k = SD_HC) {
         eject();
+        if (k < SD_HC || k > SD_MMC) return -4;
         int f = open(path, rw ? O_RDWR : O_RDONLY);
         if (f < 0) return -1;
         off_t len = lseek(f, 0, SEEK_END);
-        if (len < 512 || len % 512) { close(f); return -2; }
+        if (len < 512 * 1024 || len % 512) { close(f); return -2; }
+        if (k != SD_HC && len > 0x80000000LL) { close(f); return -3; }
+        kind = k;
         fd = f;
         writable = rw;
         sectors = (uint32_t)(len / 512);
@@ -110,9 +128,31 @@ struct SDCard {
         cmd8 = app = crc_on = false;
         tries = 0;
         cmd_n = 0;
+        blen = 512;
         out.clear();
         read_next = -1;
         w = W_NONE;
+    }
+
+    // A read or write's argument as a sector (and an offset in it, for a
+    // byte-addressed card).  The R1 error bit, or 0 if it's fine.
+    uint8_t where(uint32_t arg, uint32_t len, bool aligned, uint32_t& sector, uint32_t& off) const {
+        if (kind == SD_HC) {
+            sector = arg;
+            off = 0;
+        } else {
+            sector = arg / 512;
+            off = arg % 512;
+            if ((aligned && off) || off + len > 512) return 0x20;   // address error
+        }
+        return sector < sectors ? 0 : 0x40;                          // parameter error
+    }
+
+    static void put_bits(uint8_t* d, int hi, int lo, uint32_t v) {   // bit 127 is d[0]'s top bit
+        for (int b = lo; b <= hi; b++) {
+            uint8_t m = 1 << (b % 8);
+            if (v >> (b - lo) & 1) d[15 - b / 8] |= m; else d[15 - b / 8] &= ~m;
+        }
     }
 
     bool read_sector(uint32_t s, uint8_t* buf) {
@@ -171,21 +211,32 @@ struct SDCard {
         out.push_back(c & 0xFF);
     }
 
-    void csd(uint8_t* d) const {         // CSD version 2.0 (SDHC)
-        uint32_t c_size = sectors / 1024 - 1;    // capacity = (C_SIZE + 1) * 512K
+    void csd(uint8_t* d) const {
         memset(d, 0, 16);
-        d[0] = 0x40;                     // CSD_STRUCTURE = 1
-        d[1] = 0x0E;                     // TAAC
-        d[3] = 0x32;                     // TRAN_SPEED: 25 MHz
-        d[4] = 0x5B;                     // CCC
-        d[5] = 0x59;                     // CCC, READ_BL_LEN = 9 (512)
-        d[7] = (c_size >> 16) & 0x3F;
-        d[8] = (c_size >> 8) & 0xFF;
-        d[9] = c_size & 0xFF;
-        d[10] = 0x7F;                    // ERASE_BLK_EN, SECTOR_SIZE
-        d[11] = 0x80;
-        d[12] = 0x0A;                    // R2W_FACTOR, WRITE_BL_LEN = 9
-        d[13] = 0x40;
+        if (kind == SD_HC) {             // CSD version 2.0: capacity = (C_SIZE + 1) * 512K
+            put_bits(d, 127, 126, 1);
+            put_bits(d, 119, 112, 0x0E); // TAAC
+            put_bits(d, 69, 48, sectors / 1024 - 1);
+        } else {                         // version 1.0 (an MMC's says 1.2, spec 3.x)
+            // capacity = (C_SIZE + 1) * 2^(C_SIZE_MULT + 2) * 2^READ_BL_LEN: 512-byte
+            // blocks up to 1 GB, 1024-byte ones for 2 GB, as cards do
+            int bl = sectors > 2097152 ? 10 : 9;
+            put_bits(d, 127, 126, kind == SD_MMC ? 2 : 0);
+            if (kind == SD_MMC) put_bits(d, 125, 122, 3);
+            put_bits(d, 119, 112, 0x26); // TAAC
+            put_bits(d, 83, 80, bl);
+            put_bits(d, 79, 79, 1);      // READ_BL_PARTIAL
+            put_bits(d, 73, 62, (uint32_t)((uint64_t)sectors * 512 / (512u << bl)) - 1);
+            put_bits(d, 61, 50, 0xFFF);  // the VDD currents: the most
+            put_bits(d, 49, 47, 7);      // C_SIZE_MULT: 512
+        }
+        put_bits(d, 103, 96, 0x32);      // TRAN_SPEED: 25 MHz
+        put_bits(d, 95, 84, 0x5B5);      // CCC: classes 0, 2, 4, 5, 7, 8, 10
+        if (kind == SD_HC) put_bits(d, 83, 80, 9);   // READ_BL_LEN: 512
+        put_bits(d, 46, 46, 1);          // ERASE_BLK_EN
+        put_bits(d, 45, 39, 0x7F);       // SECTOR_SIZE
+        put_bits(d, 28, 26, 2);          // R2W_FACTOR
+        put_bits(d, 25, 22, kind == SD_HC ? 9 : (sectors > 2097152 ? 10 : 9));   // WRITE_BL_LEN
         d[15] = (crc7(d, 15) << 1) | 1;
     }
 
@@ -219,9 +270,13 @@ struct SDCard {
             return;
         }
         uint8_t r;
-        if (acmd && c == 41) {           // SD_SEND_OP_COND
-            if (cmd8 && (arg & 0x40000000) && ++tries >= init_tries) idle = false;
+        bool sd = kind != SD_MMC;
+        if (acmd && c == 41 && sd) {     // SD_SEND_OP_COND: an SDHC card needs CMD8 and HCS
+            if ((kind != SD_HC || (cmd8 && (arg & 0x40000000))) && ++tries >= init_tries) idle = false;
             r = r1();
+            respond({r});
+        } else if ((c == 8 && (kind == SD_V1 || kind == SD_MMC)) || (c == 55 && !sd)) {
+            r = r1() | 0x04;             // a 1.x card has no CMD8; an MMC no application commands
             respond({r});
         } else if (acmd && !idle && (c == 13 || c == 22 || c == 23 || c == 42 || c == 51)) {
             uint8_t d[64] = {0};         // SD_STATUS (64 bytes), SEND_NUM_WR_BLOCKS (4),
@@ -250,6 +305,7 @@ struct SDCard {
                 respond({r});
                 break;
             case 1:                      // SEND_OP_COND: no HCS, so an SDHC card stays idle
+                if (kind != SD_HC && ++tries >= init_tries) idle = false;
                 r = r1();
                 respond({r});
                 break;
@@ -287,33 +343,44 @@ struct SDCard {
                 r = r1();
                 respond({r, 0x00});
                 break;
-            case 16:                     // SET_BLOCKLEN: fixed at 512 on SDHC
-                r = r1();
+            case 16:                     // SET_BLOCKLEN: fixed at 512 on SDHC; 1 to 512 otherwise
+                if (kind != SD_HC && (arg < 1 || arg > 512)) {
+                    r = r1() | 0x40;
+                } else {
+                    if (kind != SD_HC) blen = arg;
+                    r = r1();
+                }
                 respond({r});
                 break;
             case 17:
             case 18: {                   // READ_SINGLE_BLOCK, READ_MULTIPLE_BLOCK
-                if (arg >= sectors) {
-                    r = r1() | 0x40;     // parameter error
+                uint32_t sec, off, n = kind == SD_HC ? 512 : blen;
+                uint8_t err = where(arg, n, c == 18, sec, off);
+                if (!err && c == 18 && n != 512) err = 0x40;     // whole blocks only
+                if (err) {
+                    r = r1() | err;
                     respond({r});
                     break;
                 }
                 uint8_t d[512];
                 r = r1();
                 respond({r});
-                if (!read_sector(arg, d)) {
+                if (!read_sector(sec, d)) {
                     for (int i = 0; i < nac; i++) out.push_back(0xFF);
                     out.push_back(0x01); // error token: error
                     break;
                 }
-                block(d, 512);
-                if (c == 18) read_next = (int64_t)arg + 1;
+                block(d + off, n);
+                if (c == 18) read_next = (int64_t)sec + 1;
                 break;
             }
             case 24:
-            case 25:                     // WRITE_BLOCK, WRITE_MULTIPLE_BLOCK
-                if (arg >= sectors) {
-                    r = r1() | 0x40;
+            case 25: {                   // WRITE_BLOCK, WRITE_MULTIPLE_BLOCK: whole aligned blocks
+                uint32_t sec, off;
+                uint8_t err = where(arg, 512, true, sec, off);
+                if (!err && kind != SD_HC && blen != 512) err = 0x40;
+                if (err) {
+                    r = r1() | err;
                     respond({r});
                     break;
                 }
@@ -321,16 +388,17 @@ struct SDCard {
                 respond({r});
                 w = W_TOKEN;
                 w_multi = c == 25;
-                w_sector = arg;
+                w_sector = sec;
                 break;
+            }
             case 55:                     // APP_CMD
                 app = true;
                 r = r1();
                 respond({r});
                 break;
-            case 58: {                   // READ_OCR: R3; bit 31 once powered up, CCS (bit 30)
+            case 58: {                   // READ_OCR: R3; bit 31 once powered up, CCS (bit 30) if SDHC
                 r = r1();
-                uint8_t top = idle ? 0x00 : 0xC0;
+                uint8_t top = idle ? 0x00 : (kind == SD_HC ? 0xC0 : 0x80);
                 respond({r, top, 0xFF, 0x80, 0x00});
                 break;
             }

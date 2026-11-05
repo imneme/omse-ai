@@ -68,7 +68,16 @@ The sources: **Fuse** (`peripherals/ide/divxxx.c`, `divmmc.c`, the automap in `z
 
 ## The card
 
-An **SDHC card** (block addressing, CCS set in its OCR), in SPI mode, full duplex: one byte in and one byte out per transfer (`src/sdcard.h`). Where the spec gives a range, omse-ai picks a strict but real point in it, and you can move it with `sd_timing()`.
+A card in SPI mode, full duplex: one byte in and one byte out per transfer (`src/sdcard.h`). Where the spec gives a range, omse-ai picks a strict but real point in it, and you can move it with `sd_timing()`. It's one of four kinds, chosen with `kind=` when it's inserted, because drivers meet all four and must treat them differently:
+
+| kind | what | addresses | how it starts |
+|---|---|---|---|
+| `sdhc` (default) | SD 2.0, high capacity | blocks; CCS set in the OCR; CSD version 2.0 | CMD8, then ACMD41 with HCS (CMD1 never) |
+| `sdsc` | SD 2.0, standard capacity, 2 GB at most | bytes; CCS clear; CSD version 1.0 | CMD8, then ACMD41 (or CMD1) |
+| `sdv1` | SD 1.x | bytes | ACMD41 or CMD1; CMD8 is an illegal command |
+| `mmc` | MultiMediaCard | bytes; CSD version 1.2 | CMD1; CMD8 and CMD55 are illegal |
+
+On the byte-addressed cards, CMD16 sets the block length (1 to 512; reads of less than a block are allowed, but a read mustn't cross a 512-byte block, and writes are whole aligned blocks). Their CSDs say 512-byte blocks up to 1 GB and 1024-byte ones above, as real cards do. esxDOS 0.8.9 boots from all four, and its driver shows in `sd_log()`: SDHC needs no CMD16; on an SDSC card it sends CMD16 when it sees CCS clear; an SD 1.x card or an MMC refuses CMD8, and esxDOS falls back to CMD1.
 
 - **It wakes up only after 74 clocks with MOSI high** (ten bytes of `FF`), then listens only for CMD0, which puts it in SPI mode when it arrives with CS low.
 - **CMD0 and CMD8 must carry a correct CRC7**, as in the spec; a wrong one gets R1 with the CRC-error bit, and isn't obeyed. Other commands' CRCs are checked only after CMD59 turns CRCs on.
@@ -76,7 +85,7 @@ An **SDHC card** (block addressing, CCS set in its OCR), in SPI mode, full duple
 - **It takes its time to initialise:** ACMD41 answers "still idle" the first time (`init_tries`, default 2), so a driver must loop, as on a real card. An SDHC card leaves idle only if CMD8 came first and ACMD41's HCS bit is set; CMD1 alone never initialises it.
 - **While it's initialising, only CMD0, 1, 8, 55, 58 and 59 and ACMD41 are legal**; anything else gets R1 `05` (idle, illegal command).
 - **CMD12 stops a multiple-block read with a stuff byte, then R1b.** The spec says to discard the stuff byte and doesn't define it; omse-ai sends the next byte of the block it interrupted, as a real card in mid-block does, so a driver that mistakes it for R1 can be caught here.
-- Commands: CMD0, 1, 8, 9 (CSD, version 2.0), 10 (CID: maker `OA`, product `omseS`, which esxDOS shows as `sda: OA omseS`), 12, 13, 16, 17, 18, 24, 25, 55, 58, 59; ACMD13, 22, 23, 41, 42, 51. Anything else gets the illegal-command bit.
+- Commands: CMD0, 1, 8, 9 (the CSD), 10 (CID: maker `OA`, product `omseS`, which esxDOS shows as `sda: OA omseS`), 12, 13, 16, 17, 18, 24, 25, 55, 58, 59; ACMD13, 22, 23, 41, 42, 51. Anything else gets the illegal-command bit.
 
 esxDOS 0.8.9 initialises with CMD0, CMD8 (`1AA`), CMD55 and ACMD41 with HCS (twice: it loops while the card is idle), CMD9, CMD10, CMD58, and then reads with CMD17.
 
@@ -90,14 +99,14 @@ omse-ai serves LOAD and SAVE instantly by trapping the ROM's LD-BYTES (at `0562`
 
 ## How it's checked
 
-`tests/test_divmmc.py` holds every point above with real OUT and IN instructions. A small test EEPROM of its own hands each automap back to the ROM, and the SPI tests are straight-line Z80 that Python writes, one OUT or IN at a time, so every byte on the wire is visible. Before they were trusted, each was broken on purpose. Twenty mutants of the code (the IN returning this transfer's byte, entry points mapping before their fetch, `3D00` mapping after it, MAPRAM clearable, bank 3 writable, the jumper ignored, the off-area narrowed, bank bits dropped, no N_CR, no CRC check, no wake-up clocks, reads while idle, ACMD41 at once, a wrong CRC16, a read-only card writing its file, CMD12 without its stuff byte or busy, the stuff byte `FF`) were each run in a copy of the tree. Nineteen failed a test. The twentieth adds a delayed map at `3D00` beside the instant one, which changes nothing, so no test can see it.
+`tests/test_divmmc.py` holds every point above with real OUT and IN instructions. A small test EEPROM of its own hands each automap back to the ROM, and the SPI tests are straight-line Z80 that Python writes, one OUT or IN at a time, so every byte on the wire is visible. Before they were trusted, each was broken on purpose. Thirty mutants of the code (the IN returning this transfer's byte, entry points mapping before their fetch, `3D00` mapping after it, MAPRAM clearable, bank 3 writable, the jumper ignored, the off-area narrowed, bank bits dropped, no N_CR, no CRC check, no wake-up clocks, reads while idle, ACMD41 at once, a wrong CRC16, a read-only card writing its file, CMD12 without its stuff byte or busy, the stuff byte `FF`, and for the card kinds: CCS on every kind, block addresses everywhere, reads crossing blocks, CMD16 ignored, CMD8 on a 1.x card, CMD55 on an MMC, CMD1 starting an SDHC card, the CSD's size off by one, no 2 GB limit, writes ignoring the block length) were each run in a copy of the tree. Twenty-nine failed a test. The thirtieth adds a delayed map at `3D00` beside the instant one, which changes nothing, so no test can see it.
 
 With `$OMSE_AI_ESXDOS` naming an esxDOS folder (holding `ESXMMC.BIN`, `SYS` and `BIN`), the tests also build a card with `tools/mkfat.py` and boot esxDOS from it.
 
 ## Limits
 
 - **Snapshots don't hold the divMMC.** SNA has no room for it, so loading one power-cycles the interface (its RAM is kept), and a `go` session doesn't carry esxDOS's state between calls. Keep a divMMC session in one Python process.
-- **One card, SDHC only.** No second slot, no SDSC (byte addressing) or MMC cards, no write-protect or card-detect switches.
+- **One card.** No second slot, and no write-protect or card-detect switches. No SDXC either (it's SDHC to a driver in SPI mode, up to 2 TB).
 - **SPI transfers take no time.** A real one takes a few T-states, always done before the next IN or OUT can arrive.
 - **No divIDE**, and no Next extensions: it's the original divMMC, with 128K or 512K of RAM.
 - The EEPROM can be rewritten with the write-protect jumper off (`write_protect=False`), as on the real thing, but esxDOS's own flashing tool hasn't been tried.

@@ -161,7 +161,7 @@ def _load_lib():
         'zx_div_wp': ([P, I], None), 'zx_div_state': ([P, ctypes.POINTER(ctypes.c_int)], None),
         'zx_div_eeprom': ([P], P), 'zx_div_ram': ([P, I], P), 'zx_nmi': ([P], None),
         'zx_tape_traps': ([P, I], None),
-        'zx_sd_insert': ([P, ctypes.c_char_p, I], I), 'zx_sd_eject': ([P], None),
+        'zx_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zx_sd_eject': ([P], None),
         'zx_sd_sectors': ([P], ctypes.c_uint32), 'zx_sd_timing': ([P, I, I, I, I], None),
         'zx_sd_log_len': ([P], I), 'zx_sd_log_get': ([P, ctypes.POINTER(ctypes.c_uint64)], None),
         'zx_sd_log_clear': ([P], None),
@@ -589,17 +589,18 @@ class Speccy:
 
     # -- divMMC and its SD card ------------------------------------------------
     def fit_divmmc(self, eeprom=None, card=None, writable=False, ram_kb=128, write_protect=True,
-                   boot_frames=None):
+                   boot_frames=None, kind='sdhc'):
         """Fit a divMMC, as on a real machine: power off, plug it in, power on.
         eeprom is its 8K EEPROM image (a path or bytes; None: blank, all FF),
-        card an SD-card image to put in it first (sd_insert), ram_kb 128 or 512,
+        card an SD-card image to put in it first (sd_insert, with writable and
+        kind), ram_kb 128 or 512,
         write_protect the EEPROM's jumper (on, as in use: automap needs it).
         Then it boots (esxDOS looks at the card) for boot_frames frames."""
         data = Path(eeprom).read_bytes() if isinstance(eeprom, (str, Path)) else eeprom
         if data is not None and len(data) != 8192:
             raise ValueError(f'a divMMC EEPROM image is 8192 bytes, not {len(data)}')
         if card is not None:
-            self.sd_insert(card, writable)
+            self.sd_insert(card, writable, kind)
         if self.lib.zx_div_fit(self.z, data, len(data) if data else 0, ram_kb,
                                1 if write_protect else 0) != 0:
             raise ValueError(f'a divMMC has 128 or 512 K of RAM, not {ram_kb}')
@@ -610,15 +611,25 @@ class Speccy:
         if boot_frames:
             self.run(boot_frames)
 
-    def sd_insert(self, path, writable=False):
+    SD_KINDS = ('sdhc', 'sdsc', 'sdv1', 'mmc')
+
+    def sd_insert(self, path, writable=False, kind='sdhc'):
         """Put an SD-card image (whole 512-byte sectors) in the divMMC's slot.
         Not writable (the default), the card still takes writes, into memory,
-        and the file is left as it was."""
-        r = self.lib.zx_sd_insert(self.z, str(path).encode(), 1 if writable else 0)
+        and the file is left as it was. kind: 'sdhc' (block-addressed, the
+        default), 'sdsc' (an SD 2.0 card of 2 GB or less: byte-addressed),
+        'sdv1' (an SD 1.x card: no CMD8 either) or 'mmc' (a MultiMediaCard:
+        only CMD1 initialises it)."""
+        if kind not in self.SD_KINDS:
+            raise ValueError(f'an SD card is one of {", ".join(self.SD_KINDS)}, not {kind!r}')
+        r = self.lib.zx_sd_insert(self.z, str(path).encode(), 1 if writable else 0,
+                                  self.SD_KINDS.index(kind))
         if r == -1:
             raise FileNotFoundError(f'{path}: cannot open it' + (' for writing' if writable else ''))
         if r == -2:
-            raise ValueError(f'{path}: an SD-card image is whole 512-byte sectors')
+            raise ValueError(f'{path}: an SD-card image is whole 512-byte sectors, 512K or more')
+        if r == -3:
+            raise ValueError(f'{path}: over 2 GB, too big for a {kind} card (an sdhc can be)')
 
     def sd_eject(self):
         self.lib.zx_sd_eject(self.z)

@@ -371,10 +371,115 @@ class TestSPI(unittest.TestCase):
         self.assertEqual(tail[1], sector(5)[10])
         self.assertEqual(zx.sd_log()[-1][0], 'CMD12')
 
+    def test_cmd1_never_starts_an_sdhc_card(self):
+        zx = machine(card=card_image())
+        z = wake_and_select(Z80()).out(0xEB, *cmd(0)).in_(3)
+        for _ in range(5):
+            z.out(0xEB, *cmd(1)).in_(3)
+        self.assertEqual(z.run(zx)[-1], 0x01)              # still idle: SDHC needs ACMD41 with HCS
+
     def test_an_unknown_command_is_illegal(self):
         zx = machine(card=card_image())
         got = init_card(Z80()).out(0xEB, *cmd(5)).in_(3).run(zx)
         self.assertEqual(got[-1], 0x04)
+
+
+def start(z, kind):
+    """Wake the card and initialise it the way its kind wants: SD 2.0 cards
+    CMD8 then ACMD41 with HCS, an SD 1.x card ACMD41 alone (its CMD8 is an
+    illegal command), an MMC CMD1. Twice, as the card leaves idle on the second."""
+    wake_and_select(z).out(0xEB, *cmd(0)).in_(3)
+    if kind != 'mmc':
+        z.out(0xEB, *cmd(8, 0x1AA)).in_(7)
+    for _ in range(2):
+        if kind == 'mmc':
+            z.out(0xEB, *cmd(1)).in_(3)
+        else:
+            z.out(0xEB, *cmd(55)).in_(3).out(0xEB, *cmd(41, 0 if kind == 'sdv1' else 0x40000000)).in_(3)
+    return z
+
+
+def capacity(csd):
+    """The capacity a CSD declares, in bytes: version 2.0 (SDHC) or 1.0."""
+    bits = int.from_bytes(csd, 'big')
+
+    def f(hi, lo):
+        return bits >> lo & ((1 << (hi - lo + 1)) - 1)
+    if f(127, 126) == 1:
+        return (f(69, 48) + 1) * 512 * 1024
+    return (f(73, 62) + 1) * (1 << (f(49, 47) + 2)) * (1 << f(83, 80))
+
+
+class TestCardKinds(unittest.TestCase):
+    """SDSC, SD 1.x and MMC cards: byte addresses, CMD16, and their own ways in."""
+
+    def card(self, kind, z):
+        zx = machine(card=card_image(), kind=kind)
+        return zx, z.run(zx)
+
+    def test_each_kind_starts_its_own_way(self):
+        for kind, cmd8, ocr in (('sdhc', 0x01, 0xC0), ('sdsc', 0x01, 0x80), ('sdv1', 0x05, 0x80),
+                                ('mmc', None, 0x80)):
+            with self.subTest(kind=kind):
+                z = start(Z80(), kind).out(0xEB, *cmd(58)).in_(7)
+                zx, got = self.card(kind, z)
+                if cmd8 is not None:
+                    self.assertEqual(got[5], cmd8)               # R1 of CMD8: 05 is illegal
+                self.assertEqual(got[-7 + 2:-7 + 4], bytes([0x00, ocr]))   # ready, then OCR (CCS only SDHC)
+                names = [n for n, a, r in zx.sd_log()]
+                self.assertEqual(names[-1], 'CMD58')
+
+    def test_an_mmc_has_no_cmd8_and_no_cmd55(self):
+        zx, got = self.card('mmc', wake_and_select(Z80()).out(0xEB, *cmd(0)).in_(3)
+                            .out(0xEB, *cmd(8, 0x1AA)).in_(3).out(0xEB, *cmd(55)).in_(3))
+        self.assertEqual(list(got[5::3][:2]), [0x05, 0x05])
+
+    def test_byte_addressed_cards_read_by_byte(self):
+        for kind in ('sdsc', 'sdv1', 'mmc'):
+            with self.subTest(kind=kind):
+                z = start(Z80(), kind)
+                z.out(0xEB, *cmd(17, 5 * 512)).in_(520)
+                z.out(0xEB, *cmd(17, 5)).in_(3)                    # mid-block: it would cross one
+                zx, got = self.card(kind, z)
+                blk = got[-(520 + 3):-3]
+                self.assertEqual(blk[2], 0x00)
+                i = blk.index(0xFE, 3)
+                self.assertEqual(blk[i + 1:i + 513], sector(5))
+                self.assertEqual(got[-1], 0x20)                     # address error
+
+    def test_cmd16_reads_a_shorter_block(self):
+        z = start(Z80(), 'sdsc')
+        z.out(0xEB, *cmd(16, 256)).in_(3)
+        z.out(0xEB, *cmd(17, 5 * 512 + 256)).in_(264)
+        z.out(0xEB, *cmd(24, 6 * 512)).in_(3)                      # a write needs 512 again
+        zx, got = self.card('sdsc', z)
+        blk = got[-(264 + 3):-3]
+        i = blk.index(0xFE, 3)
+        self.assertEqual(blk[i + 1:i + 257], sector(5)[256:])
+        self.assertEqual(blk[i + 257] << 8 | blk[i + 258], crc16(sector(5)[256:]))
+        self.assertEqual(got[-1], 0x40)
+
+    def test_the_csd_says_the_capacity(self):
+        for kind in ('sdhc', 'sdsc', 'sdv1', 'mmc'):
+            with self.subTest(kind=kind):
+                zx, got = self.card(kind, start(Z80(), kind).out(0xEB, *cmd(9)).in_(24))
+                csd = got[-24:]
+                i = csd.index(0xFE, 3)
+                self.assertEqual(capacity(csd[i + 1:i + 17]), 2048 * 512)
+                self.assertEqual(csd[i + 16] >> 1, crc7(csd[i + 1:i + 16]))
+
+    def test_a_standard_card_is_2_gb_at_most(self):
+        big = OUT / 'big.img'
+        with open(big, 'wb') as f:
+            f.truncate(0x80000000 + 512)                            # sparse: no disk used
+        try:
+            zx = Speccy()
+            with self.assertRaises(ValueError):
+                zx.sd_insert(big, kind='sdsc')
+            zx.sd_insert(big, kind='sdhc')
+            zx.sd_eject()
+        finally:
+            big.unlink()
 
 
 ESXDOS = os.environ.get('OMSE_AI_ESXDOS')
@@ -435,6 +540,22 @@ class TestEsxDOS(unittest.TestCase):
         self.assertEqual(names[:4], ['CMD0', 'CMD8', 'CMD55', 'ACMD41'])
         self.assertIn('CMD58', names)
         self.assertIn('CMD17', names)
+
+    def test_every_kind_of_card(self):
+        # esxDOS's driver takes its own path for each: SDHC needs no CMD16; an
+        # SDSC card (CCS clear) gets CMD16 for 512-byte blocks; an SD 1.x card
+        # or an MMC refuses CMD8, and esxDOS falls back to CMD1.
+        for kind, want, refuse in (('sdhc', 'ACMD41', 'CMD16'), ('sdsc', 'CMD16', 'CMD1'),
+                                   ('sdv1', 'CMD1', 'ACMD41'), ('mmc', 'CMD1', 'ACMD41')):
+            with self.subTest(kind=kind):
+                zx = Speccy()
+                zx.fit_divmmc(Path(ESXDOS) / 'ESXMMC.BIN', card=self.img, kind=kind, boot_frames=0)
+                self.assertIsNotNone(zx.wait_ready(max_frames=1500))
+                names = [n for n, a, r in zx.sd_log()]
+                self.assertIn(want, names)
+                self.assertNotIn(refuse, names)
+                zx.dot('.ls')
+                self.assertIn('HELLO.TAP', zx.screen_text())
 
     def test_loads_a_tape_from_the_card(self):
         zx = self.boot()
