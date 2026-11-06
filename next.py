@@ -196,8 +196,16 @@ class Next:
         return im
 
     # the SD card on the SPI master's card-select 0
-    def sd_insert(self, path, writable=False, kind=1):
-        return self.lib.zxn_sd_insert(self.z, str(path).encode(), 1 if writable else 0, kind)
+    SD_KINDS = ('sdhc', 'sdsc', 'sdv1', 'mmc')     # as speccy.py, in sdcard.h's order
+
+    def sd_insert(self, path, writable=False, kind='sdhc'):
+        """Put an SD-card image in the slot (card 0), as speccy.py's sd_insert:
+        kind 'sdhc' (block-addressed, the default), 'sdsc', 'sdv1' or 'mmc'.
+        Returns 0 on success."""
+        if kind not in self.SD_KINDS:
+            raise ValueError(f'an SD card is one of {", ".join(self.SD_KINDS)}, not {kind!r}')
+        return self.lib.zxn_sd_insert(self.z, str(path).encode(), 1 if writable else 0,
+                                      self.SD_KINDS.index(kind))
 
     def sd_eject(self):
         self.lib.zxn_sd_eject(self.z)
