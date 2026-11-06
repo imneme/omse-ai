@@ -148,14 +148,15 @@ class SpiGap(NextCase):
         self.check_speeds(t)
 
 
-def custom(cmd, tail):
-    """Select the card, send cmd well spaced, then the raw tail; JR $."""
+def custom(cmds, tail):
+    """Select the card, send each command well spaced, then the raw tail; JR $."""
     code = [0xF3, 0x21, RESULTS & 0xFF, RESULTS >> 8, 0x01, 0xEB, 0x00, 0x3E, 0xFF, 0xD3, 0xE7]
     for _ in range(10):
         code += out_eb(0xFF, 'single')
     code += [0x3E, 0xFE, 0xD3, 0xE7]
-    for b in cmd:
-        code += out_eb(b, 'single')
+    for cmd in cmds:
+        for b in cmd:
+            code += out_eb(b, 'single')
     return bytes(code + tail + [0x18, 0xFE])
 
 
@@ -186,7 +187,7 @@ class SpiGapBoundary(SpiGap):
     def run_custom(self, cmd, tail, n):
         zx = bare()
         zx.sd_insert(self.card, kind='sdhc')
-        zx.sd_timing(ncr=1)
+        zx.sd_timing(ncr=0)                             # R1/R7 right after the command (Ratio)
         code = custom(cmd, tail)
         zx.load(CODE, code)
         launch(zx, CODE)
@@ -197,13 +198,15 @@ class SpiGapBoundary(SpiGap):
         """Speccy-Zone's run 4: the read register loads 17 edges after a begin
         (spi:159-168) and the CPU latches after its strobe, so a read 16 on
         sees the isolated access's byte: OUT (EBh),A; NOP; IN A,(C)."""
-        got = self.run_custom(CMD0, [0x3E, 0xFF, 0xD3, 0xEB, 0x00, 0xED, 0x78, 0x77], 1)
+        got = self.run_custom([CMD0], [0x3E, 0xFF, 0xD3, 0xEB, 0x00, 0xED, 0x78, 0x77], 1)
         self.assertEqual(got, [0x01], 'R1, the dummy transfer\'s byte, not FF')
 
     def test_after_ini_ini_a_read_15_later_rereads(self):
         """Two accesses exactly 16 apart (INI; INI), then IN B,(C) 15 later:
         it re-reads the second INI's byte, not the next transfer's early."""
-        got = self.run_custom(CMD8, [0xED, 0xA2, 0xED, 0xA2, 0xED, 0x40, 0x70], 3)
+        # CMD0 first (a card ignores CMD8 until it's in SPI mode), and four NOPs so
+        # the first INI is 16+ clocks after the last OUT and begins (Ratio's trace)
+        got = self.run_custom([CMD0, CMD8], [0x00] * 4 + [0xED, 0xA2, 0xED, 0xA2, 0xED, 0x40, 0x70], 3)
         self.assertIn(0x01, got, 'a live card answering CMD8')
         self.assertEqual(got[2], got[1], f'IN B,(C) 15 after the second INI re-reads it: {got}')
 
