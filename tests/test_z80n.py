@@ -38,7 +38,8 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 M1, MREQ, IORQ, RD, WR, RFSH = 1 << 24, 1 << 25, 1 << 26, 1 << 27, 1 << 28, 1 << 34
 NEXTREG = 1 << 39
-CTRL = M1 | MREQ | IORQ | RD | WR | RFSH | NEXTREG
+NMIACK_MSB, NMIACK_LSB, RETN_LSB, RETN_MSB = 1 << 56, 1 << 57, 1 << 58, 1 << 59
+CTRL = M1 | MREQ | IORQ | RD | WR | RFSH | NEXTREG | NMIACK_MSB | NMIACK_LSB | RETN_LSB | RETN_MSB
 S_, Z_, Y_, H_, X_, P_, N_, C_ = 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01
 REGS = ['af', 'bc', 'de', 'hl', 'ix', 'iy', 'sp', 'pc', 'wz', 'ir', 'af2', 'bc2', 'de2', 'hl2', 'im', 'iff1',
         'iff2']
@@ -50,6 +51,9 @@ Z80N_T = {0x23: 8, 0x24: 8, 0x27: 11, 0x28: 8, 0x29: 8, 0x2A: 8, 0x2B: 8, 0x2C: 
           0x94: 8, 0x95: 8, 0x98: 13, 0xA4: 16, 0xA5: 14, 0xAC: 16, 0xB4: (21, 16), 0xB6: (21, 16),
           0xB7: (21, 16), 0xBC: (21, 16)}
 OPERANDS = {0x27: 1, 0x34: 2, 0x35: 2, 0x36: 2, 0x8A: 2, 0x91: 2, 0x92: 1}
+# The T80N decodes these as RETN (t80n_mcode.vhd), with its RETN_LSB/RETN_MSB commands on the two pops; ED 4D is
+# RETI, with none. (A Zilog's ED 55..7D are RETN too; floooh's z80.h runs them as RETI, the same but its RETI pin.)
+RETN_OPS = (0x45, 0x55, 0x5D, 0x65, 0x6D, 0x75, 0x7D)
 
 
 # -- the bare Z80 ----------------------------------------------------------------------------------------
@@ -82,7 +86,7 @@ def harness(header=None):
     h.bare_mem.restype = h.bare_io.restype = ctypes.c_void_p
     h.bare_mem.argtypes = h.bare_io.argtypes = [ctypes.c_void_p]
     h.bare_waits.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-    h.bare_z80n.argtypes = [ctypes.c_void_p]
+    h.bare_z80n.argtypes = h.bare_nmi.argtypes = [ctypes.c_void_p]
     h.bare_get.restype = ctypes.c_uint
     h.bare_get.argtypes = [ctypes.c_void_p, ctypes.c_int]
     h.bare_set.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint]
@@ -117,6 +121,9 @@ class Bare:
                 self.h.bare_set(self.b, i, regs[r])
         if 'pc' in regs:                             # last: it prefetches there
             self.h.bare_set(self.b, REGS.index('pc'), regs['pc'])
+
+    def nmi(self):
+        self.h.bare_nmi(self.b)
 
     def step(self, limit=400):
         n = self.h.bare_step(self.b, self.log, 512, limit)
@@ -178,31 +185,32 @@ class Ref:
         # read's or a write's shows nothing (z80.h looks at WAIT first), as every other cycle in z80.h.
         self.ticks += [(MREQ if fetch else 0, a, None, None)] * (self.wait_mem + (self.wait_rd if rd else 0))
 
-    def fetch(self, a, extra=0):
+    def fetch(self, a, extra=0, t2=MREQ):
         ir = self.R['ir']
         d = self.mem[a]
         self.ticks.append((M1 | MREQ | RD, a, d, None))
         self._held(True, True, a)
-        self.ticks += [(MREQ, a, None, None), (MREQ | RFSH, ir, None, None), (0, ir, None, None)]
+        self.ticks += [(t2, a, None, None), (MREQ | RFSH, ir, None, None), (0, ir, None, None)]
         self.ticks += [(0, ir, None, None)] * extra          # a 5-T M1's last T: the refresh address stays
         r = ir & 0xFF
         self.R['ir'] = (ir & 0xFF00) | (r & 0x80) | ((r + 1) & 0x7F)
         return d
 
-    def rd(self, a, side=None, then=None):
-        """A read at a; `then`: the address the bus moves to after T1 (LDPIRX); side: a NEXTREG strobe."""
+    def rd(self, a, side=None, then=None, extra=0):
+        """A read at a; `then`: the address the bus moves to after T1 (LDPIRX); side: a NEXTREG strobe; extra:
+        other side-band pins on its T1 (RETN's)."""
         a &= 0xFFFF
         d = self.mem[a]
-        self.ticks.append((MREQ | RD | (NEXTREG if side else 0), a, d, side))
+        self.ticks.append((MREQ | RD | (NEXTREG if side else 0) | extra, a, d, side))
         b = a if then is None else then
         self._held(True, False, b)
         self.ticks += [(MREQ, b, None, None), (0, b, None, None)]
         return d
 
-    def wr(self, a, d):
+    def wr(self, a, d, extra=0):
         a &= 0xFFFF
         self.mem[a] = d
-        self.ticks.append((MREQ | WR, a, d, None))
+        self.ticks.append((MREQ | WR | extra, a, d, None))
         self._held(False, False, a)
         self.ticks += [(MREQ, a, None, None), (0, a, None, None)]
 
@@ -236,6 +244,17 @@ class Ref:
         else:
             self.R[r] = v & 0xFFFF
 
+    def nmi(self):
+        """The NMI response: a fetch at PC that doesn't count it, 5 T (the last internal, the bus on IR), then
+        PC pushed, high byte first, with the T80N's NMIACK_MSB and NMIACK_LSB commands on the two writes."""
+        p = self.R['pc']
+        self.fetch(p, extra=1, t2=0)            # (z80.h's NMI fetch shows no MREQ on T2, as it always has)
+        sp = self.R['sp']
+        self.wr(sp - 1, p >> 8, extra=NMIACK_MSB if self.z80n else 0)
+        self.wr(sp - 2, p & 0xFF, extra=NMIACK_LSB if self.z80n else 0)
+        self.R.update(sp=(sp - 2) & 0xFFFF, pc=0x0066, wz=0x0066, iff1=0)
+        return self
+
     def run(self):
         g, s = self.g, self.s
         p = self.R['pc']
@@ -244,6 +263,16 @@ class Ref:
         op = self.mem[(p + 1) & 0xFFFF]
         self.fetch((p + 1) & 0xFFFF, extra=1 if (self.z80n and op == 0x90) else 0)
         pc = (p + 2) & 0xFFFF
+        if op in RETN_OPS or op == 0x4D:                        # RETN (and RETI): pops PC, IFF1 = IFF2
+            side = self.z80n and op != 0x4D
+            sp = g('sp')
+            lo = self.rd(sp, extra=RETN_LSB if side else 0)
+            hi = self.rd(sp + 1, extra=RETN_MSB if side else 0)
+            s('sp', sp + 2)
+            s('pc', hi << 8 | lo)
+            s('wz', hi << 8 | lo)                               # (floooh's MEMPTR, kept as it was)
+            self.R['iff1'] = self.R['iff2']
+            return self
         if not self.z80n or op not in Z80N_T:
             s('pc', pc)                                         # a Zilog's ED no-op, 8 T
             return self
@@ -408,7 +437,8 @@ class Z80NCase(unittest.TestCase):
 def show(t):
     c, a, d, side = t
     names = [n for n, b in (('M1', M1), ('MREQ', MREQ), ('IORQ', IORQ), ('RD', RD), ('WR', WR),
-                            ('RFSH', RFSH), ('NEXTREG', NEXTREG)) if c & b]
+                            ('RFSH', RFSH), ('NEXTREG', NEXTREG), ('NMIACK_MSB', NMIACK_MSB),
+                            ('NMIACK_LSB', NMIACK_LSB), ('RETN_LSB', RETN_LSB), ('RETN_MSB', RETN_MSB)) if c & b]
     s = '|'.join(names) or '-'
     s += f'@{a:04X}'
     if d is not None:
@@ -614,6 +644,58 @@ class TestWaits(Z80NCase):
                     self.check(regs, code, cpu=cpu)
 
 
+class TestNmiAndRetn(Z80NCase):
+    """The NMI's two pushes and RETN's two pops carry the T80N's NMIACK and RETN commands on the side band (the
+    Next keeps the NMI's return address in nextregs C2h/C3h, and its stackless NMI uses them instead of memory);
+    RETI (ED 4D) and the flag off carry none. Timing and everything else as the Zilog's."""
+
+    def nmi_case(self, z80n):
+        cpu = Bare(z80n=z80n)
+        rng = random.Random(18)
+        for k in range(8):
+            regs = fill_regs(rng, iff1=1, iff2=1, pc=rng.choice((0x8000, 0x1234, 0xFFFF)))
+            cpu.mem[regs['pc']] = 0x00                          # a NOP, then the NMI
+            cpu.set(regs)
+            cpu.nmi()
+            self.assertEqual(len(cpu.step()), 4)
+            start = cpu.regs()
+            ref = Ref(start, bytes(cpu.mem), bytes(cpu.io), z80n=z80n).nmi()
+            ticks = cpu.step()
+            got = cpu.regs()
+            for r in REGS:
+                self.assertEqual(got[r], ref.R[r], r)
+            self.assertEqual(bytes(cpu.mem), bytes(ref.mem))
+            self.assertEqual([show(t) for t in ticks], [show(t) for t in ref.ticks])
+            self.assertEqual(len(ticks), 11)
+
+    def test_nmi_with_z80n(self):
+        self.nmi_case(True)
+
+    def test_nmi_without(self):
+        self.nmi_case(False)
+
+    def test_retn_family(self):
+        rng = random.Random(19)
+        for z80n in (True, False):
+            cpu = Bare(z80n=z80n)
+            for op in RETN_OPS + (0x4D,):
+                with self.subTest(op=f'ED {op:02X}', z80n=z80n):
+                    self.check(fill_regs(rng, iff1=0, iff2=1), [0xED, op], cpu=cpu)
+
+    def test_retn_side_band_ticks(self):
+        cpu = Bare()
+        regs = fill_regs(random.Random(20), sp=0x9000)
+        cpu.mem[0x9000], cpu.mem[0x9001] = 0x34, 0x12
+        for op, want in ((0x45, (RETN_LSB, RETN_MSB)), (0x7D, (RETN_LSB, RETN_MSB)), (0x4D, (0, 0))):
+            with self.subTest(op=f'ED {op:02X}'):
+                cpu.mem[0x8000], cpu.mem[0x8001] = 0xED, op
+                cpu.set(regs)
+                ticks = cpu.step()
+                pops = [t for t in ticks if t[0] & RD and not t[0] & M1]
+                self.assertEqual([(t[0] & (RETN_LSB | RETN_MSB), t[1]) for t in pops], [(want[0], 0x9000), (want[1], 0x9001)])
+                self.assertEqual(cpu.regs()['pc'], 0x1234)
+
+
 class TestOthersUnchanged(unittest.TestCase):
     """The flag takes only the Z80N's own opcodes: every other instruction (unprefixed, CB, DD, FD, ED) runs
     exactly as with the flag off, tick for tick."""
@@ -624,7 +706,7 @@ class TestOthersUnchanged(unittest.TestCase):
         codes = [[op] for op in range(256) if op not in (0xCB, 0xDD, 0xED, 0xFD)]
         codes += [[pre, op] for pre in (0xCB, 0xDD, 0xED, 0xFD) for op in range(256)]
         for code in codes:
-            if code[0] == 0xED and code[1] in Z80N_T:
+            if code[0] == 0xED and (code[1] in Z80N_T or code[1] in RETN_OPS):
                 continue
             regs = fill_regs(rng)
             code = code + [rng.randrange(256) for _ in range(3)]

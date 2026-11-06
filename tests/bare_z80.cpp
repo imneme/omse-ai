@@ -17,6 +17,7 @@ struct Bare {
     int wait_mem;               // wait states to add to each memory cycle (read or write), at its T2
     int wait_rd;                // ... or to each memory *read* only (the Next at 28 MHz)
     int waits_left;
+    bool nmi;                   // an NMI asked for: the NMI pin for the next tick
     uint8_t mem[65536];
     uint8_t io_in[65536];       // what an IN from each port reads
 };
@@ -27,7 +28,12 @@ static bool is_t1(const Bare* b, uint64_t p) {
 
 // one tick: the CPU, then the system's answer (memory, ports), then any wait state for the next tick
 static uint64_t tick(Bare* b) {
-    uint64_t p = z80_tick(&b->cpu, b->pins);
+    uint64_t in = b->pins;
+    if (b->nmi) {
+        in |= Z80_NMI;
+        b->nmi = false;
+    }
+    uint64_t p = z80_tick(&b->cpu, in) & ~Z80_NMI;
     const uint16_t a = Z80_GET_ADDR(p);
     const bool mem_t1 = (p & Z80_MREQ) && (p & (Z80_RD | Z80_WR)) && !(p & Z80_RFSH);
     if (mem_t1) {
@@ -93,6 +99,9 @@ void bare_set(Bare* b, int r, unsigned v) {
         case 15: c.iff1 = v; break; case 16: c.iff2 = v; break;
     }
 }
+
+// an NMI: one tick of the NMI pin (the CPU takes the edge at its next instruction)
+void bare_nmi(Bare* b) { b->nmi = true; }
 
 // z80_reset, as a machine's reset button would
 void bare_reset(Bare* b) { b->pins = z80_reset(&b->cpu); b->at_t1 = false; }

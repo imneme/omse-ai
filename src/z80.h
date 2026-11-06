@@ -332,7 +332,17 @@ extern "C" {
 #define Z80N_NEXTREG        (1ULL<<Z80N_PIN_NEXTREG)
 #define Z80N_NR_REG_SHIFT   (40)
 #define Z80N_NR_VAL_SHIFT   (48)
-#define Z80N_SIDEBAND_MASK  (Z80N_NEXTREG|(0xFFFFULL<<Z80N_NR_REG_SHIFT))
+// The NMI's two pushes and RETN's two pops carry the T80N's NMIACK and RETN commands, for one tick each, on the
+// T1 of the machine cycle (with MREQ|WR or MREQ|RD on the pins as usual). The Next always keeps the NMI's return
+// address in nextregs C2h (low) and C3h (high), written from the data bus during NMIACK; with its stackless
+// NMI (nextreg C0h bit 3) it also keeps those writes out of memory (MREQ hidden from the machine), and the first
+// RETN after the acknowledge reads C2h and C3h instead of memory (zxnext.vhd, z80_stackless_nmi). RETN here is
+// ED 45, 55, 5D, 65, 6D, 75 and 7D, as the T80N decodes them; RETI (ED 4D) carries none.
+#define Z80N_NMIACK_MSB     (1ULL<<56)  // the NMI's push of PC's high byte (its M2)
+#define Z80N_NMIACK_LSB     (1ULL<<57)  // ... of its low byte (M3)
+#define Z80N_RETN_LSB       (1ULL<<58)  // RETN's pop of PC's low byte (its M2)
+#define Z80N_RETN_MSB       (1ULL<<59)  // ... of its high byte (M3)
+#define Z80N_SIDEBAND_MASK  (Z80N_NEXTREG|(0xFFFFULL<<Z80N_NR_REG_SHIFT)|(0xFULL<<56))
 #define Z80N_GET_NR_REG(p)  ((uint8_t)((p)>>Z80N_NR_REG_SHIFT))
 #define Z80N_GET_NR_VAL(p)  ((uint8_t)((p)>>Z80N_NR_VAL_SHIFT))
 
@@ -479,6 +489,8 @@ bool z80_opdone(z80_t* cpu);
 #define Z80N_LDX_STEP       1790    // .. 1803 (LDIX LDDX LDIRX LDDRX, ED B6; LDPIRX from its +2)
 #define Z80N_LDPIRX_STEP    1804    // .. 1805
 #define Z80N_LDWS_STEP      1806    // .. 1812
+#define Z80N_RETN_STEP      1813    // .. 1819 (RETN, with the T80N's RETN commands)
+#define Z80N_NMI_STEP       1820    // .. 1830 (the NMI response, with its NMIACK commands)
 
 uint64_t z80_init(z80_t* cpu) {
     CHIPS_ASSERT(cpu);
@@ -915,6 +927,7 @@ static inline uint16_t _z80n_first_step(uint8_t op) {
         case 0x95: return Z80N_SETAE_STEP;      case 0x98: return Z80N_JPC_STEP;
         case 0xA4: case 0xAC: case 0xB4: case 0xB6: case 0xBC: return Z80N_LDX_STEP;
         case 0xA5: return Z80N_LDWS_STEP;       case 0xB7: return Z80N_LDPIRX_STEP;
+        case 0x45: case 0x55: case 0x5D: case 0x65: case 0x6D: case 0x75: case 0x7D: return Z80N_RETN_STEP;
         default: return 0;
     }
 }
@@ -1066,7 +1079,7 @@ static inline uint64_t _z80_fetch(z80_t* cpu, uint64_t pins) {
         return _z80_set_ab_x(pins, cpu->pc++, Z80_M1|Z80_MREQ|Z80_RD);
     } else if (cpu->int_bits & Z80_NMI) {
         // non-maskable interrupt starts with a regular M1 machine cycle
-        cpu->step = Z80_NMI_STEP;
+        cpu->step = cpu->z80n ? Z80N_NMI_STEP : Z80_NMI_STEP;
         cpu->int_bits = 0;
         if (pins & Z80_HALT) {
             pins &= ~Z80_HALT;
@@ -3088,6 +3101,26 @@ uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
             cpu->l++; cpu->f = _z80_add_flags(cpu->d, 1, (uint32_t)cpu->d + 1); cpu->d++;
             _goto(Z80N_LDWS_STEP+6);
         case Z80N_LDWS_STEP+6: _fetch();
+        //--- RETN (ED 45 55 5D 65 6D 75 7D), as z80.h's own but for the T80N's RETN_LSB and RETN_MSB on the pops
+        case Z80N_RETN_STEP:   _mread1(cpu->sp++); pins |= Z80N_RETN_LSB; _goto(Z80N_RETN_STEP+1);
+        case Z80N_RETN_STEP+1: _wait(); _mread2(); _goto(Z80N_RETN_STEP+2);
+        case Z80N_RETN_STEP+2: cpu->wzl = _gd(); _goto(Z80N_RETN_STEP+3);
+        case Z80N_RETN_STEP+3: _mread1(cpu->sp++); pins |= Z80N_RETN_MSB; _goto(Z80N_RETN_STEP+4);
+        case Z80N_RETN_STEP+4: _wait(); _mread2(); _goto(Z80N_RETN_STEP+5);
+        case Z80N_RETN_STEP+5: cpu->wzh = _gd(); cpu->pc = cpu->wz; _goto(Z80N_RETN_STEP+6);
+        case Z80N_RETN_STEP+6: pins = _z80_fetch(cpu, pins); cpu->iff1 = cpu->iff2; goto step_to;
+        //--- the NMI response, as z80.h's own but for the T80N's NMIACK_MSB and NMIACK_LSB on the pushes
+        case Z80N_NMI_STEP:    _wait(); cpu->iff1 = false; _goto(Z80N_NMI_STEP+1);
+        case Z80N_NMI_STEP+1:  pins = _z80_refresh(cpu, pins); _goto(Z80N_NMI_STEP+2);
+        case Z80N_NMI_STEP+2:  _goto(Z80N_NMI_STEP+3);
+        case Z80N_NMI_STEP+3:  _goto(Z80N_NMI_STEP+4);
+        case Z80N_NMI_STEP+4:  _mwrite1(--cpu->sp, cpu->pch); pins |= Z80N_NMIACK_MSB; _goto(Z80N_NMI_STEP+5);
+        case Z80N_NMI_STEP+5:  _wait(); _mwrite2(); _goto(Z80N_NMI_STEP+6);
+        case Z80N_NMI_STEP+6:  _goto(Z80N_NMI_STEP+7);
+        case Z80N_NMI_STEP+7:  _mwrite1(--cpu->sp, cpu->pcl); pins |= Z80N_NMIACK_LSB; _goto(Z80N_NMI_STEP+8);
+        case Z80N_NMI_STEP+8:  _wait(); _mwrite2(); cpu->wz = cpu->pc = 0x0066; _goto(Z80N_NMI_STEP+9);
+        case Z80N_NMI_STEP+9:  _goto(Z80N_NMI_STEP+10);
+        case Z80N_NMI_STEP+10: _fetch();
         default: _Z80_UNREACHABLE;
     }
 fetch_next:
