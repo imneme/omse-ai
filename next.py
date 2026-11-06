@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
     }
@@ -237,6 +237,7 @@ class Next:
     frame = property(lambda self: self.lib.zxn_frame(self.z))
     hc_ula = property(lambda self: self.lib.zxn_hc_ula(self.z))
     vc_ula = property(lambda self: self.lib.zxn_vc_ula(self.z))
+    cvc = property(lambda self: self.lib.zxn_cvc(self.z))         # the ULA line + NR 0x64's offset
     speed = property(lambda self: self.lib.zxn_speed(self.z))
 
     def run_ticks(self, n):

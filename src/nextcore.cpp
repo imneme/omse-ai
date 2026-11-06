@@ -121,6 +121,15 @@ struct ZXN {
     uint16_t int_status = 0;            // each source's status (im2p:150-160), bit = source number
     uint16_t im2_req = 0;               // hardware IM2: pending until its service ends (im2p:162-176)
     uint8_t im2_state[14] = {0};        // im2_device.vhd: 0 idle, 1 requesting, 2 acknowledged, 3 in service
+    uint8_t cop_ram[2048] = {0};        // the copper's 1K x 16 instructions, MSB at even byte addresses
+    int cop_waddr = 0;                  // nr_copper_addr, 11 bits, the byte NR 0x60/0x63 write next
+    uint8_t cop_stored = 0;             // nr_copper_data_stored, NR 0x63's even byte
+    int cop_mode = 0, cop_last = 0;     // NR 0x62 b7:6, and copper.vhd's last_state_s
+    int cop_pc = 0;                     // copper_list_addr_s
+    bool cop_dout = false, cop_dout_d = false, cop_req = false;   // a MOVE's pulse, its edge, the arbitrated write
+    uint16_t cop_data = 0;              // copper_data_o
+    uint8_t cop_reg = 0, cop_val = 0;   // copper_nr_reg / copper_nr_dat
+    uint8_t nmi_flags = 0;              // NR 0x02 b3 (multiface) and b2 (divMMC): software NMI requests
     struct Ctc {                        // ctc_chan.vhd: one channel
         uint8_t state = 0;              // 0 reset, 1 reset awaiting a time constant, 2 trigger, 3 run, 4 run awaiting one
         uint8_t ctrl = 0;               // the control word's bits 7:3 (b4 int enable, b3 counter, b2 /256, b1 rising, b0 trigger)
@@ -373,7 +382,7 @@ void ctc_write(ZXN& z, int n, uint8_t v);
 
 int nr_read(ZXN& z, int n) {
     switch (n) {
-        case 0x02: return (z.reset_type == 2 ? 2 : z.reset_type == 1 ? 1 : 0) | (z.nr[0x02] & 0x80);   // ref §4.3
+        case 0x02: return (z.reset_type == 2 ? 2 : z.reset_type == 1 ? 1 : 0) | (z.nr[0x02] & 0x80) | z.nmi_flags;
         case 0x03: return (z.pend_timing << 4) | (z.lock << 3) | z.mtype; // the registers, not the timing in effect
                                                                       // (zxnext:5800-5801; palette sub-index b7: later)
         case 0x05: return z.nr[0x05];
@@ -399,6 +408,8 @@ int nr_read(ZXN& z, int n) {
             return ((st & 1) << 7) | (((st >> 11) & 1) << 6) | ((st >> 3) & 0x0F);
         }
         case 0xC6: return z.nr[0xC6] & 0x77;                          // (zxnext:6151-6152)
+        case 0x61: return z.cop_waddr & 0xFF;                         // (zxnext:5990-5994)
+        case 0x62: return (z.cop_mode << 6) | (z.cop_waddr >> 8);
         case 0xC5: {
             int v = 0;
             for (int n = 0; n < 4; n++) v |= ((z.ctc[n].ctrl >> 4) & 1) << n;
@@ -475,6 +486,22 @@ void nr_write(ZXN& z, int n, int v) {
         case 0xC6:
             z.nr[0xC6] = v & 0x77;
             return;
+        case 0x60: case 0x63:                                         // copper data, 8-bit or 16-bit (zxnext:3918-3940,
+            if (n == 0x60) z.cop_ram[z.cop_waddr] = v;                // 5356-5375): 0x60 writes each byte; 0x63 holds the
+            else if (z.cop_waddr & 1) {                               // even byte and writes both on the odd one
+                z.cop_ram[z.cop_waddr - 1] = z.cop_stored;
+                z.cop_ram[z.cop_waddr] = v;
+            }
+            if (!(z.cop_waddr & 1)) z.cop_stored = v;
+            z.cop_waddr = (z.cop_waddr + 1) & 0x7FF;
+            return;
+        case 0x61:
+            z.cop_waddr = (z.cop_waddr & 0x700) | v;
+            return;
+        case 0x62:
+            z.cop_mode = v >> 6;
+            z.cop_waddr = (z.cop_waddr & 0xFF) | ((v & 7) << 8);
+            return;
         case 0xC8:                                                    // write 1 to clear (zxnext:1911-1914)
             if (v & 1) z.int_status &= ~(1 << 11);
             if (v & 2) z.int_status &= ~1;
@@ -504,6 +531,8 @@ void nr_write(ZXN& z, int n, int v) {
             return;
         case 0x02:                                                    // reset (ref §4.3)
             z.nr[0x02] = (z.nr[0x02] & 0x7F) | (v & 0x80);
+            z.nmi_flags = v & 0x0C;                                   // b3/b2 request an NMI; a 0 clears (zxnext:3781-3805;
+                                                                      // the NMI itself: with the multiface)
             if (v & 2) do_reset(z, true);
             else if (v & 1) do_reset(z, false);
             return;
@@ -620,6 +649,11 @@ void do_reset(ZXN& z, bool hard) {
     z.int_status = z.im2_req = 0;
     memset(z.im2_state, 0, sizeof z.im2_state);
     for (auto& c : z.ctc) c = ZXN::Ctc();                             // (ctc_chan.vhd: reset_hard)
+    z.cop_mode = z.cop_waddr = z.cop_pc = 0;                          // (zxnext:4959-4963; copper:52-56)
+    z.cop_stored = 0;
+    z.cop_dout = z.cop_dout_d = z.cop_req = false;
+    z.cop_data = 0;
+    z.nmi_flags = 0;                                                  // (zxnext:3784-3785, 3797-3798)
     z.nr_sel = 0x24;
     z.ula_int_disabled = false;
     z.int_req = z.int_low = false;
@@ -808,6 +842,48 @@ inline void draw_pixel(ZXN& z) {
 
 // One rising edge of the CPU clock. Returns false (and changes nothing) if a run_until_pc stop is due: the CPU is
 // about to begin T1 of an instruction's first opcode fetch at an address in the range (DESIGN.md §9.1 (5)).
+// ---- the copper (copper.vhd), one 28 MHz cycle. A WAIT (b15 = 1) waits for cvc = b8:0 and hc_ula >= 8 x b14:9 + 12;
+// a MOVE writes b7:0 to nextreg b14:8 (0x00-0x7F; register 0 is a NOP) and costs a second cycle. Mode 01 runs the
+// list once from 0, 11 restarts it at each frame's (0, 0), 10 carries on from where it is; a change of mode resets
+// the address for 01 and 11. Its writes win the nextreg arbitration and land two cycles after the MOVE
+// (zxnext:4650-4676).
+void nr_write(ZXN& z, int n, int v);
+inline int cvc(const ZXN& z);
+inline int hc_ula(const ZXN& z);
+void copper_tick(ZXN& z) {
+    if (!z.cop_mode && !z.cop_last && !z.cop_dout && !z.cop_dout_d && !z.cop_req) return;
+    const bool req = z.cop_req;
+    const uint8_t reg = z.cop_reg, val = z.cop_val;
+    z.cop_req = false;
+    if (z.cop_dout && !z.cop_dout_d) {                                // copper_requester's rising edge
+        z.cop_req = true;
+        z.cop_reg = (z.cop_data >> 8) & 0x7F;
+        z.cop_val = z.cop_data & 0xFF;
+    }
+    z.cop_dout_d = z.cop_dout;
+    if (z.cop_last != z.cop_mode) {
+        z.cop_last = z.cop_mode;
+        if (z.cop_mode == 1 || z.cop_mode == 3) z.cop_pc = 0;
+        z.cop_dout = false;
+    } else if (z.cop_mode == 3 && cvc(z) == 0 && hc_ula(z) == 0) {
+        z.cop_pc = 0;
+        z.cop_dout = false;
+    } else if (z.cop_mode) {
+        if (z.cop_dout) z.cop_dout = false;
+        else {
+            const uint16_t ins = z.cop_ram[2 * z.cop_pc] << 8 | z.cop_ram[2 * z.cop_pc + 1];
+            if (ins & 0x8000) {
+                if (cvc(z) == (ins & 0x1FF) && hc_ula(z) >= ((ins >> 9) & 0x3F) * 8 + 12) z.cop_pc = (z.cop_pc + 1) & 0x3FF;
+            } else {
+                z.cop_data = ins & 0x7FFF;
+                if (ins & 0x7F00) z.cop_dout = true;
+                z.cop_pc = (z.cop_pc + 1) & 0x3FF;
+            }
+        }
+    } else z.cop_dout = false;
+    if (req) nr_write(z, reg, val);                                   // the arbitrated write (it may reset the machine)
+}
+
 // ---- the CTC (ctc_chan.vhd). A write to a channel waiting for a time constant stores it; otherwise bit 0 = 1 is a
 // control word (bit 1 resets the channel, bit 2 says a time constant follows) and bit 0 = 0 a vector (unused here).
 void ctc_write(ZXN& z, int n, uint8_t v) {
@@ -1171,6 +1247,7 @@ bool master_tick(ZXN& z) {
         }
         draw_pixel(z);
     }
+    copper_tick(z);
     ctc_tick(z);
     z.t28++;
     return true;
@@ -1293,6 +1370,7 @@ void zxn_nr_write(ZXN* z, int n, int v) { nr_write(*z, n & 0xFF, v); }
 int zxn_io_in(ZXN* z, int port) { return io_read(*z, port & 0xFFFF); }
 void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
 uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
+int zxn_cvc(ZXN* z) { return cvc(*z); }                          // DESIGN.md §9
 int zxn_sd_insert(ZXN* z, const char* path, int writable, int kind) { return z->sd.insert(path, writable != 0, kind); }
 void zxn_sd_eject(ZXN* z) { z->sd.eject(); }
 void zxn_sd_timing(ZXN* z, int ncr, int nac, int busy, int init_tries) {   // as zxcore's zx_sd_timing
