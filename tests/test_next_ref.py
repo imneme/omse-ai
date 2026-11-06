@@ -24,6 +24,7 @@ CITE = re.compile(r'zxnext:(\d+)(?:-(\d+))?')
 # returns the read mux, which can differ.
 KNOWN_TSV_DIFFS = {
     0xA2: 'tsv gives the stored 0x00 and notes "reads b1=1"; the read is 0x02',
+    0xCA: 'tsv gives 0; after any reset both Tx-empty status bits are set (Loam, 6 Nov)',
 }
 
 

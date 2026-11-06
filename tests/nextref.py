@@ -129,7 +129,9 @@ POWER_ON = {
     0xC6: (0x00, 'zxnext:5037-5038', 'zxnext:6151-6152'),
     0xC8: (0x00, 'no interrupt yet', 'zxnext:6154-6155'),
     0xC9: (0x00, 'no interrupt yet', 'zxnext:6157-6158'),
-    0xCA: (0x00, 'no interrupt yet', 'zxnext:6160-6161'),
+    0xCA: (0x44, 'both UARTs\' Tx-empty status: their Tx FIFOs are empty through reset, so the first '
+                 'clock after it sees a rising request (im2_int_req, zxnext line 1900; im2p:93-101, 156-160); writes clear '
+                 '(zxnext:1911-1914)', 'zxnext:6160-6161'),
     0xCC: (0x00, 'zxnext:5040-5041', 'zxnext:6163-6164'),
     0xCD: (0x00, 'zxnext:5042', 'zxnext:6166-6167'),
     0xCE: (0x00, 'zxnext:5043-5044', 'zxnext:6169-6170'),
