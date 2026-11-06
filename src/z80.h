@@ -224,7 +224,12 @@
     MODIFICATION NOTICE:
 
     This code has been modified from the original version to add items to the
-    address bus following the timings of the original Z80 CPU. 
+    address bus following the timings of the original Z80 CPU.
+
+    It has also been modified (for omse-ai, 2026) to add the ZX Spectrum
+    Next's Z80N extra instructions, and their side-band signals on the pins,
+    behind the z80_t.z80n flag, which is off by default; with it off, the
+    CPU behaves as before.
 
 */
 #include <stdint.h>
