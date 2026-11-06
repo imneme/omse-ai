@@ -923,6 +923,12 @@ void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
 uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
 int zxn_sd_insert(ZXN* z, const char* path, int writable, int kind) { return z->sd.insert(path, writable != 0, kind); }
 void zxn_sd_eject(ZXN* z) { z->sd.eject(); }
+void zxn_sd_timing(ZXN* z, int ncr, int nac, int busy, int init_tries) {   // as zxcore's zx_sd_timing
+    z->sd.ncr = ncr;
+    z->sd.nac = nac;
+    z->sd.busy = busy;
+    z->sd.init_tries = init_tries;
+}
 int zxn_spi_state(ZXN* z) { return z->spi_state; }
 uint64_t zxn_spi_count(ZXN* z) { return z->spi_count; }
 int zxn_fb_width() { return FB_W; }

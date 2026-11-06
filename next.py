@@ -54,7 +54,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
     }
@@ -215,6 +215,11 @@ class Next:
 
     def sd_eject(self):
         self.lib.zxn_sd_eject(self.z)
+
+    def sd_timing(self, ncr=1, nac=3, busy=2, init_tries=2):
+        """The card's delays, in SPI bytes, as speccy.py's: before a response (N_CR, 0-8 on a real SD card), before
+        a data block (N_AC), busy after a write; and how many ACMD41s it takes to leave the idle state."""
+        self.lib.zxn_sd_timing(self.z, ncr, nac, busy, init_tries)
 
     spi_state = property(lambda self: self.lib.zxn_spi_state(self.z))
     spi_count = property(lambda self: self.lib.zxn_spi_count(self.z))
