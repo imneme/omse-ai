@@ -661,3 +661,31 @@ def p3_dma_run(q, v, cycles, contended, line_len, lines):
         while q >= line_len:
             q, v = q - line_len, (v + 1) % lines
     return total
+
+
+def dma_burst_reads(first, n, r, w, prescaler, m, mcycles, j):
+    """READ_1 stamps (cpu_clocks) of an n-byte burst transfer with a due
+    prescaler, the first at `first`, while the CPU runs a sled whose M-cycles
+    repeat with lengths `mcycles`, frozen at the end of M-cycle j at the first
+    grant. Per byte from its READ_1 edge E0: WAITING_CYCLES releases BUSRQ at
+    E(r+w+1) (dma:441-447); the T80N samples it at E(r+w+2) and at E(r+w+3)
+    drops BUSAK and starts its next M-cycle (t80n:1661-1663, 1738-1752). The
+    DMA leaves WAITING at E_k (dma:451), asks again at E(k+1) (dma:269-283);
+    the T80N sees it at E(k+2) and grants only where an M-cycle ends, T_Res,
+    internal M-cycles too (t80n:1742-1747); READ_1 is the edge after.
+    Returns (stamps, the M-cycle index at each later grant)."""
+    assert (m * (r + w - 2)) >> 5 < prescaler, 'the prescaler must be due at WRITE_4'
+    stamps, grants = [first], []
+    for _ in range(n - 1):
+        k = r + w + 1
+        while (m * (k - 2)) >> 5 < prescaler:
+            k += 1
+        t = r + w + 3                                   # the CPU's next M-cycle starts here
+        while True:
+            j = (j + 1) % len(mcycles)
+            t += mcycles[j]                             # the edge that ends it
+            if t >= k + 3:
+                break
+        grants.append(j)
+        stamps.append(stamps[-1] + t + 1)
+    return stamps, grants

@@ -46,10 +46,11 @@ def pattern(n, seed=11):
 
 def program(zx, a, b, n, ab=True, a_mode=INC, b_mode=INC, a_io=False, b_io=False,
             a_t=None, b_t=None, pre=None, mode=CONTINUOUS, restart=False, port=ZXN,
-            enable=True):
+            enable=True, op=0b01):
     """Disable, WR0-WR5, LOAD and (unless told not to) ENABLE, as io_out writes
-    (dma:509-735). a and b are port A's and port B's addresses; ab=True is A -> B."""
-    out = [0x83, 0x7D if ab else 0x79, a & 0xFF, a >> 8, n & 0xFF, n >> 8]
+    (dma:509-735). a and b are port A's and port B's addresses; ab=True is A -> B;
+    op is WR0's bits 1:0 (01 transfer; 10, 11 search on a Zilog)."""
+    out = [0x83, 0x78 | ab << 2 | op, a & 0xFF, a >> 8, n & 0xFF, n >> 8]
     out.append(0x04 | a_io << 3 | a_mode << 4 | (a_t is not None) << 6)
     if a_t is not None:
         out.append(a_t)
@@ -150,6 +151,19 @@ class Registers(NextCase):
         zx.io_out(ZXN, 0xC3)
         self.assertEqual(reads(zx, 1), [0x3A], 'C3h: E=1, T=0 (dma:637-646)')
 
+    def test_reset_command_restores_both_timings_and_clears_the_prescaler(self):
+        """C3h sets both ports' timing back to 3 clocks and the prescaler to 0
+        (dma:641-643). (A mutant survivor, Speccy-Zone's run 1.)"""
+        zx = machine()
+        zx.dma_log(True)
+        program(zx, A, B, 4, a_t=T2, b_t=T4, pre=5, enable=False)
+        zx.io_out(ZXN, 0xC3)
+        program(zx, A, B, 4)                            # no timing bytes this time
+        zx.run_ticks(20000)
+        ev = zx.dma_events
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [3] * 7,
+                         'three clocks each way, and no prescaler between bytes')
+
     def test_reinitialise_status(self):
         zx = machine()
         zx.write(A, pattern(4))
@@ -243,6 +257,38 @@ class Transfers(NextCase):
         n = len(zx.dma_events)
         zx.run_ticks(20000)
         self.assertEqual(len(zx.dma_events), n, '83h stops it')
+
+    def test_z80_mode_auto_restart_blocks_are_length_plus_one(self):
+        """FINISH_DMA's reload loads the counter with FFFFh in Z80 mode
+        (dma:482-486), so every restarted block moves length + 1, like the first.
+        (A mutant survivor, Speccy-Zone's run 1.)"""
+        zx = machine()
+        zx.write(A, pattern(4))
+        zx.dma_log(True)
+        program(zx, A, B, 2, restart=True, pre=8, mode=BURST, port=Z80)
+        for _ in range(200000):
+            zx.run_ticks(1)
+            if len(zx.dma_events) >= 20 and not zx.busak:
+                break
+        zx.io_out(Z80, 0x83)
+        got = [a for k, a, v in cycles(zx.dma_events) if k == 'mr']
+        self.assertGreaterEqual(len(got), 10)
+        self.assertEqual(got, [A + i % 3 for i in range(len(got))], 'blocks of three from length 2')
+
+    def test_wr0_search_codes_still_transfer(self):
+        """WR0 is any base byte with b7 = 0 and bits 1:0 not 00 (dma:513): 10
+        and 11 (search, search/transfer on a Zilog) set the direction and take
+        their follow-on bytes like 01. (A mutant survivor, Speccy-Zone's run 1.)"""
+        for op in (0b10, 0b11):
+            for ab in (True, False):
+                with self.subTest(op=op, ab=ab):
+                    zx = machine()
+                    src, dst = (A, B) if ab else (B, A)
+                    zx.write(src, pattern(6, seed=op))
+                    zx.write(dst, bytes(6))
+                    program(zx, A, B, 6, ab=ab, op=op)
+                    zx.run_ticks(20000)
+                    self.assertEqual(zx.read(dst, 6), pattern(6, seed=op))
 
     def test_the_dma_cannot_program_itself(self):
         zx = machine()
@@ -373,6 +419,75 @@ class Timing(NextCase):
         ev = [e for e in zx.dma_events if e[2] == 'mr']
         self.assertEqual(len(ev), 4, 'Z80 mode: length + 1')
         self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [ref.dma_period(3, 3, 10, 8)] * 3)
+
+    def out_then_sled(self, n, **kw):
+        """Program the DMA but leave it disabled; the CPU runs LD A,87h;
+        OUT (6Bh),A then a sled of ADD HL,BC (M-cycles 4, 4, 3: t80n_mcode:891-935).
+        Returns (cpu_clocks at the OUT's fetch, the events)."""
+        zx = bare()
+        zx.load(0x8100, bytes([0x3E, 0x87, 0xD3, 0x6B] + [0x09] * 3000 + [0x18, 0xFE]))
+        zx.dma_log(True)
+        program(zx, A, B, n, enable=False, **kw)
+        launch(zx, 0x8100)
+        self.assertTrue(zx.run_until_pc(0x8102, max_ticks=10**6))
+        c0 = zx.cpu_clocks
+        zx.run_ticks(n * 32 * 30 + 20000)
+        return c0, zx.dma_events
+
+    def test_an_out_starts_the_dma_at_the_next_mcycle_end(self):
+        """The OUT's IORQ/WR fall at the rising edge after its first I/O T-state
+        (t80na:151-154, 334-356), and the DMA sees the write at its next rising
+        edge (dma:500-505), asks for the bus one later, and the T80N samples that
+        one later still (t80n:1663): too late for the OUT's own T_Res, so the
+        grant comes at the end of the next instruction's M1 (t80n:1742-1747).
+        From the OUT's fetch: 11 clocks of OUT, 4 of the M1, READ_1 at the 17th
+        edge, stamped c0 + 16. (Mutant survivors 4 and 5, Speccy-Zone's run 1.)"""
+        c0, ev = self.out_then_sled(4)
+        self.assertEqual(len(ev), 8)
+        self.assertEqual(ev[0][1] - c0, 16)
+
+    def test_burst_grants_wait_for_the_cpus_mcycle_ends(self):
+        """Burst mode with a prescaler: each byte's renewed request is granted
+        only where one of the CPU's M-cycles ends, internal ones included
+        (nextref.dma_burst_reads). Prescalers 20, 21, 22 put the grants at the
+        ends of the M1, the first internal M-cycle and the second."""
+        seen = set()
+        for pre in (20, 21, 22):
+            with self.subTest(prescaler=pre):
+                c0, ev = self.out_then_sled(6, pre=pre, mode=BURST)
+                want, grants = ref.dma_burst_reads(16, 6, 3, 3, pre, 8, [4, 4, 3], 0)
+                self.assertEqual([e[1] - c0 for e in ev if e[2] == 'mr'], want)
+                seen |= set(grants)
+        self.assertEqual(seen, {0, 1, 2}, 'grants at every kind of M-cycle end')
+
+    def test_the_speed_waits_for_the_dma_to_let_go(self):
+        """cpu_speed (and NR 08h's contention disable) are copied only at an edge
+        where the DMA isn't holding the bus (zxnext:5714). A copper MOVE of 3 to
+        NR 07h mid-block takes effect only after BUSAK falls. (Speccy-Zone's
+        finding in the core, run 1.)"""
+        zx = machine(timing='48k')
+        v = zx.cvc + 20 if zx.cvc + 20 < 300 else 10
+        load_copper(zx, [copper_wait(v), copper_move(0x07, 0x03), COPPER_NEVER])
+        zx.dma_log(True)
+        program(zx, 0xA000, 0xC000, 9000, a_mode=FIXED, b_mode=FIXED)
+        zx.nr_write(0x62, 0x40)
+        passed = False
+        for _ in range(9000 * 6 * 8 // 64 + 2000):
+            zx.run_ticks(64)
+            if not zx.busak and len(zx.dma_events) >= 18000:
+                break
+            if zx.busak:
+                passed |= zx.cvc > v
+                self.assertEqual(zx.speed, 0, f'the speed changed with the bus held '
+                                              f'({len(zx.dma_events)} cycles in)')
+        self.assertTrue(passed, 'the copper\'s line came and went inside the block')
+        ev = zx.dma_events
+        self.assertEqual(len(ev), 18000)
+        self.assertTrue(all(b[0] - a[0] == 8 * (b[1] - a[1]) for a, b in zip(ev, ev[1:])),
+                        'every DMA clock at 3.5 MHz')
+        zx.run_ticks(200)
+        self.assertEqual(zx.speed, 3, 'then 28 MHz')
+        self.assertEqual(zx.nr_read(0x07) & 0x03, 0x03, 'the copper did write it')
 
     def test_continuous_mode_keeps_the_bus(self):
         zx = machine()
