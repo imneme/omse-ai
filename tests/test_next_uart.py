@@ -303,7 +303,8 @@ class Receive(NextCase):
         zx.run_ticks(P0 * 22)
         self.assertEqual(status(zx) & 0x01, 0x01)
         zx.io_out(FRAME, 0x98)
-        zx.io_out(FRAME, 0x18)
+        zx.run_ticks(16)                                # an instruction's worth: b7 held a while,
+        zx.io_out(FRAME, 0x18)                          # as two OUTs on a real Next would hold it
         zx.run_ticks(10)
         self.assertEqual(status(zx) & 0x01, 0x00, 'uart:385')
 
