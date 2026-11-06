@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
     }
@@ -349,6 +349,11 @@ class Next:
             raise ValueError(f'an SD card is one of {", ".join(self.SD_KINDS)}, not {kind!r}')
         return self.lib.zxn_sd_insert(self.z, str(path).encode(), 1 if writable else 0,
                                       self.SD_KINDS.index(kind))
+
+    def set_joy(self, left=0, right=0):
+        """The two joysticks, a bit per control pressed: R L D U B C A START Y Z X in bits 0-10 (zxnext:3398-3400).
+        Kempston reads bits 5:0 (fire, up, down, left, right), MD adds 7:6."""
+        self.lib.zxn_set_joy(self.z, left, right)
 
     def sd_eject(self):
         self.lib.zxn_sd_eject(self.z)

@@ -130,6 +130,13 @@ struct ZXN {
     uint16_t cop_data = 0;              // copper_data_o
     uint8_t cop_reg = 0, cop_val = 0;   // copper_nr_reg / copper_nr_dat
     uint8_t nmi_flags = 0;              // NR 0x02 b3 (multiface) and b2 (divMMC): software NMI requests
+    uint16_t joy[2] = {0, 0};           // the joysticks: X Z Y START A C B U D L R in bits 10:0 (zxnext:3398-3400)
+    uint8_t ay_reg[3][16] = {{0}};      // the AYs' register files (ym2149.vhd), chip 0 = AY_ID 11, 1 = 10, 2 = 01
+    uint8_t ay_addr[3] = {0, 0, 0};     // each chip's selected register (5 bits)
+    int ay_sel = 0;                     // turbosound.vhd's ay_select, as a chip number
+    uint8_t ulap_mode = 0, ulap_index = 0;   // port 0xBF3B (zxnext:4466-4478)
+    bool ulap_en = false;               // port_ff3b_ulap_en
+    uint8_t ulap_pal[64] = {0};         // ULA+ entries as written through 0xFF3B (the palette system itself: later)
     struct Ctc {                        // ctc_chan.vhd: one channel
         uint8_t state = 0;              // 0 reset, 1 reset awaiting a time constant, 2 trigger, 3 run, 4 run awaiting one
         uint8_t ctrl = 0;               // the control word's bits 7:3 (b4 int enable, b3 counter, b2 /256, b1 rising, b0 trigger)
@@ -379,6 +386,12 @@ inline bool locked(const ZXN& z);
 void int_raise(ZXN& z, int i, bool unq);
 inline uint16_t int_status(const ZXN& z);
 void ctc_write(ZXN& z, int n, uint8_t v);
+void ay_reset(ZXN& z);
+void ay_select(ZXN& z, uint8_t v);
+void ay_write(ZXN& z, uint8_t v);
+uint8_t ay_read(const ZXN& z, bool info);
+inline bool joy_port_on(const ZXN& z, int port);
+uint8_t joy_read(const ZXN& z, int port);
 
 int nr_read(ZXN& z, int n) {
     switch (n) {
@@ -408,6 +421,7 @@ int nr_read(ZXN& z, int n) {
             return ((st & 1) << 7) | (((st >> 11) & 1) << 6) | ((st >> 3) & 0x0F);
         }
         case 0xC6: return z.nr[0xC6] & 0x77;                          // (zxnext:6151-6152)
+        case 0x68: return (z.nr[0x68] & 0xF5) | (z.ulap_en ? 0x08 : 0);   // b3 is port_ff3b_ulap_en (zxnext:5998-5999)
         case 0x61: return z.cop_waddr & 0xFF;                         // (zxnext:5990-5994)
         case 0x62: return (z.cop_mode << 6) | (z.cop_waddr >> 8);
         case 0xC5: {
@@ -452,6 +466,14 @@ void nr_write(ZXN& z, int n, int v) {
             z.portff = (z.portff & ~0x40) | ((v & 4) << 4);           // b2 is port FF b6 (zxnext:3577-3578)
             z.ula_int_disabled = z.portff & 0x40;
             z.nr[0x22] = v & 3;                                       // the line interrupt: enable, line b8 (zxnext:5233-5236)
+            return;
+        case 0x68:                                                    // b3: ULA+ on (zxnext:4491-4492; the rest: later)
+            z.nr[0x68] = v;
+            z.ulap_en = v & 8;
+            return;
+        case 0x06:                                                    // PS/2 mode (bit 2) only in config mode
+            z.nr[0x06] = z.config_mode ? v : (v & ~0x04) | (z.nr[0x06] & 0x04);   // (zxnext:5100-5109)
+            if ((v & 3) == 3) ay_reset(z);                            // PSG mode 11 holds the AYs in reset (6286)
             return;
         case 0x12: case 0x13:                                         // Layer 2's banks, 7 bits (zxnext:5157-5161)
             z.nr[n] = v & 0x7F;
@@ -560,9 +582,6 @@ void nr_write(ZXN& z, int n, int v) {
             z.nr[0x05] = v;
             z.pend_hz60 = (v >> 2) & 1;
             return;
-        case 0x06:                                                    // PS/2 mode (bit 2) only in config mode
-            z.nr[0x06] = z.config_mode ? v : (v & ~0x04) | (z.nr[0x06] & 0x04);   // (zxnext:5100-5109)
-            return;
         case 0x07:
             z.speed_prog = v & 3;                                     // takes effect between bus cycles (ref §1.3)
             return;
@@ -654,6 +673,9 @@ void do_reset(ZXN& z, bool hard) {
     z.cop_dout = z.cop_dout_d = z.cop_req = false;
     z.cop_data = 0;
     z.nmi_flags = 0;                                                  // (zxnext:3784-3785, 3797-3798)
+    ay_reset(z);
+    z.ulap_mode = z.ulap_index = 0;                                   // (zxnext:4469-4471, 4487-4488)
+    z.ulap_en = false;
     z.nr_sel = 0x24;
     z.ula_int_disabled = false;
     z.int_req = z.int_low = false;
@@ -707,6 +729,15 @@ uint8_t io_read(ZXN& z, uint16_t port) {
     }
     if ((port & 0xFF) == 0xFF) return floating_bus(z);                // always answered (ref §5.1)
     if ((port & 0xFF) == 0xEB && port_en(z, 11)) return z.spi_rx;     // the previous transfer's byte (ref §1.7)
+    if ((port & 0xFF) == 0x1F && port_en(z, 6) && joy_port_on(z, 0x1F)) return joy_read(z, 0x1F);   // (zxnext:2633)
+    if ((port & 0xFF) == 0x37 && port_en(z, 7) && joy_port_on(z, 0x37)) return joy_read(z, 0x37);   // (zxnext:2634)
+    if (fd(port) && (port & 4) && port_en(z, 16)) {                   // the AY: FFFD, BFFD (+3 timing), BFF5
+        const int hi = port >> 14;                                    // (zxnext:2606-2608, 2730)
+        if (hi == 2 && !(port & 8)) return ay_read(z, true);
+        if (hi == 3 || (hi == 2 && z.timing == 3)) return ay_read(z, false);
+    }
+    if (port == 0xFF3B && port_en(z, 24))                             // ULA+ (zxnext:4497-4508)
+        return z.ulap_mode == 0 ? z.ulap_pal[z.ulap_index] : z.ulap_en;
     if ((port & 0xF8FF) == 0x183B && port_en(z, 27))                  // the CTC: channel by A10:8, 4-7 answer 00
         return ((port >> 8) & 7) < 4 ? z.ctc[(port >> 8) & 7].count : 0x00;    // (zxnext:2649, 2792; ctc:155-176)
     if ((port & 0xFF) == 0xE3 && dm_en(z)) return z.porte3 & 0xCF;    // divMMC (zxnext:2567, 4131)
@@ -725,6 +756,19 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
         else z.spi_cs = 0xFF;
     }
     if ((port & 0xF8FF) == 0x183B && port_en(z, 27) && ((port >> 8) & 7) < 4) ctc_write(z, (port >> 8) & 7, v);
+    if (fd(port) && (port & 4) && port_en(z, 16)) {                   // the AY (zxnext:2731-2732): FFFD loses to DFFD
+        const bool dffd = (port >> 12) == 0xD && port_en(z, 2);
+        if ((port >> 14) == 3 && !dffd) ay_select(z, v);
+        else if ((port >> 14) == 2) ay_write(z, v);
+    }
+    if (port == 0xBF3B && port_en(z, 24)) {                           // ULA+ mode and index (zxnext:4472-4477)
+        z.ulap_mode = v >> 6;
+        if (z.ulap_mode == 0) z.ulap_index = v & 0x3F;
+    }
+    if (port == 0xFF3B && port_en(z, 24)) {                           // mode 00: a palette entry; 01: the enable
+        if (z.ulap_mode == 0) z.ulap_pal[z.ulap_index] = v;
+        else if (z.ulap_mode == 1) z.ulap_en = v & 1;
+    }
     if (port == 0x123B && port_en(z, 15)) {                           // Layer 2's control (zxnext:3855-3864)
         if (v & 0x10) z.l2_off = v & 7;
         else {
@@ -770,6 +814,7 @@ inline bool contended_page(const ZXN& z, uint16_t a) {
 }
 // Is the port contended as the ULA's own? A0 = 0, and under 128K timing ports that decode as 7FFD (zxnext 4437).
 inline bool contended_port(const ZXN& z, uint16_t port) {
+    if ((port == 0xBF3B || port == 0xFF3B) && port_en(z, 24)) return true;   // ULA+ ("uno requires", zxnext:4437)
     return !(port & 1) || (z.timing == 2 && dec_7ffd(z, port));      // port_7ffd's own decode: not 1FFD, enabled (zxnext 2552)
 }
 // At each rising CPU edge: what does this T-state ask the ULA? zxula.vhd holds the clock for (a) a contended address
@@ -842,6 +887,69 @@ inline void draw_pixel(ZXN& z) {
 
 // One rising edge of the CPU clock. Returns false (and changes nothing) if a run_until_pc stop is due: the CPU is
 // about to begin T1 of an instruction's first opcode fetch at an address in the range (DESIGN.md §9.1 (5)).
+// ---- the AYs (turbosound.vhd, ym2149.vhd): register files only, no sound yet. Reset leaves every register 0 but the
+// mixer (R7) at 0xFF, register 0 selected and AY 0 chosen (ym2149:166-187; turbosound:80-86).
+void ay_reset(ZXN& z) {
+    memset(z.ay_reg, 0, sizeof z.ay_reg);
+    for (auto& r : z.ay_reg) r[7] = 0xFF;
+    memset(z.ay_addr, 0, sizeof z.ay_addr);
+    z.ay_sel = 0;
+}
+inline bool ay_held(const ZXN& z) { return (z.nr[0x06] & 3) == 3; }  // NR 0x06 PSG mode 11 holds them in reset (6286)
+// 0xFFFD: with TurboSound on (NR 0x08 b1), 1xx111nn picks a chip (nn 10 -> 1, 01 -> 2, else 0); 000rrrrr selects
+// a register of the chosen chip (turbosound:80-100)
+void ay_select(ZXN& z, uint8_t v) {
+    if (ay_held(z)) return;
+    if ((z.nr[0x08] & 2) && (v & 0x80) && (v & 0x1C) == 0x1C) z.ay_sel = (v & 3) == 2 ? 1 : (v & 3) == 1 ? 2 : 0;
+    else if (!(v & 0xE0)) z.ay_addr[z.ay_sel] = v & 0x1F;
+}
+void ay_write(ZXN& z, uint8_t v) {                                    // 0xBFFD (ym2149:183-206)
+    if (ay_held(z)) return;
+    const int a = z.ay_addr[z.ay_sel];
+    if (!(a & 0x10)) z.ay_reg[z.ay_sel][a] = v;
+}
+// what the chosen chip reads (ym2149:216-249): its ID and register number for 0xBFF5; 0xFF above 15 in YM mode; in
+// AY mode (NR 0x06 b0) the unused bits of the narrow registers read 0; R14/R15 read the I/O ports (pulled up) when
+// they're inputs, or the register ANDed with them
+uint8_t ay_read(const ZXN& z, bool info) {
+    const int c = z.ay_sel, a = z.ay_addr[c];
+    if (info) return ((3 - c) << 6) | a;                              // AY_ID & '0' & addr
+    const bool ay = z.nr[0x06] & 1;
+    if ((a & 0x10) && !ay) return 0xFF;
+    const uint8_t* r = z.ay_reg[c];
+    static const uint8_t AYMASK[16] = {0xFF, 0x0F, 0xFF, 0x0F, 0xFF, 0x0F, 0x1F, 0xFF,
+                                       0x1F, 0x1F, 0x1F, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF};
+    const int k = a & 15;
+    if (k == 14) return (r[7] & 0x40) ? r[14] : 0xFF;
+    if (k == 15) return (r[7] & 0x80) ? r[15] : 0xFF;
+    return ay ? r[k] & AYMASK[k] : r[k];
+}
+
+// ---- the joysticks (zxnext:3386-3465): NR 0x05 sets each one's mode, joystick 1 from b3 and b7:6, joystick 2 from
+// b1 and b5:4. Port 0x1F answers when either is Kempston 1 (001) or MD 1 (101), 0x37 for Kempston 2 (100) or MD 2
+// (110), with bits 5:0 of the joystick, and 7:6 too in MD mode.
+inline int joy_mode(const ZXN& z, int j) {
+    const uint8_t v = z.nr[0x05];
+    return j == 0 ? ((v >> 1) & 4) | (v >> 6) : ((v << 1) & 4) | ((v >> 4) & 3);
+}
+inline bool joy_port_on(const ZXN& z, int port) {                     // port_1f_hw_en / port_37_hw_en (zxnext:2412-2413)
+    for (int j = 0; j < 2; j++) {
+        const int m = joy_mode(z, j);
+        if (port == 0x1F ? (m == 1 || m == 5) : (m == 4 || m == 6)) return true;
+    }
+    return false;
+}
+uint8_t joy_read(const ZXN& z, int port) {
+    uint8_t v = 0;
+    for (int j = 0; j < 2; j++) {
+        const int m = joy_mode(z, j);
+        const bool md = port == 0x1F ? m == 5 : m == 6, k = md || (port == 0x1F ? m == 1 : m == 4);
+        if (k) v |= z.joy[j] & 0x3F;
+        if (md) v |= z.joy[j] & 0xC0;
+    }
+    return v;
+}
+
 // ---- the copper (copper.vhd), one 28 MHz cycle. A WAIT (b15 = 1) waits for cvc = b8:0 and hc_ula >= 8 x b14:9 + 12;
 // a MOVE writes b7:0 to nextreg b14:8 (0x00-0x7F; register 0 is a NOP) and costs a second cycle. Mode 01 runs the
 // list once from 0, 11 restarts it at each frame's (0, 0), 10 carries on from where it is; a change of mode resets
@@ -1371,6 +1479,7 @@ int zxn_io_in(ZXN* z, int port) { return io_read(*z, port & 0xFFFF); }
 void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
 uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
 int zxn_cvc(ZXN* z) { return cvc(*z); }                          // DESIGN.md §9
+void zxn_set_joy(ZXN* z, int left, int right) { z->joy[0] = left & 0x7FF; z->joy[1] = right & 0x7FF; }
 int zxn_sd_insert(ZXN* z, const char* path, int writable, int kind) { return z->sd.insert(path, writable != 0, kind); }
 void zxn_sd_eject(ZXN* z) { z->sd.eject(); }
 void zxn_sd_timing(ZXN* z, int ncr, int nac, int busy, int init_tries) {   // as zxcore's zx_sd_timing
