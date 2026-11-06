@@ -220,6 +220,30 @@ class ModelSense(unittest.TestCase):
             self.assertEqual(nv._sprite_line(v, 100)[1], over, f'd={d}')
             self.assertEqual(last_x(budget_boundary_slots(d), 'p3', 127), last, f'd={d}')
 
+    def test_sprite_scenes_can_see_what_they_test(self):
+        """Each sprite-survivor scene against the same scene with its behaviour taken away: the pictures
+        must differ, or the scene is testing nothing (mixed_sprites once had no overlaps at all)."""
+        def pic(s):
+            return nv.frame9_np(s.model())[2]
+        self.assertNotEqual(pic(sprite_scene(0x01, cluster_sprites())), pic(sprite_scene(0x41, cluster_sprites())))
+        self.assertNotEqual(pic(sprite_scene(0x01, mixed_sprites())), pic(sprite_scene(0x41, mixed_sprites())))
+        a = sprite_scene(0x03, four_bit_sprites(), four_bit=True)
+        self.assertNotEqual(pic(a), pic(sprite_scene(0x03, four_bit_sprites(), four_bit=True).nr(0x4B, 0x5A)))
+        b = sprite_scene(0x01, mixed_sprites())
+        write_palette(b, 0b110, unique_palette(77))
+        first = pic(b)
+        self.assertNotEqual(first, pic(b.nr(0x43, 0x08)), 'the second sprite palette shows')
+        c = sprite_scene(0x01, [[120, 100, 0x00, 0x80 | 5], [160, 100, 0x0A, 0x80 | 5]])
+        before = pic(c)
+        c.io(0x303B, 0x80 | 5)
+        for i in range(128):
+            c.io(0x5B, (i * 0x3B + 0x11) & 0xFF)
+        self.assertNotEqual(before, pic(c), 'the second-half upload is on screen')
+        orders = set()
+        for order in range(8):
+            orders.add(tuple(pic(sprites_l2_scene(order))))
+        self.assertEqual(len(orders), 8, 'each layer order draws differently')
+
     def test_power_on_picture_is_black(self):
         self.assertEqual(set(nv.Video().frame9()[2]), {0}, '§9.1 (13): palette RAMs start all zero')
 
@@ -691,6 +715,22 @@ def sprite_scene(nr15=0x01, sprites=None, four_bit=False, seed=41, ula_seed=1):
     return s
 
 
+def four_bit_sprites():
+    """Twelve 4-bit sprites: both halves (N6), every scale in x and y, palette offsets, y mirror."""
+    spr = []
+    for i in range(12):
+        x, y = 10 + (i % 6) * 48, 20 + (i // 6) * 90
+        a4 = 0x80 | ((i & 1) << 6) | ((i % 4) << 3) | (((i // 2) % 4) << 1)
+        spr.append([x, y, ((i * 0x30) & 0xF0) | ((i & 3) << 2), 0xC0 | (i * 3 & 0x3F), a4])
+    return spr
+
+
+def cluster_sprites():
+    """Twelve sprites piled 6 px apart, every mirror/rotate, so most pixels have several writers."""
+    return [[100 + (i % 4) * 6, 80 + (i // 4) * 6, ((i * 0x50) & 0xF0) | ((i & 7) << 1), 0x80 | (i * 7 & 0x3F)]
+            for i in range(12)]
+
+
 def mixed_sprites():
     """Sixteen sprites: every mirror/rotate combination, palette offsets, overlaps, one across the left
     border, one wrapping past x 511, one partly below line 224."""
@@ -702,7 +742,7 @@ def mixed_sprites():
     out.append([4, 100, 0x00, 0x80 | 7])                       # across the left border
     out.append([500 & 0xFF, 120, 0x01, 0x80 | 9])              # x 500: wraps to 0-3
     out.append([140, 216, 0x20, 0x80 | 11])                    # crosses line 224
-    out.append([150, 60, 0x40, 0x80 | 12])                     # overlaps sprite 4
+    out.append([150, 40, 0x40, 0x80 | 12])                     # overlaps sprite 4 (156, 35)
     return out
 
 
@@ -727,12 +767,7 @@ class Sprites(VideoCase):
         self.assertFrameMatches(s)
 
     def test_four_bit_and_scaling(self):
-        spr = []
-        for i in range(12):
-            x, y = 10 + (i % 6) * 48, 20 + (i // 6) * 90
-            a4 = 0x80 | ((i & 1) << 6) | ((i % 4) << 3) | (((i // 2) % 4) << 1)
-            spr.append([x, y, ((i * 0x30) & 0xF0) | ((i & 3) << 2), 0xC0 | (i * 3 & 0x3F), a4])
-        self.assertFrameMatches(sprite_scene(0x03, spr, four_bit=True).nr(0x4B, 0x03))
+        self.assertFrameMatches(sprite_scene(0x03, four_bit_sprites(), four_bit=True).nr(0x4B, 0x03))
 
     def test_relative_sprites(self):
         spr = [[60, 40, 0x10, 0xC0 | 2, 0x00],                 # composite anchor (5 bytes, bit 5 = 0)
@@ -803,6 +838,83 @@ class SpriteBudget(VideoCase):
                 zx = s.machine()
                 self.assertEqual(zx.io_in(0x303B), want, 'sprites:977, 990-991')
                 self.assertEqual(zx.io_in(0x303B), 0x00, 'sprites:986-988: a read clears it')
+
+
+def sprites_l2_scene(order):
+    """Sprites, Layer 2 (with its band of transparent E3) and the ULA, in layer order `order`. ULA paper 4
+    is the transparent colour too, or with the ULA on top the order beneath it would never show."""
+    s = sprite_scene(0x01, cluster_sprites() + mixed_sprites())
+    s.ops += l2_scene(0).ops[len(ula_scene(1).ops):]
+    write_palette(s, 0b000, [nv.rgb9_from8(0xE3)], start=16 + 4)
+    return s.nr(0x15, 0x01 | (order << 2))
+
+
+@needs_next
+class SpriteSurvivors(VideoCase):
+    """Behaviours Speccy-Zone's sprite mutants showed the suite missing (10 real of 24 on 64d9b75), as scenes.
+    Her #5 (overlap sets status bit 0) and #10 (a read clears it) are in SpriteBudget and test_collision_flag;
+    her #11 (9-bit Y wrap) is an equivalent mutant."""
+
+    def test_four_byte_sprite_is_an_anchor_despite_a_stale_fifth_byte(self):
+        s = sprite_scene(0x01, [[200, 150, 0x00, 0xC0 | 2, 0x40], [100, 100, 0x00, 0xC0 | 3, 0x00]])
+        s.io(0x303B, 0x00)                                  # sprite 0 again, four bytes: byte 4 keeps 40h
+        for b in (100, 80, 0x00, 0x80 | 5):                 # (sprites:639-664), and bit 6 = 0 makes it an
+            s.io(0x57, b)                                   # anchor anyway (sprites:756)
+        self.assertFrameMatches(s)
+
+    def test_relatives_hide_with_their_anchor(self):
+        spr = [[60, 40, 0x00, 0x40 | 2, 0x00],              # an anchor, invisible
+               [16, 0, 0x00, 0xC0 | 3, 0x40], [0, 16, 0x00, 0xC0 | 4, 0x40],   # visible relatives: hidden too
+               [150, 40, 0x00, 0xC0 | 5, 0x00],             # a visible anchor (sprites:784, 932)
+               [16, 0, 0x00, 0xC0 | 6, 0x40], [0, 16, 0x00, 0x40 | 7, 0x40]]
+        self.assertFrameMatches(sprite_scene(0x01, spr))
+
+    def test_four_bit_relative_takes_its_half_from_the_added_pattern(self):
+        spr = [[80, 60, 0x10, 0xC0 | 9, 0xC0],              # 4-bit anchor, N6 = 1: pattern 19
+               [16, 0, 0x00, 0xC0 | 4, 0x41],               # own N6 0, + anchor: 8 + 19 = 27, odd half
+               [0, 16, 0x00, 0xC0 | 5, 0x61],               # own N6 1: 11 + 19 = 30, even half
+               [16, 16, 0x00, 0xC0 | 6, 0x40]]              # no pattern add: its own 12
+        self.assertFrameMatches(sprite_scene(0x01, spr, four_bit=True))   # sprites:803, 928, 962-963
+
+    def test_four_bit_transparency_is_the_low_nibble(self):
+        for nr4b in (0xE3, 0x5A):                           # nibble 3, nibble A (sprites:971)
+            with self.subTest(nr4b=nr4b):
+                s = sprite_scene(0x03, four_bit_sprites(), four_bit=True).nr(0x4B, nr4b)
+                self.assertFrameMatches(s, name=f'sprites_4bit_trans_{nr4b:02x}')
+
+    def test_zero_on_top_where_sprites_really_overlap(self):
+        for nr15 in (0x01, 0x41):                           # sprites:972
+            with self.subTest(nr15=nr15):
+                self.assertFrameMatches(sprite_scene(nr15, cluster_sprites()), name=f'sprites_cluster_{nr15:02x}')
+
+    def test_second_sprite_palette(self):
+        s = sprite_scene(0x01, mixed_sprites())
+        write_palette(s, 0b110, unique_palette(77))
+        s.nr(0x43, 0x08)                                    # NR 0x43 bit 3 (zxnext:5329, 6735)
+        self.assertFrameMatches(s)
+
+    def test_sprites_and_layer2_in_every_order(self):
+        for order in range(8):                              # zxnext:7123-7192 and on
+            with self.subTest(order=order):
+                self.assertFrameMatches(sprites_l2_scene(order), name=f'sprites_l2_order_{order}')
+
+    def test_pattern_upload_into_the_second_half(self):
+        s = sprite_scene(0x01, [[120, 100, 0x00, 0x80 | 5], [160, 100, 0x0A, 0x80 | 5]])
+        s.io(0x303B, 0x80 | 5)                              # pattern 5 from byte 128 (sprites:736)
+        for i in range(128):
+            b = (i * 0x3B + 0x11) & 0xFF
+            s.io(0x5B, 0x00 if b == 0xE3 else b)
+        self.assertFrameMatches(s)
+
+    def test_collision_flag(self):
+        for spr, want in (([[100, 100, 0, 0x80 | 2], [108, 104, 0, 0x80 | 3]], 0x01),
+                          ([[100, 100, 0, 0x80 | 2], [140, 104, 0, 0x80 | 3]], 0x00)):
+            with self.subTest(want=want):
+                s = sprite_scene(0x01, spr)
+                self.assertEqual(nv.sprite_status(s.model()), want)
+                zx = s.machine()
+                self.assertEqual(zx.io_in(0x303B), want, 'sprites:991')
+                self.assertEqual(zx.io_in(0x303B), 0x00, 'sprites:986-988')
 
 
 def ulap_scene(seed=8):
