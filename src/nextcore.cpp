@@ -102,6 +102,14 @@ struct ZXN {
     bool pal_sub = false;               // NR 0x44's write phase (reads in NR 0x03 b7)
     uint8_t clip[4][4];                 // NR 0x18-0x1B: x1, x2, y1, y2 of Layer 2, sprites, the ULA, the tilemap
     uint8_t clip_idx[4] = {0, 0, 0, 0};
+    uint8_t spr_attr[128][5] = {{0}};   // sprite attributes (sprites.vhd)
+    uint8_t spr_pat[16384] = {0};       // pattern RAM: 64 x 256 bytes (8-bit) or 128 x 128 (4-bit)
+    int spr_ai = 0, spr_pi = 0;         // attr_index (sprite << 3 | byte), pattern_index (14 bits)
+    int spr_mirror = 0;                 // NR 0x34's sprite (b7 the pattern half)
+    uint16_t spr_line[320];             // the line buffer: b8 written, b7:0 the palette index
+    int spr_line_y = -1;                // the wide line it holds
+    uint64_t spr_line_f = 0;            // and the frame it was rendered in
+    uint8_t spr_status = 0;             // port 0x303B: b1 overtime, b0 collision
     int flash_count = 0;
     bool flash_on = false;
 
@@ -180,6 +188,10 @@ struct ZXN {
     bool int_req = false;               // the ULA's registered pulse, seen at the next 7 MHz edge
     bool int_low = false;
     int int_count = 0;
+    int in_latch_dt = -1;               // during an IN's io_read: ticks on to the INT that a 253Bh read registers
+    uint64_t in_latch_at = 0;           // that tick, for NR 0x22 b7 (0: none)
+    bool rd_open = false;               // a read below 28 MHz, served at T1, waiting for its T2 (ldpirx_mem)
+    uint16_t rd_addr = 0;               // the address it was served from
     std::vector<IntEvent> int_log;
 
     // logs and stops
@@ -436,8 +448,47 @@ uint8_t ay_read(const ZXN& z, bool info);
 inline bool joy_port_on(const ZXN& z, int port);
 uint8_t joy_read(const ZXN& z, int port);
 
+// ---- sprites' CPU side (video/sprites.vhd:594-748; zxnext:4265-4316, 4794-4855)
+// port 0x303B write: the attribute index to sprite v6:0's first byte, the pattern index to pattern v5:0, half v7
+// (647-667, 728-741); tied (NR 0x09 b4), NR 0x34's sprite follows, b7 the pattern index's ("wear helmet", 607-609)
+void spr_select(ZXN& z, int v) {
+    z.spr_ai = (v & 0x7F) << 3;
+    z.spr_pi = (v & 0x3F) << 8 | (v & 0x80);
+    if (z.nr[0x09] & 0x10) z.spr_mirror = (v & 0x7F) | (z.spr_pi & 0x80);
+}
+// port 0x57 write: the attribute byte at the index; then the next byte, or the next sprite's first after byte 4, or
+// after byte 3 when its b6 says there's no fifth (639-667, 669-715); tied, a move to the next sprite moves NR 0x34's
+void spr_attr_port(ZXN& z, int v) {
+    z.spr_attr[z.spr_ai >> 3][z.spr_ai & 7] = v;
+    if ((z.spr_ai & 4) || ((z.spr_ai & 7) == 3 && !(v & 0x40))) {
+        z.spr_ai = (((z.spr_ai >> 3) + 1) & 0x7F) << 3;
+        if (z.nr[0x09] & 0x10) z.spr_mirror = (z.spr_ai >> 3) | (z.spr_pi & 0x80);
+    } else z.spr_ai++;
+}
+// port 0x5B write: the pattern byte at the index, which counts on through all 14 bits (717-741)
+void spr_pat_port(ZXN& z, int v) {
+    z.spr_pat[z.spr_pi] = v;
+    z.spr_pi = (z.spr_pi + 1) & 0x3FFF;
+}
+// NR 0x34 sets the mirror's sprite (b7 the pattern half); NR 0x35-0x39 write that sprite's attribute 0-4, and NR
+// 0x75-0x79 then move to the next sprite, b7 the pattern index's (zxnext:4794-4855: the increment is the register's
+// b6; sprites.vhd:594-612, 704-715). Tied, a change of the mirror's sprite moves the port's indexes there.
+void spr_mirror_write(ZXN& z, int n, int v) {
+    if (n == 0x34) z.spr_mirror = v;
+    else {
+        z.spr_attr[z.spr_mirror & 0x7F][(n & 0x0F) - 5] = v;
+        if (!(n & 0x40)) return;
+        z.spr_mirror = ((z.spr_mirror + 1) & 0x7F) | (z.spr_pi & 0x80);
+    }
+    if (z.nr[0x09] & 0x10) {
+        z.spr_ai = (z.spr_mirror & 0x7F) << 3;
+        z.spr_pi = (z.spr_mirror & 0x3F) << 8 | (z.spr_mirror & 0x80);
+    }
+}
+
 int nr_read(ZXN& z, int n) {
     switch (n) {
+        case 0x34: return z.spr_mirror & 0x7F;                        // '0' & the mirror's sprite (zxnext:5939-5940)
         case 0x02: return (z.reset_type == 2 ? 2 : z.reset_type == 1 ? 1 : 0) | (z.nr[0x02] & 0x80) | z.nmi_flags;
         case 0x03: return (z.pal_sub << 7) | (z.pend_timing << 4) | (z.lock << 3) | z.mtype;   // the registers, not the
                                                                       // timing in effect; b7 NR 0x44's phase (5800-5801)
@@ -450,6 +501,7 @@ int nr_read(ZXN& z, int n) {
         case 0x1F: return cvc(z) & 0xFF;
         case 0x10: return z.coreid << 2;                              // no buttons pressed (zxnext:5830-5831)
         case 0x22:                                                    // the pulse, port FF b6, the line interrupt's
+            if (z.in_latch_dt >= 0) z.in_latch_at = z.t28 + z.in_latch_dt;   // an IN: b7 is set again at its latch
             return (z.int_low ? 0x80 : 0) | ((z.portff >> 4) & 4) | (z.nr[0x22] & 3);       // (zxnext:5898-5899)
         case 0x81: return 0x80 | (z.nr[0x81] & 0x70);                 // b7 the bus's ROMCS pin, high (zxnext:6032)
         case 0x2C: case 0x2E: return 0x80;                            // the Pi's I2S audio, off: 0x200 >> 2 (zxnext:2316-2317,
@@ -714,6 +766,10 @@ void nr_write(ZXN& z, int n, int v) {
             z.nr[0x8C] = v;
             remap(z);
             return;
+        case 0x34: case 0x35: case 0x36: case 0x37: case 0x38: case 0x39:
+        case 0x75: case 0x76: case 0x77: case 0x78: case 0x79:        // the sprite mirror; 0x35-0x39/0x75-0x79 read 0
+            spr_mirror_write(z, n, v);
+            return;
         case 0x8F:
             z.nr[0x8F] = v & 3;
             port_memory_change(z, z.port1ffd & 1);
@@ -729,6 +785,8 @@ void nr_write(ZXN& z, int n, int v) {
 }
 
 void do_reset(ZXN& z, bool hard) {
+    z.spr_ai = z.spr_pi = z.spr_mirror = 0;                           // sprites.vhd's reset (the RAMs keep)
+    z.spr_status = 0;
     if (hard) {
         z.reset_type = 4;
         for (auto& r : NR_RESET) if (r.hard >= 0) z.nr[r.reg] = r.hard;
@@ -799,6 +857,8 @@ void do_reset(ZXN& z, bool hard) {
     z.nr_sel = 0x24;
     z.ula_int_disabled = false;
     z.int_req = z.int_low = false;
+    z.in_latch_at = 0;
+    z.rd_open = false;
     z.int_count = 0;
     z.int_log.clear();
     z.wait_next = false;
@@ -842,6 +902,11 @@ uint8_t floating_bus(const ZXN& z) {
 uint8_t io_read(ZXN& z, uint16_t port) {
     if (port == 0x243B) return z.nr_sel;                              // both decode all 16 bits (ref §4.1)
     if (port == 0x253B) return nr_read(z, z.nr_sel);
+    if (port == 0x303B && port_en(z, 14)) {                           // sprite status, cleared by the read (979-995)
+        const uint8_t v = z.spr_status;
+        z.spr_status = 0;
+        return v;
+    }
     if (!(port & 1)) {                                                // 0xFE: the half-rows selected by A8-A15 low
         uint8_t v = 0x1F;
         for (int r = 0; r < 8; r++) if (!(port & (0x100 << r))) v &= ~z.keys[r] & 0x1F;
@@ -879,6 +944,11 @@ uint8_t io_read(ZXN& z, uint16_t port) {
 void io_write(ZXN& z, uint16_t port, uint8_t v) {
     if (port == 0x243B) { z.nr_sel = v; return; }
     if (port == 0x253B) { nr_write(z, z.nr_sel, v); return; }
+    if (port_en(z, 14)) {                                             // sprites (zxnext:2638-2640, 2746-2749)
+        if (port == 0x303B) spr_select(z, v);
+        else if ((port & 0xFF) == 0x57) spr_attr_port(z, v);
+        else if ((port & 0xFF) == 0x5B) spr_pat_port(z, v);
+    }
     if (!(port & 1)) {                                                // 0xFE, A0 = 0 (ref §5.1)
         z.border = v & 7;
         z.audio.ear = (v >> 4) & 1;                                   // the beeper (zxnext:6410, audio_mixer:54-55)
@@ -993,15 +1063,19 @@ inline bool wait_s(const ZXN& z) {
 }
 
 // +3 timing's form (zxula.vhd 597-600): WAIT while MREQ is low on a contended page, in the window wait_s gives +3
-// (hc_adj(3:1) = 000 as well: slots 15, 0 and 3-14). The Z80 samples WAIT on the falling edge of T2 and of each Tw;
-// z80.h checks it at the start of the T2 step and repeats the step while it's set. So before each rising edge, the
-// window is evaluated at the slot of that T-state's falling edge, hc_ula + 1. No I/O contention in +3 timing.
+// (hc_adj(3:1) = 000 as well: slots 15, 0 and 3-14). The T80N samples WAIT_n at the rising edge that ends T2 and
+// each Tw (t80n.vhd's T-state process, "TState = 2 and WAIT_n = '0'"; t80na.vhd:193 passes it straight in), seeing
+// the hc from before that edge. z80.h checks WAIT at the start of the T2 step, the edge that begins T2, and repeats
+// the step while it's set; +3 never stretches the clock, so the deciding edge is one T on: hc_ula + 2, into the next
+// row past the line's end (Loam's ContentionP3Exact). No I/O contention in +3 timing.
 inline bool p3_wait_now(const ZXN& z) {
     if (!z.contention || z.timing != 3 || z.speed_eff != 0 || (z.nr[0x08] & 0x40)) return false;
     if (!z.p3_mem && !z.p3_waiting) return false;
-    int h = hc_ula(z) + 1, v = vc_ula(z);
+    const Timing& t = T(z);
+    int h = hc_ula(z) + 2, v = vc_ula(z);
+    if (h >= t.hc_len) { h -= t.hc_len; v = (v + 1) % t.vc_len; }    // vc_ula steps at hc_ula 0
     int adj = ((h & 15) + 1) & 15;
-    return (adj >= 4 || adj <= 1) && (h & 0x1FF) < 256 && v < 192;
+    return (adj >= 4 || adj <= 1) && h < 256 && v < 192;
 }
 
 // ---- Layer 2 at the beam (video/layer2.vhd). (x, y) is the pixel relative to the ULA's paper; sample 0/1 the two
@@ -1082,6 +1156,93 @@ bool tm_pixel(const ZXN& z, int x, int y, int smp, uint16_t& rgb, bool& below, b
     if (!shown) return false;
     below = ((attr & 1) || t512) && !(ctl & 1);
     rgb = z.pal[0][1 << 9 | ((ctl >> 4) & 1) << 8 | px] & 0x1FF;
+    return true;
+}
+
+// ---- sprites (video/sprites.vhd:750-1068): render wide line L into the line buffer, sprites 0-127 in order
+void spr_render(ZXN& z, int L) {
+    for (auto& p : z.spr_line) p = 0;
+    z.spr_line_y = L;
+    z.spr_line_f = z.frame;
+    bool avis = false, ah = false, art = false, arot = false, axm = false, aym = false;
+    int ax = 0, ay = 0, apat = 0, apal = 0, axs = 0, ays = 0;
+    for (int i = 0; i < 128; i++) {
+        const uint8_t* a = z.spr_attr[i];
+        const bool e5 = a[3] & 0x40, rel = e5 && (a[4] & 0xC0) == 0x40;
+        uint8_t c0 = a[0], c1 = a[1], c2 = a[2], c3 = a[3], c4 = a[4];
+        if (rel) {                                                    // relative to the last anchor (750-800)
+            const int x0 = (int8_t)(arot ? a[1] : a[0]), y0 = (int8_t)(arot ? a[0] : a[1]);
+            const int x1 = (arot ^ axm) ? -x0 : x0, y1 = aym ? -y0 : y0;
+            const int x3 = (ax + ((x1 * (1 << axs)) & 0x1FF)) & 0x1FF, y3 = (ay + ((y1 * (1 << ays)) & 0x1FF)) & 0x1FF;
+            const int pal = (a[2] & 1) ? (apal + (a[2] >> 4)) & 15 : a[2] >> 4;
+            const bool xm = arot ? ((a[2] >> 2) ^ (a[2] >> 1)) & 1 : (a[2] >> 3) & 1;
+            const bool ym = arot ? ((a[2] >> 3) ^ (a[2] >> 1)) & 1 : (a[2] >> 2) & 1;
+            c0 = x3 & 0xFF; c1 = y3 & 0xFF;
+            c2 = pal << 4 | (art ? (axm ^ xm) << 3 | (aym ^ ym) << 2 | (arot ^ ((a[2] >> 1) & 1)) << 1 : a[2] & 0x0E) | (x3 >> 8);
+            c3 = (avis && (a[3] & 0x80)) << 7 | 0x40 | (a[3] & 0x3F);
+            c4 = ah << 7 | (a[4] & 0x20) << 1 | (art ? axs << 3 | ays << 1 : a[4] & 0x1E) | (y3 >> 8);
+        }
+        const int cy = (e5 ? (c4 & 1) : 0) << 8 | c1, cx = (c2 & 1) << 8 | c0;
+        const bool h4 = (c4 & 0x80) && e5, n6 = (c4 & 0x40) && h4;
+        int pat = (a[3] & 0x3F) << 1 | n6;
+        if (rel && (a[4] & 1)) pat = (pat + apat) & 0x7F;
+        if (!rel) {                                                   // an anchor (927-950)
+            art = (a[4] & 0x20) && e5; ah = (a[4] & 0x80) && e5; avis = a[3] & 0x80;
+            ax = cx; ay = cy; apat = pat; apal = a[2] >> 4;
+            const bool u = e5 && (a[4] & 0x20);
+            arot = u && (a[2] & 2); axm = u && (a[2] & 8); aym = u && (a[2] & 4);
+            axs = u ? (a[4] >> 3) & 3 : 0; ays = u ? (a[4] >> 1) & 3 : 0;
+        }
+        if (!(c3 & 0x80)) continue;
+        const int xs = e5 ? (c4 >> 3) & 3 : 0, ys = e5 ? (c4 >> 1) & 3 : 0;
+        int yo = (L - cy) & 0x1FF;                                    // 9-bit, scaled down by the Y scale (805-809)
+        if (yo & 0x100) yo |= ~0x1FF;
+        yo >>= ys;
+        if (yo < 0 || yo > 15) continue;
+        const int yi = (c2 & 4) ? 15 - yo : yo;
+        const bool rot = c2 & 2, xme = ((c2 >> 3) ^ (c2 >> 1)) & 1;
+        int addr = (pat >> 1) << 8 | (rot ? (xme ? 15 : 0) << 4 | yi : yi << 4 | (xme ? 15 : 0));
+        const int step = xme ? (rot ? -16 : -1) : (rot ? 16 : 1);
+        const int pal = c2 >> 4;
+        for (int k = 0, cnt = 0; k < (16 << xs); k++) {
+            const int hx = (cx + k) & 0x1FF;
+            uint8_t idx;
+            bool t;
+            if (h4) {
+                // the half is the relative-adjusted pattern's bit 0, not the sprite's own N6 (spr_rel_pattern(0), 928)
+                const uint8_t b = z.spr_pat[((addr & 0x3F00) | (pat & 1) << 7 | (addr & 0xFF) >> 1) & 0x3FFF];
+                const uint8_t nib = (addr & 1) ? b & 15 : b >> 4;
+                idx = pal << 4 | nib; t = nib == (z.nr[0x4B] & 15);
+            } else {
+                const uint8_t b = z.spr_pat[addr & 0x3FFF];
+                idx = (((b >> 4) + pal) & 15) << 4 | (b & 15); t = b == z.nr[0x4B];
+            }
+            if (!t && hx < 320) {
+                if (z.spr_line[hx] & 0x100) z.spr_status |= 1;        // collision
+                if (!((z.nr[0x15] & 0x40) && (z.spr_line[hx] & 0x100))) z.spr_line[hx] = 0x100 | idx;
+            }
+            const int nc = cnt + (8 >> xs);
+            if ((nc ^ cnt) & 8) addr += step;
+            cnt = nc;
+        }
+    }
+}
+// the sprite pixel at paper (x, y) (sprites.vhd:1000-1068): sprites on (NR 0x15 b0), inside the clip window
+bool spr_pixel(ZXN& z, int x, int y, uint16_t& rgb) {
+    if (!(z.nr[0x15] & 1)) return false;
+    const int whc = x + 32, wvc = y + 32;
+    if (whc < 0 || whc >= 320 || wvc < 0 || wvc >= 256) return false;
+    if (z.spr_line_y != wvc || z.spr_line_f != z.frame) spr_render(z, wvc);
+    const uint16_t p = z.spr_line[whc];
+    if (!(p & 0x100)) return false;
+    const uint8_t* c = z.clip[1];
+    int xs, xe, ys, ye;
+    if (z.nr[0x15] & 2) {                                             // over the border
+        if (z.nr[0x15] & 0x20) { xs = c[0] * 2; xe = c[1] * 2 + 1; ys = c[2]; ye = c[3]; }
+        else { xs = 0; xe = 319; ys = 0; ye = 255; }
+    } else { xs = c[0] + 32; xe = c[1] + 32; ys = c[2] + 32; ye = c[3] + 32; if (wvc >= 224) return false; }
+    if (whc < xs || whc > xe || wvc < ys || wvc > ye) return false;
+    rgb = z.pal[1][1 << 9 | ((z.nr[0x43] >> 3) & 1) << 8 | (p & 0xFF)] & 0x1FF;
     return true;
 }
 
@@ -1201,7 +1362,9 @@ inline void draw_pixel(ZXN& z) {
     }
     // the compositor (zxnext:7000-7180). The ULA is transparent where its colour's bits 8:1 match NR 0x14, outside its
     // clip window (NR 0x1A; never in the border), or when it's off (NR 0x68 b7); Layer 2 where it doesn't show or
-    // matches NR 0x14; its priority bit lifts it over everything. No sprites or tilemap yet: they're transparent.
+    // matches NR 0x14; its priority bit lifts it over everything except in L S U and L U S. Sprites where no sprite
+    // pixel shows (sprite_transparent = not pixel_en; no colour test, zxnext:7025-7026). In the U-over-S orders a
+    // border pixel of the ULA gives way to a sprite where the tilemap is transparent (7163, 7173, 7185).
     // The blend modes add Layer 2 to a mix colour chosen by NR 0x68 b6:5 (00 the ULA's colour even if it's off,
     // 10 the ULA as shown, 01/11 none: the ULA then sits below), 110 saturating at 7, 111 then less 5 (zxnext:7032-7250).
     const uint8_t* uc = z.clip[2];
@@ -1213,6 +1376,8 @@ inline void draw_pixel(ZXN& z) {
     const bool pent = z.timing == 4;
     const int rawh = x + t.hactive, rawv = ((y + t.vactive) % t.vc_len + t.vc_len) % t.vc_len;
     const bool blank = rawh <= (pent ? 63 : 95) || rawv <= (pent ? 15 : 7);
+    uint16_t srgb = 0;
+    const bool st = !spr_pixel(z, x, y, srgb);                        // 7 MHz: the same for both samples
     for (int smp = 0; smp < 2; smp++) {
         const uint16_t ur = urgb2[smp];
         const bool ul_t = (ur >> 1) == z.nr[0x14] || uclip || (z.nr[0x68] & 0x80);   // ula_transparent
@@ -1235,13 +1400,13 @@ inline void draw_pixel(ZXN& z) {
         const bool lt = !l2_pixel(z, x, y, smp, lrgb, lp) || (lrgb >> 1) == z.nr[0x14];
         if (lt) lp = false;
         uint16_t out;
+        const bool uo = !ut && !(border && tt && !st);                // the ULA over S (7163, 7173, 7185)
         switch (order) {
-            case 1: case 3:                                           // L S U, L U S: Layer 2 on top anyway
-                out = !lt ? lrgb : !ut ? urgb : fb9;
-                break;
-            case 2: case 4: case 5:                                   // S U L, U S L, U L S
-                out = lp ? lrgb : !ut ? urgb : !lt ? lrgb : fb9;
-                break;
+            case 1: out = !lt ? lrgb : !st ? srgb : !ut ? urgb : fb9; break;                  // L S U (7137-7145)
+            case 2: out = lp ? lrgb : !st ? srgb : !ut ? urgb : !lt ? lrgb : fb9; break;      // S U L (7147-7157)
+            case 3: out = !lt ? lrgb : uo ? urgb : !st ? srgb : fb9; break;                   // L U S (7159-7167)
+            case 4: out = lp ? lrgb : uo ? urgb : !st ? srgb : !lt ? lrgb : fb9; break;       // U S L (7169-7179)
+            case 5: out = lp ? lrgb : uo ? urgb : !lt ? lrgb : !st ? srgb : fb9; break;       // U L S (7181-7191)
             case 6: case 7: {
                 const int bm = (z.nr[0x68] >> 5) & 3;
                 const bool umt = (ur >> 1) == z.nr[0x14] || uclip;   // ula_mix_transparent: not the ULA's enable
@@ -1274,11 +1439,11 @@ inline void draw_pixel(ZXN& z) {
                     ch[i] = v;
                 }
                 const uint16_t mixer = ch[0] << 6 | ch[1] << 3 | ch[2];
-                out = lp ? mixer : !topt ? top : !bt ? bot : !lt ? mixer : fb9;   // (7202-7211; no sprites yet)
+                out = lp ? mixer : !topt ? top : !st ? srgb : !bt ? bot : !lt ? mixer : fb9;   // (7207-7217, 7249-7259)
                 break;
             }
-            default:                                                  // S L U
-                out = lp ? lrgb : !lt ? lrgb : !ut ? urgb : fb9;
+            default:                                                  // S L U (7125-7135)
+                out = lp ? lrgb : !st ? srgb : !lt ? lrgb : !ut ? urgb : fb9;
         }
         z.f9raw[fy * F9_W + 2 * fx + smp] = out;
         z.f9[fy * F9_W + 2 * fx + smp] = blank ? 0 : out;
@@ -1743,15 +1908,28 @@ bool cpu_edge(ZXN& z) {
             Z80_SET_DATA(p, mem_read(z, a, &k));
             if (z.speed_eff == 3 && (k == K_SRAM || k == K_BRAM5)) z.wait_next = true;   // ref §1.4
             if (fetch) snoop_fetch(z, Z80_GET_DATA(p));
+            z.rd_open = !fetch && z.speed_eff < 3;                    // below 28 MHz the memory takes the address at T2
+            z.rd_addr = a;
         } else if (p & Z80_WR) {
+            z.rd_open = false;
             mem_write(z, a, Z80_GET_DATA(p));
+        } else if (z.rd_open) {                                       // the read's T2 (or a refresh, which closes it)
+            z.rd_open = false;
+            if (!(p & Z80_RFSH) && a != z.rd_addr) Z80_SET_DATA(p, mem_read(z, a));   // LDPIRX: DE's byte (Strobe)
         }
     } else if ((p & Z80_IORQ) && (p & Z80_M1)) {
+        z.rd_open = false;
         Z80_SET_DATA(p, intack_data(z));                              // INTACK: 0xFF, or hardware IM2's vector
     } else if ((p & Z80_IORQ) && !(p & Z80_M1)) {
+        z.rd_open = false;
         uint16_t port = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
+            // NR 0x22 b7 through 253Bh: INT as port_253b_dat held it at the falling edge in the T80N's T2, 1.5 clocks
+            // after this tick begins, less the CLK_28 register in front of it (master_tick sets it then)
+            const int per = z.speed_eff == 0 ? 8 : z.speed_eff == 1 ? 4 : z.speed_eff == 2 ? 2 : 1;   // ticks a CPU clock
+            z.in_latch_dt = (3 * per + 1) / 2 - 1;
             uint8_t v = io_read(z, port);
+            z.in_latch_dt = -1;
             Z80_SET_DATA(p, v);
             if (z.io_logging) z.io_log.push_back({z.t28, z.cpu_clocks, port, v, 0});
         } else if (p & Z80_WR) {
@@ -1803,6 +1981,13 @@ bool cpu_edge(ZXN& z) {
 
 // One 28 MHz master tick. Returns false if a stop was due before anything moved.
 bool master_tick(ZXN& z) {
+    if (z.in_latch_at == z.t28 && z.in_latch_at) {                    // the 253Bh register takes INT (cpu_edge's IN)
+        z.in_latch_at = 0;
+        const uint8_t d = (Z80_GET_DATA(z.pins) & 0x7F) | (z.int_low ? 0x80 : 0);
+        Z80_SET_DATA(z.pins, d);                                      // the byte z80.h takes at T3
+        if (z.io_logging && !z.io_log.empty() && z.io_log.back().port == 0x253B && !z.io_log.back().write)
+            z.io_log.back().value = d;
+    }
     const int sc_next = (z.sc + 1) & 3;
     const bool edge7 = sc_next == 0;                                  // the 7 MHz edge: sc from 3 to 0 (ref §1.1)
     bool edge = false;
