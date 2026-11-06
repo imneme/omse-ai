@@ -456,6 +456,11 @@ class Next:
         """A chip's envelope step now, 0-31."""
         return self.lib.zxn_ay_env(self.z, chip)
 
+    def ay_log(self):
+        """The CPU's AY writes in the I/O log (io_log(True) first; io_out isn't logged): [(t28, port, value)]."""
+        return [(t, port, v) for t, _, port, v, rw in self.io_events
+                if rw == 'w' and (port & 0xFF) == 0xFD and (port >> 14) in (2, 3)]
+
     @staticmethod
     def write_wav(path, samples, rate=48000):
         """Write audio() output (int16, shape (n, 2)) as a stereo WAV."""

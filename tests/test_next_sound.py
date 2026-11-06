@@ -15,6 +15,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_next_regs import needs_next, NextCase, bare  # noqa: E402
+from test_next_memory import out  # noqa: E402
 
 AY_VOL = [0x00, 0x03, 0x04, 0x06, 0x0a, 0x0f, 0x15, 0x22, 0x28, 0x41, 0x5b, 0x72, 0x90, 0xb5, 0xd7, 0xff]
 YM_VOL = [0x00, 0x01, 0x01, 0x02, 0x02, 0x03, 0x03, 0x04, 0x06, 0x07, 0x09, 0x0a, 0x0c, 0x0e, 0x11, 0x13,
@@ -350,6 +351,24 @@ class Beeper(NextCase):
         zx.nr_write(0x08, zx.nr_read(0x08) | 0x10)          # ...when it's enabled (zxnext:6411)
         s = capture(zx, 8)[-1]
         self.assertEqual(list(s), [DAC_IDLE] * 2, 'exc: the beeper leaves the mix (audio_mixer:54-55)')
+
+
+@needs_next
+class Log(NextCase):
+
+    def test_ay_log(self):
+        zx = bare()
+        code = [0x01, 0xFD, 0xFF, 0x3E, 0x08, 0xED, 0x79,  # LD BC,FFFD; LD A,8; OUT (C),A
+                0x06, 0xBF, 0x3E, 0x0F, 0xED, 0x79,        # LD B,BF; LD A,15; OUT (C),A
+                0x18, 0xFE]                                # JR $
+        zx.load(0x8000, bytes(code))
+        zx.set_regs(pc=0x8000, sp=0x7FF0)
+        zx.io_log(True)                                    # the CPU's own I/O cycles (io_out isn't logged)
+        t0 = zx.t28
+        zx.run_ticks(4000)
+        log = zx.ay_log()
+        self.assertEqual([(p, v) for _, p, v in log], [(0xFFFD, 8), (0xBFFD, 15)], 'select then data, in order')
+        self.assertTrue(t0 < log[0][0] < log[1][0], 'each with its t28')
 
 
 @needs_next
