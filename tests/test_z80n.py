@@ -24,6 +24,7 @@ Where the VHDL disagrees with the documented behaviour, these tests follow the V
 "VHDL:"); a probe on Melissa's real Next decides (next-build/z80n/NOTES.md lists them).
 """
 import ctypes
+import hashlib
 import os
 import random
 import subprocess
@@ -62,7 +63,7 @@ def harness(header=None):
     if header in _libs:
         return _libs[header]
     ext = 'dylib' if sys.platform == 'darwin' else 'so'
-    tag = '' if header is None else '-' + format(abs(hash(header)), 'x')
+    tag = '' if header is None else '-' + hashlib.sha1(header.encode()).hexdigest()[:12]
     lib = OUT / f'libbarez80{tag}.{ext}'
     src = ROOT / 'tests' / 'bare_z80.cpp'
     deps = [src, Path(header) if header else ROOT / 'src' / 'z80.h']
