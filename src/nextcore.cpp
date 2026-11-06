@@ -102,6 +102,7 @@ struct ZXN {
     uint8_t spi_rx = 0xFF;              // the read register port 0xEB returns
     uint8_t spi_got = 0xFF;             // the byte the transfer in progress has received
     bool spi_last_d = false;            // state_last_d: the edge after state 15 loads the read register
+    uint64_t spi_count = 0;             // transfers begun (for tests)
     uint8_t nr[256];
     int nr_sel = 0x24;                  // port 0x243B resets to 0x24 (ref §4.1)
     bool ula_int_disabled = false;      // port 0xFF bit 6 and its aliases (ref §2.3)
@@ -578,6 +579,7 @@ bool cpu_edge(ZXN& z) {
             const uint8_t mosi = (p & Z80_WR) ? Z80_GET_DATA(p) : 0xFF;   // a read sends 0xFF
             z.spi_got = z.sd.xfer(mosi, !(z.spi_cs & 1));                 // card 0 on select bit 0
             z.spi_state = 0;
+            z.spi_count++;
         }
     }
     // the effective speed follows the programmed one only between bus cycles (ref §1.3)
@@ -773,6 +775,7 @@ uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
 int zxn_sd_insert(ZXN* z, const char* path, int writable, int kind) { return z->sd.insert(path, writable != 0, kind); }
 void zxn_sd_eject(ZXN* z) { z->sd.eject(); }
 int zxn_spi_state(ZXN* z) { return z->spi_state; }
+uint64_t zxn_spi_count(ZXN* z) { return z->spi_count; }
 int zxn_fb_width() { return FB_W; }
 int zxn_fb_height() { return FB_H; }
 int zxn_border(ZXN* z) { return z->border; }
