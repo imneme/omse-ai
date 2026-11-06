@@ -111,8 +111,12 @@ class PowerOn(NextCase):
 def scribbled():
     """A bare machine with every SCRIBBLE register written and settled."""
     zx = bare()
-    for reg, (w, *_) in ref.SCRIBBLE.items():
-        zx.nr_write(reg, w)
+    # NR 0x8F first: writing it rewrites MMU0/1 and MMU6/7 through the paging
+    # logic a cycle later (nr_8f_we_dly -> port_memory_change_dly, zxnext:3753),
+    # which would undo the MMU scribbles if it came after them.
+    order = [0x8F] + [r for r in ref.SCRIBBLE if r != 0x8F]
+    for reg in order:
+        zx.nr_write(reg, ref.SCRIBBLE[reg][0])
     zx.run_frames(ref.SETTLE_FRAMES)
     return zx
 
