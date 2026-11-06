@@ -1071,12 +1071,12 @@ inline void draw_pixel(ZXN& z) {
             else if (o) idx = attr & f;
             else switch (f) {
                 case 0x01: idx = 0x80 | attr >> 1; break;
-                case 0x03: idx = 0xC0 | attr >> 2; break;
-                case 0x07: idx = 0xE0 | attr >> 3; break;
-                case 0x0F: idx = 0xF0 | attr >> 4; break;
-                case 0x1F: idx = 0xF8 | attr >> 5; break;
-                case 0x3F: idx = 0xFC | attr >> 6; break;
-                case 0x7F: idx = 0xFE | attr >> 7; break;
+                case 0x03: idx = 0x80 | attr >> 2; break;              // paper_base_index & the attribute's upper
+                case 0x07: idx = 0x80 | attr >> 3; break;              // bits: 80h up, for every format (zxula:486,
+                case 0x0F: idx = 0x80 | attr >> 4; break;              // 516-525)
+                case 0x1F: idx = 0x80 | attr >> 5; break;
+                case 0x3F: idx = 0x80 | attr >> 6; break;
+                case 0x7F: idx = 0x80 | attr >> 7; break;
                 default: idx = 0; bgnd2[smp] = true;
             }
         } else if (ulap) {
