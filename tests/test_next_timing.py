@@ -34,32 +34,35 @@ def launch(zx, target):
     zx.poke(0x8002, 0x00)
 
 
-def goto_line(zx, timing, hz, line):
-    """Park at an instruction boundary a little before ULA row `line`."""
+def goto_line(zx, timing, hz, line, at_hc=0):
+    """Park at an instruction boundary about 300 pixels before (line, at_hc)."""
     L, N, *_ = ref.TIMINGS[(timing, hz)]
     assert zx.run_until_pc(LOOP, max_ticks=10**6)
     now = zx.vc_ula * L + zx.hc_ula
-    d = (line * L - now - 300) % (L * N)
+    d = (line * L + at_hc - now - 300) % (L * N)
     zx.run_ticks(d * ref.TICKS_PER_PIXEL)
 
 
-def run_block(zx, addr, code, start, end, timing='48k', hz=50, line=None):
+def run_block(zx, addr, code, start, end, timing='48k', hz=50, line=None, at_hc=0):
     """Load code at addr, launch it (at ULA row `line` if given), and return
     (t28 from start to end, cpu_clocks from start to end, hc_ula, vc_ula at start)."""
     zx.load(addr, code)
     if line is not None:
-        goto_line(zx, timing, hz, line)
+        goto_line(zx, timing, hz, line, at_hc)
     launch(zx, addr)
     assert zx.run_until_pc(start, max_ticks=10**7), f'never reached {start:#06x}'
-    t0, c0, q, v = zx.t28, zx.cpu_clocks, zx.hc_ula, zx.vc_ula
+    # §9.1 (11): a stop's counters are from just before T1's edge, where at
+    # 3.5 MHz hc_ula steps to T1's own (odd) count: T1 is hc_ula + 1.
+    t0, c0, q, v = zx.t28, zx.cpu_clocks, zx.hc_ula + 1, zx.vc_ula
     assert zx.run_until_pc(end, max_ticks=10**8), f'never reached {end:#06x}'
     return zx.t28 - t0, zx.cpu_clocks - c0, q, v
 
 
 def program(setup, body, reps, prefix=0):
-    """setup; `prefix` x LD A,(BC) (7 T, to vary the phase); S: body x reps;
-    E: JR $.  Returns (code, offset of S, offset of E)."""
-    code = bytes([0xF3]) + bytes(setup) + bytes([0x0A]) * prefix
+    """setup; `prefix` x LD E,0 (7 T, uncontended, to vary the phase; E is
+    used by no test); S: body x reps; E: JR $.  Returns (code, offset of S,
+    offset of E). (Ratio found the first version's LD A,(BC) clobbering A.)"""
+    code = bytes([0xF3]) + bytes(setup) + bytes([0x1E, 0x00]) * prefix
     s = len(code)
     code += bytes(body) * reps
     return code + bytes([0x18, 0xFE]), s, len(code)
@@ -68,11 +71,34 @@ def program(setup, body, reps, prefix=0):
 MMU0 = [0xFF, 0xFF, 0x0A, 0x0B, 0x04, 0x05, 0x00, 0x01]
 
 
+def run_to(zx, t):
+    """Run to master tick t, which must not be in the past."""
+    assert t >= zx.t28, f'asked to run back to tick {t} from {zx.t28}'
+    zx.run_ticks(t - zx.t28)
+
+
+def next_start(zx, period, since=0):
+    """The next INT start after now, from the latest pulse seen (finished or
+    not) since index `since`."""
+    starts = [s for s, e in zx.int_log[since:]]
+    assert starts, 'no INT pulses to go by'
+    t = starts[-1]
+    while t <= zx.t28:
+        t += period
+    return t
+
+
+def completed(log):
+    """The pulses that have ended (a pulse still low when a run stops may be
+    listed unfinished; its end isn't known yet)."""
+    return [(s, e) for s, e in log if e is not None and e > s]
+
+
 def pulses(case, zx, frames, since=0, at_least=2):
-    """Run frames; the INT pulses since index `since`, failing (not erroring)
-    if there are too few to judge."""
+    """Run frames; the completed INT pulses since index `since`, failing (not
+    erroring) if there are too few to judge."""
     zx.run_frames(frames)
-    got = zx.int_log[since:]
+    got = completed(zx.int_log[since:])
     case.assertGreaterEqual(len(got), at_least, f'only {len(got)} INT pulses in {frames} frames')
     return got
 
@@ -118,8 +144,7 @@ class UlaInterrupt(NextCase):
     def test_pulse_is_32_or_36_ticks_at_28_mhz(self):
         for timing in ('48k', '128k', 'p3', 'pentagon'):
             zx = bare(timing=timing, speed=3)
-            zx.run_frames(3)
-            self.assertEqual({e - s for s, e in zx.int_log}, {ref.INT_CLOCKS[timing]},
+            self.assertEqual({e - s for s, e in pulses(self, zx, 3)}, {ref.INT_CLOCKS[timing]},
                              f'{timing}: zxnext:1971-2003, one CPU clock a tick at 28 MHz')
 
     def test_pulse_length_at_slower_speeds(self):
@@ -135,11 +160,27 @@ class UlaInterrupt(NextCase):
     def test_place_on_the_beam(self):
         for (timing, hz) in ref.TIMINGS:
             zx = bare(timing=timing, hz=hz)
-            nxt = pulses(self, zx, 2, at_least=1)[-1][0] + ref.frame_ticks(timing, hz)
-            zx.run_ticks(nxt - zx.t28)
+            pulses(self, zx, 2, at_least=1)
+            run_to(zx, next_start(zx, ref.frame_ticks(timing, hz)))
             h, v = ref.int_beam(timing, hz)
             self.assertEqual(zx.vc_ula, v, f'{timing} {hz} Hz: ulat:548-556 (§2.3)')
             self.assertIn(zx.hc_ula, (h, h + 1), f'{timing} {hz} Hz: the pixel after the match')
+
+    def test_exact_slot(self):
+        """INT drops on the falling 28 MHz edge inside the first tick of the
+        registered pixel (ulat:548-556; im2p:100; zxnext:1977-1985), so its
+        first low tick (§9.1 (4)) is still that pixel: hc_ula is h exactly,
+        and two ticks before it is the pixel before. (Mutant survivor: h+1.)"""
+        for (timing, hz) in ref.TIMINGS:
+            zx = bare(timing=timing, hz=hz)
+            pulses(self, zx, 2, at_least=1)
+            nxt = next_start(zx, ref.frame_ticks(timing, hz))
+            h, v = ref.int_beam(timing, hz)
+            L = ref.TIMINGS[(timing, hz)][0]
+            run_to(zx, nxt - 2)
+            self.assertEqual(zx.hc_ula, (h - 1) % L, f'{timing} {hz} Hz: two ticks before')
+            run_to(zx, nxt)
+            self.assertEqual((zx.hc_ula, zx.vc_ula), (h, v), f'{timing} {hz} Hz: the slot itself')
 
     def test_disabled_ula_interrupt_makes_no_pulse(self):
         zx = bare()
@@ -166,7 +207,7 @@ class LineInterrupt(NextCase):
             F = ref.frame_ticks('48k', 50)
             self.assertEqual({b - a for a, b in zip(starts, starts[1:])}, {F},
                              f'line {line}: once a frame, and no ULA pulse')
-            zx.run_ticks(starts[-1] + F - zx.t28)
+            run_to(zx, next_start(zx, F, since=len(zx.int_log) - len(starts)))
             h, v = ref.line_int_beam('48k', 50, line)
             self.assertEqual(zx.vc_ula, v, f'line {line}: ulat:561-583')
             self.assertIn(zx.hc_ula, (h, h + 1))
@@ -177,7 +218,7 @@ class LineInterrupt(NextCase):
         zx.nr_write(0x22, 0x06)
         zx.nr_write(0x23, 100)
         starts = self.line_starts(zx)                   # the offset applies at row 0
-        zx.run_ticks(starts[-1] + ref.frame_ticks('48k', 50) - zx.t28)
+        run_to(zx, next_start(zx, ref.frame_ticks('48k', 50), since=len(zx.int_log) - len(starts)))
         self.assertEqual(zx.vc_ula, ref.line_int_beam('48k', 50, 100, offset=10)[1],
                          'cvc = vc_ula + NR 0x64 (ulat:455-472)')
 
@@ -186,7 +227,8 @@ class LineInterrupt(NextCase):
         zx.nr_write(0x22, 0x06)
         zx.nr_write(0x23, 50)
         starts = self.line_starts(zx)
-        zx.run_ticks(starts[-1] + ref.frame_ticks('48k', 50) + 8 - zx.t28)
+        run_to(zx, next_start(zx, ref.frame_ticks('48k', 50),
+                              since=len(zx.int_log) - len(starts)) + 8)
         self.assertEqual(zx.nr_read(0x22) & 0x80, 0x80, 'zxnext:5899 not pulse_int_n (§9 D-3)')
         zx.run_ticks(400)
         self.assertEqual(zx.nr_read(0x22) & 0x80, 0x00, 'pulse over')
@@ -227,6 +269,17 @@ class Waits(NextCase):
     def test_28_mhz_unmapped_reads_do_not(self):
         self.assertEqual(self.clocks(3, [0x7E], [0x21, 0x00, 0xE0], mmu={7: 0xE0}), 8,
                          'page >= 0xE0 in slots 2-7: no request (zxnext:3019-3020)')
+
+    def test_nextreg_extra_reads_wait_at_28_mhz(self):
+        """Strobe (the Z80N me), from t80n.vhd: NEXTREG's idle cycles are real
+        reads of the operand, so each gets the 28 MHz wait (zxnext:3128-3140).
+        NEXTREG r,v: 20 T, 26 clocks at 28 MHz; NEXTREG r,A: 17 T, 22."""
+        nr7f_v = [0xED, 0x91, 0x7F, 0x55]               # NEXTREG 7Fh,55h
+        nr7f_a = [0xED, 0x92, 0x7F]                     # NEXTREG 7Fh,A
+        self.assertEqual(self.clocks(0, nr7f_v), 20, 'NEXTREG r,v at 3.5 MHz')
+        self.assertEqual(self.clocks(0, nr7f_a), 17, 'NEXTREG r,A at 3.5 MHz')
+        self.assertEqual(self.clocks(3, nr7f_v), 26, 'NEXTREG r,v at 28 MHz')
+        self.assertEqual(self.clocks(3, nr7f_a), 22, 'NEXTREG r,A at 28 MHz')
 
     def test_slower_speeds_have_no_waits(self):
         ld_hl = [0x21, 0x00, 0xC0]
@@ -277,8 +330,10 @@ class Contention48(NextCase):
     TIMING = '48k'
 
     def check(self, setup, body, per, name, mmu=MMU0, regs=None, line=8, prefixes=range(8),
-              reps=REPS, addr=CODE):
+              reps=REPS, addr=CODE, at_hc=0):
         L, N, *_ = ref.TIMINGS[(self.TIMING, 50)]
+        total_dt = total_plain = 0
+        contended = False
         for k in prefixes:
             zx = bare(timing=self.TIMING)
             for slot, page in enumerate(mmu):
@@ -287,15 +342,23 @@ class Contention48(NextCase):
             if regs:
                 zx.set_regs(**regs)
             code, s, e = program(setup, body, reps, prefix=k)
-            dt, dc, q, v = run_block(zx, addr, code, addr + s, addr + e, self.TIMING, 50, line)
+            dt, dc, q, v = run_block(zx, addr, code, addr + s, addr + e, self.TIMING, 50, line,
+                                     at_hc)
+            self.assertTrue(reps > 1 or (v < 192 and q < 256),
+                            f'{name}: the lone access must start in the pixel area '
+                            f'(it started at hc_ula {q}, row {v})')
             events = [ev for i in range(reps) for ev in per(addr + s + i * len(body))]
             want = ref.Contention(self.TIMING, mmu, L, N).run(q, v, events)
             self.assertEqual(dt, 8 * want, f'{name}, prefix {k}, from hc_ula {q} row {v}: '
                                            f'{dt} ticks, the ULA rule says {8 * want}')
-            plain = sum(e[1] if e[0] != 'io' else 4 for e in per(addr + s)) * reps
-            if any(ref.Contention(self.TIMING, mmu, L, N).mem(e[1] if e[0] == 'io' else e[0] or 0)
-                   for e in per(addr + s) if e[0] is not None):
-                self.assertGreater(dt, 8 * plain, f'{name}: no contention at all')
+            total_dt += dt
+            total_plain += sum(e[1] if e[0] != 'io' else 4 for e in per(addr + s)) * reps
+            c = ref.Contention(self.TIMING, mmu, L, N)
+            contended |= any(c.mem(e[1] if e[0] == 'io' else e[0] or 0) or
+                             (e[0] == 'io' and ref.port_contended(self.TIMING, e[1]))
+                             for e in per(addr + s) if e[0] is not None)
+        if contended and len(prefixes) > 1:             # one access from one phase may miss
+            self.assertGreater(total_dt, 8 * total_plain, f'{name}: no contention at all')
 
     def test_reads(self):                               # LD A,(HL): pc:4, hl:3
         self.check([0x21, 0x00, 0x40, 0x01, 0x00, 0x80], [0x7E],
@@ -329,7 +392,7 @@ class Contention48(NextCase):
             port = hi << 8 | 0xFE
             self.check([0x3E, hi, 0x01, 0x00, 0x80], [0xD3, 0xFE, 0x00],
                        lambda pc, port=port: [(pc, 4), (pc + 1, 3), ('io', port), (pc + 2, 4)],
-                       f'one OUT (FEh),A with A = {hi:02X}h, then a NOP', reps=1)
+                       f'one OUT (FEh),A with A = {hi:02X}h, then a NOP', reps=1, at_hc=330)
 
     def test_contention_follows_the_page_not_the_address(self):
         self.check([0x21, 0x00, 0xC0, 0x01, 0x00, 0x80], [0x7E],
@@ -338,6 +401,30 @@ class Contention48(NextCase):
         self.check([0x21, 0x00, 0x40, 0x01, 0x00, 0x80], [0x7E],
                    lambda pc: [(pc, 4), (0x4000, 3)], 'page 10h at 4000h: uncontended',
                    mmu=[0xFF, 0xFF, 0x10, 0x11, 0x04, 0x05, 0x00, 0x01], prefixes=[0, 3])
+
+    def test_rows_from_192_are_not_contended(self):
+        """Mutant survivor: contention past row 191. Start near row 186 so the
+        run crosses into the border (border_active_v, zxula.vhd:414)."""
+        self.check([0x21, 0x00, 0x40, 0x01, 0x00, 0x80], [0x7E],
+                   lambda pc: [(pc, 4), (0x4000, 3)], 'LD A,(HL) across row 191/192', line=186,
+                   prefixes=[0, 3])
+
+    def test_upper_half_of_bank_5(self):
+        """Mutant survivor: under 48K timing page 0Bh (6000h-7FFFh) is contended
+        like 0Ah (zxnext:4431, pages 0Ah-0Bh)."""
+        if self.TIMING != '48k':
+            self.skipTest('48K timing only')
+        self.check([0x21, 0x00, 0x60, 0x01, 0x00, 0x80], [0x7E],
+                   lambda pc: [(pc, 4), (0x6000, 3)], 'LD A,(HL) from 6000h', prefixes=[0, 5])
+
+    def test_t2_is_never_checked_from_32_starting_points(self):
+        """Mutant survivor: a check at a memory cycle's T2 shows from only a few
+        phases, so sweep 32 starts with a body (15 T) that walks the pattern:
+        LD A,(HL); NOP; NOP (zxula.vhd:589: the memory term needs MREQ high at
+        the last rising edge, i.e. T1 only)."""
+        self.check([0x21, 0x00, 0x40, 0x01, 0x00, 0x80], [0x7E, 0x00, 0x00],
+                   lambda pc: [(pc, 4), (0x4000, 3), (pc + 1, 4), (pc + 2, 4)],
+                   'LD A,(HL); NOP; NOP', prefixes=range(32), reps=40)
 
     def test_off_above_3_5_mhz(self):
         zx = bare(timing='48k', speed=1)
@@ -372,6 +459,15 @@ class Contention128(Contention48):
             self.check([0x21, 0x00, 0xC0, 0x01, 0x00, 0x80], [0x7E],
                        lambda pc: [(pc, 4), (0xC000, 3)], f'LD A,(HL) from bank {bank}',
                        mmu=mmu, prefixes=[0, 5])
+
+    def test_pages_10h_and_up_are_never_contended(self):
+        """Mutant survivor: page 12h/13h has bit 1 set but only pages 00-0Fh can
+        be contended (zxnext:4430)."""
+        for page in (0x12, 0x13):
+            mmu = MMU0[:6] + [page, page + 1]
+            self.check([0x21, 0x00, 0xC0, 0x01, 0x00, 0x80], [0x7E],
+                       lambda pc: [(pc, 4), (0xC000, 3)], f'LD A,(HL) from page {page:02X}h',
+                       mmu=mmu, prefixes=[0, 3])
 
     def test_7ffd_is_contended_as_the_ula_port(self):  # OUT (C),A: pc:4, pc+1:4, I/O
         self.check([0x01, 0xFD, 0x7F, 0xAF], [0xED, 0x79],

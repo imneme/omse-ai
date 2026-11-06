@@ -338,9 +338,9 @@ class DivMMC(NextCase):
         out(zx, ref.PE3, 0xC0 | 0x03)                   # conmem + mapram, bank 3
         zx.sram[ref.divmmc_ram(3) + 7] = 0x37
         self.assertEqual(zx.peek(0x0007), 0x37, 'bank 3 replaces the ROM (divmmc:91-95)')
-        zx.poke(0x2007, 0x99)
-        self.assertEqual(zx.sram[ref.divmmc_ram(3) + 0x2007 - 0x2000], 0x00,
-                         'bank 3 read-only with mapram (divmmc:99)')
+        zx.poke(0x2007, 0x99)                           # the same byte as 0x0007 (bank 3)
+        self.assertEqual(zx.sram[ref.divmmc_ram(3) + 7], 0x37,
+                         'bank 3 read-only with mapram: the 99h refused (divmmc:99)')
         out(zx, ref.PE3, 0xC0 | 0x05)
         zx.poke(0x2007, 0x99)
         self.assertEqual(zx.sram[ref.divmmc_ram(5) + 7], 0x99, 'other banks writable')
