@@ -525,6 +525,15 @@ void nr_write(ZXN& z, int n, int v) {
         case 0x6A:                                                    // LoRes: Radastan b5, its display file b4, offset
             z.nr[0x6A] = v & 0x3F;
             return;
+        case 0x2F:                                                    // the tilemap's X scroll, bits 9:8 (5269)
+            z.nr[0x2F] = v & 3;
+            return;
+        case 0x4C:                                                    // its transparent index (5351)
+            z.nr[0x4C] = v & 15;
+            return;
+        case 0x6E: case 0x6F:                                         // its bases: b7 bank 7, b5:0 the page (5406-5411)
+            z.nr[n] = v & 0xBF;
+            return;
         case 0x70:                                                    // Layer 2: resolution b5:4, palette offset b3:0
             z.nr[0x70] = v & 0x3F;
             return;
@@ -1007,6 +1016,54 @@ bool l2_pixel(const ZXN& z, int x, int y, int sample, uint16_t& rgb, bool& prio)
     return true;
 }
 
+// ---- the tilemap at the beam (video/tilemap.vhd), on the wide 320 x 256 counters (whc/wvc: 32 left and above the
+// paper). 40 x 32 tiles of 8 x 8, or 80 x 32 at 14 MHz (NR 0x6B b6); the map at NR 0x6E (b7 bank 7, b5:0 the 256-byte
+// page), two bytes a tile (tile, attribute) or one with NR 0x6C's attribute (b5); 4-bit patterns at NR 0x6F, 32 bytes
+// each, or 1-bit in text mode (b3); the attribute b7:4 palette offset, b3 X mirror, b2 Y mirror, b1 rotate, b0 below
+// the ULA or (b1 of NR 0x6B) the 9th tile bit; scroll NR 0x2F/0x30 (10 bits) and NR 0x31; clip NR 0x1B (X in pairs).
+inline uint8_t tm_byte(const ZXN& z, bool bank7, int page, int addr) {
+    const int a = (((addr >> 8) + page) << 8 | (addr & 0xFF)) & 0x3FFF;   // (tilemap:240-243)
+    return bank7 ? z.bram7[a & 0x1FFF] : z.bram5[a];
+}
+bool tm_pixel(const ZXN& z, int x, int y, int smp, uint16_t& rgb, bool& below, bool& text) {
+    const uint8_t ctl = z.nr[0x6B];
+    if (!(ctl & 0x80)) return false;
+    const int whc = x + 32, wvc = y + 32;
+    const uint8_t* c = z.clip[3];
+    if (whc < 0 || whc >= 320 || wvc < 0 || wvc >= 256 || whc < c[0] * 2 || whc > c[1] * 2 + 1 || wvc < c[2] || wvc > c[3])
+        return false;
+    const bool wide = ctl & 0x40, strip = ctl & 0x20, t512 = ctl & 2;
+    text = ctl & 8;
+    const int xs = (wide ? 2 * whc + smp : whc) + ((z.nr[0x2F] & 3) << 8 | z.nr[0x30]);
+    const int ax = wide ? xs % 640 : xs % 320;                        // the hardware's corrections (tilemap:120-127)
+    const int ay = (wvc + z.nr[0x31]) & 0xFF;
+    const int idx = (ay >> 3) * (wide ? 80 : 40) + (ax >> 3);
+    const bool mb7 = z.nr[0x6E] & 0x80, tb7 = z.nr[0x6F] & 0x80;
+    const int mpg = z.nr[0x6E] & 0x3F, tpg = z.nr[0x6F] & 0x3F;
+    const uint8_t tile = tm_byte(z, mb7, mpg, strip ? idx : 2 * idx);
+    const uint8_t attr = strip ? z.nr[0x6C] : tm_byte(z, mb7, mpg, 2 * idx + 1);
+    const int t9 = tile | ((t512 && (attr & 1)) ? 0x100 : 0);
+    uint8_t px;
+    bool shown;
+    if (text) {                                                       // 1 bit a pixel, 7-bit offset (tilemap:228)
+        const uint8_t b = tm_byte(z, tb7, tpg, t9 * 8 + (ay & 7));
+        px = (attr & 0xFE) | ((b << (ax & 7)) >> 7 & 1);
+        shown = true;
+    } else {
+        const bool rot = attr & 2;
+        const int ex = ((attr >> 3) ^ (attr >> 1)) & 1 ? ~ax & 7 : ax & 7, ey = (attr & 4) ? ~ay & 7 : ay & 7;
+        const int tx = rot ? ey : ex, ty = rot ? ex : ey;             // (tilemap:139-143)
+        const uint8_t b = tm_byte(z, tb7, tpg, t9 * 32 + ty * 4 + (tx >> 1));
+        const uint8_t nib = (tx & 1) ? b & 15 : b >> 4;
+        px = (attr & 0xF0) | nib;
+        shown = nib != (z.nr[0x4C] & 15);                             // the transparent index (tilemap:260)
+    }
+    if (!shown) return false;
+    below = ((attr & 1) || t512) && !(ctl & 1);
+    rgb = z.pal[0][1 << 9 | ((ctl >> 4) & 1) << 8 | px] & 0x1FF;
+    return true;
+}
+
 // ---- the ULA screen, drawn at the beam (ref §2.5): pixel 0 of a line is hc_ula = 0x0C; the 256 x 192 area from
 // bank 5's block RAM (bank 7's with the shadow screen); the border from port 0xFE; FLASH every 16 frames, counted at
 // ULA position 0,0. APPROXIMATION: memory is read when the pixel is shown, not at its fetch slot 12 pixels earlier, so
@@ -1136,8 +1193,22 @@ inline void draw_pixel(ZXN& z) {
     const int rawh = x + t.hactive, rawv = ((y + t.vactive) % t.vc_len + t.vc_len) % t.vc_len;
     const bool blank = rawh <= (pent ? 63 : 95) || rawv <= (pent ? 15 : 7);
     for (int smp = 0; smp < 2; smp++) {
-        const uint16_t urgb = urgb2[smp];
-        const bool ut = (urgb >> 1) == z.nr[0x14] || uclip || (z.nr[0x68] & 0x80);
+        const uint16_t ur = urgb2[smp];
+        const bool ul_t = (ur >> 1) == z.nr[0x14] || uclip || (z.nr[0x68] & 0x80);   // ula_transparent
+        // the tilemap with the ULA (zxnext:7011-7030): over it unless the tile is below and the ULA shows; or with
+        // NR 0x68 b0's stencil, the two ANDed where both show
+        uint16_t trgb = 0;
+        bool below = false, text = false;
+        const bool tt = !tm_pixel(z, x, y, smp, trgb, below, text) || (text && (trgb >> 1) == z.nr[0x14]);
+        uint16_t urgb;
+        bool ut;
+        if ((z.nr[0x68] & 1) && !(z.nr[0x68] & 0x80) && (z.nr[0x6B] & 0x80)) {
+            ut = ul_t || tt;
+            urgb = ut ? 0 : ur & trgb;
+        } else {
+            ut = ul_t && tt;
+            urgb = (!tt && (!below || ul_t)) ? trgb : ur;
+        }
         uint16_t lrgb = 0;
         bool lp = false;
         const bool lt = !l2_pixel(z, x, y, smp, lrgb, lp) || (lrgb >> 1) == z.nr[0x14];
@@ -1152,12 +1223,27 @@ inline void draw_pixel(ZXN& z) {
                 break;
             case 6: case 7: {
                 const int bm = (z.nr[0x68] >> 5) & 3;
-                const bool umt = (urgb >> 1) == z.nr[0x14] || uclip; // ula_mix_transparent: not the ULA's enable
-                bool mt = true, bt = true;
-                uint16_t mix = 0;
-                if (bm == 0 && !umt) { mix = urgb; mt = false; }
-                else if (bm == 2 && !ut) { mix = urgb; mt = false; }
-                else if ((bm == 1 || bm == 3) && !ut) bt = false;     // mix_bot: the ULA, under Layer 2's blend
+                const bool umt = (ur >> 1) == z.nr[0x14] || uclip;   // ula_mix_transparent: not the ULA's enable
+                bool mt = true, topt = true, bt = true;
+                uint16_t mix = 0, top = 0, bot = 0;
+                switch (bm) {                                         // mix, top and bottom layers (zxnext:7032-7068)
+                    case 0:
+                        if (!umt) { mix = ur; mt = false; }
+                        if (!tt && !below) { top = trgb; topt = false; }
+                        if (!tt && below) { bot = trgb; bt = false; }
+                        break;
+                    case 2:
+                        if (!ut) { mix = urgb; mt = false; }
+                        break;
+                    case 3:
+                        if (!tt) { mix = trgb; mt = false; }
+                        if (!ul_t && below) { top = ur; topt = false; }
+                        if (!ul_t && !below) { bot = ur; bt = false; }
+                        break;
+                    default:
+                        if (below) { if (!ul_t) { top = ur; topt = false; } if (!tt) { bot = trgb; bt = false; } }
+                        else { if (!tt) { top = trgb; topt = false; } if (!ul_t) { bot = ur; bt = false; } }
+                }
                 const int lr = lt ? 0 : lrgb;
                 int ch[3];
                 for (int i = 0; i < 3; i++) {
@@ -1167,7 +1253,7 @@ inline void draw_pixel(ZXN& z) {
                     ch[i] = v;
                 }
                 const uint16_t mixer = ch[0] << 6 | ch[1] << 3 | ch[2];
-                out = lp ? mixer : !bt ? urgb : !lt ? mixer : fb9;    // priority L2, the bottom layer, plain L2 (7202-7211)
+                out = lp ? mixer : !topt ? top : !bt ? bot : !lt ? mixer : fb9;   // (7202-7211; no sprites yet)
                 break;
             }
             default:                                                  // S L U
