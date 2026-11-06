@@ -108,6 +108,7 @@ struct ZXN {
     bool ula_int_disabled = false;      // port 0xFF bit 6 and its aliases (ref §2.3)
     bool eff_cd = false;                // eff_nr_08_contention_disable: NR 0x08 b6 as in effect (zxnext:5703-5733)
     int coreid = 1;                     // NR 0x10's core id (zxnext:1127)
+    int cvc_off = 0;                    // NR 0x64 as the timing generator last loaded it, at ULA row 0
     bool l2_en = false;                 // port_123b_layer2_en (port 0x123B b1, NR 0x69 b7; Layer 2 itself: later)
     bool l2_wr = false, l2_rd = false, l2_shadow = false;   // port 0x123B b0, b2, b3 (zxnext:3845-3869)
     int l2_seg = 0, l2_off = 0;         // b7:6, and the offset a write with b4 set stores
@@ -194,8 +195,9 @@ inline int vc_ula(const ZXN& z) {
     return (v % t.vc_len + t.vc_len) % t.vc_len;
 }
 // cvc, the line the copper, line interrupt and NR 0x1E/0x1F count: the ULA's line plus NR 0x64's offset (ref §2.4;
-// zxnext:5889-5893). (A change of NR 0x64 waits for row 0 on the hardware, ulat:455-472: here it's at once.)
-inline int cvc(const ZXN& z) { return (vc_ula(z) + z.nr[0x64]) % T(z).vc_len; }
+// zxnext:5889-5893). The timing generator loads the offset as the ULA reaches row 0 and counts on from there, so a
+// change of NR 0x64 takes effect at the next row 0 (ulat:455-470).
+inline int cvc(const ZXN& z) { return (vc_ula(z) + z.cvc_off) % T(z).vc_len; }
 
 // ---- memory (ref §3)
 
@@ -687,6 +689,7 @@ void do_reset(ZXN& z, bool hard) {
     z.speed_prog = z.speed_eff = 0;
     z.eff_cd = false;                                                 // (zxnext:5706-5709)
     z.l2_en = false;                                                  // (zxnext:3849)
+    z.cvc_off = 0;                                                    // NR 0x64 resets to 0 (zxnext:4963)
     z.porte3 = 0;                                                     // (zxnext:4114-4117; divmmc:107-140)
     z.l2_wr = z.l2_rd = z.l2_shadow = false;                          // (zxnext:3847-3854)
     z.l2_seg = z.l2_off = 0;
@@ -1487,6 +1490,7 @@ bool master_tick(ZXN& z) {
             }
         }
         const Timing& t2 = T(z);
+        if (hc_ula(z) == 0 && vc_ula(z) == 0) z.cvc_off = z.nr[0x64];   // ula_min_vactive: cvc <= offset (ulat:461-462)
         if (z.hc == t2.int_h && z.vc == t2.int_v && !z.ula_int_disabled) int_raise(z, 11, false);
         // the line interrupt for line N: at hc_ula 255 on cvc line N-1, the last line for N = 0, "before the line is
         // drawn" (ulat:561-583); NR 0x22 b1 enables it, NR 0x22 b0 : NR 0x23 is N (zxnext:5233-5239). In pulse mode
