@@ -731,5 +731,46 @@ class Sprites(VideoCase):
                 self.assertFrameMatches(s, name=f'sprites_border_order_{order}')
 
 
+def ulap_scene(seed=8):
+    s = ula_scene(seed)
+    s.io(0xBF3B, 0x40).io(0xFF3B, 0x01)                     # ULA+ on (zxnext:4489-4490)
+    for i in range(64):
+        s.io(0xBF3B, i).io(0xFF3B, (i * 0x47 + 3) & 0xFF)
+    s.bram5(0x1800, bytes((i * 53) & 0xFF for i in range(768)))   # every CLUT; bit 7 set in half
+    return s
+
+
+@needs_next
+class Survivors(VideoCase):
+    """Behaviours Speccy-Zone's video mutants showed the suite missing (4 of 31), as scenes."""
+
+    def test_ula_plus_in_hi_res_ink_takes_the_paper_half(self):
+        s = ulap_scene()
+        bm, _ = address_bitmap(23)
+        s.bram5(0x2000, bm).io(0x00FF, 0x06 | (5 << 3))      # ula:535: bit 3 = hi-res OR paper
+        self.assertFrameMatches(s)
+
+    def test_no_flash_under_ula_plus(self):
+        s = ulap_scene()
+        want = nv.frame9_np(s.model())[2]
+        for frames in (2, 18):                              # both FLASH phases (ula:470-481)
+            with self.subTest(frames=frames):
+                self.assertEqual(list(s.machine(frames).frame9()[2]), want, 'ula:470: no FLASH under ULA+')
+
+    def test_tile_below_shows_through_transparent_ula(self):
+        s = tm_scene(0x80)
+        pal = unique_palette(1)
+        for paper in (1, 4):                                # these papers become transparent
+            s.nr(0x14, pal[16 + paper] >> 1)
+        self.assertFrameMatches(s)                          # zxnext:7023: below, but the ULA is transparent
+
+    def test_512_tiles_ninth_bit_on_top(self):
+        s = tm_scene(0x83)                                  # 512 tiles, always on top
+        defs = bytes(((a * 0x6B) ^ (a >> 8) ^ (a >> 4)) & 0xFF for a in range(0x2000))
+        s.bram5(0x0000, defs)                               # definitions in bank 5 (16K: tiles 100h+ differ)
+        s.nr(0x6F, 0x00)
+        self.assertFrameMatches(s)
+
+
 if __name__ == '__main__':
     unittest.main()
