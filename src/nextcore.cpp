@@ -178,6 +178,8 @@ struct ZXN {
     bool int_req = false;               // the ULA's registered pulse, seen at the next 7 MHz edge
     bool int_low = false;
     int int_count = 0;
+    int in_latch_dt = -1;               // during an IN's io_read: ticks on to the INT that a 253Bh read registers
+    uint64_t in_latch_at = 0;           // that tick, for NR 0x22 b7 (0: none)
     std::vector<IntEvent> int_log;
 
     // logs and stops
@@ -448,6 +450,7 @@ int nr_read(ZXN& z, int n) {
         case 0x1F: return cvc(z) & 0xFF;
         case 0x10: return z.coreid << 2;                              // no buttons pressed (zxnext:5830-5831)
         case 0x22:                                                    // the pulse, port FF b6, the line interrupt's
+            if (z.in_latch_dt >= 0) z.in_latch_at = z.t28 + z.in_latch_dt;   // an IN: b7 is set again at its latch
             return (z.int_low ? 0x80 : 0) | ((z.portff >> 4) & 4) | (z.nr[0x22] & 3);       // (zxnext:5898-5899)
         case 0x81: return 0x80 | (z.nr[0x81] & 0x70);                 // b7 the bus's ROMCS pin, high (zxnext:6032)
         case 0x2C: case 0x2E: return 0x80;                            // the Pi's I2S audio, off: 0x200 >> 2 (zxnext:2316-2317,
@@ -792,6 +795,7 @@ void do_reset(ZXN& z, bool hard) {
     z.nr_sel = 0x24;
     z.ula_int_disabled = false;
     z.int_req = z.int_low = false;
+    z.in_latch_at = 0;
     z.int_count = 0;
     z.int_log.clear();
     z.wait_next = false;
@@ -1725,7 +1729,12 @@ bool cpu_edge(ZXN& z) {
     } else if ((p & Z80_IORQ) && !(p & Z80_M1)) {
         uint16_t port = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
+            // NR 0x22 b7 through 253Bh: INT as port_253b_dat held it at the falling edge in the T80N's T2, 1.5 clocks
+            // after this tick begins, less the CLK_28 register in front of it (master_tick sets it then)
+            const int per = z.speed_eff == 0 ? 8 : z.speed_eff == 1 ? 4 : z.speed_eff == 2 ? 2 : 1;   // ticks a CPU clock
+            z.in_latch_dt = (3 * per + 1) / 2 - 1;
             uint8_t v = io_read(z, port);
+            z.in_latch_dt = -1;
             Z80_SET_DATA(p, v);
             if (z.io_logging) z.io_log.push_back({z.t28, z.cpu_clocks, port, v, 0});
         } else if (p & Z80_WR) {
@@ -1777,6 +1786,13 @@ bool cpu_edge(ZXN& z) {
 
 // One 28 MHz master tick. Returns false if a stop was due before anything moved.
 bool master_tick(ZXN& z) {
+    if (z.in_latch_at == z.t28 && z.in_latch_at) {                    // the 253Bh register takes INT (cpu_edge's IN)
+        z.in_latch_at = 0;
+        const uint8_t d = (Z80_GET_DATA(z.pins) & 0x7F) | (z.int_low ? 0x80 : 0);
+        Z80_SET_DATA(z.pins, d);                                      // the byte z80.h takes at T3
+        if (z.io_logging && !z.io_log.empty() && z.io_log.back().port == 0x253B && !z.io_log.back().write)
+            z.io_log.back().value = d;
+    }
     const int sc_next = (z.sc + 1) & 3;
     const bool edge7 = sc_next == 0;                                  // the 7 MHz edge: sc from 3 to 0 (ref §1.1)
     bool edge = false;
