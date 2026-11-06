@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_uart_feed': ([P, I, ctypes.c_char_p, I, U64, I, I, I], None), 'zxn_uart_sent_len': ([P, I], I), 'zxn_uart_sent_get': ([P, I, I, U64P], None), 'zxn_uart_sent_clear': ([P, I], None), 'zxn_uart_cts': ([P, I, I], None), 'zxn_uart_rts': ([P, I], I), 'zxn_i2c_rtc': ([P, I, I, I, I, I, I, I, I], None), 'zxn_i2c_logging': ([P, I], None), 'zxn_i2c_log_len': ([P], I), 'zxn_i2c_log_get': ([P, I, U64P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_uart_feed': ([P, I, ctypes.c_char_p, I, U64, I, I, I], None), 'zxn_uart_sent_len': ([P, I], I), 'zxn_uart_sent_get': ([P, I, I, U64P], None), 'zxn_uart_sent_clear': ([P, I], None), 'zxn_uart_cts': ([P, I, I], None), 'zxn_uart_feed_levels': ([P, I, ctypes.c_char_p, U64P, I], None), 'zxn_uart_tx_logging': ([P, I, I], None), 'zxn_uart_tx_log_len': ([P, I], I), 'zxn_uart_tx_log_get': ([P, I, I, U64P], None), 'zxn_uart_rts': ([P, I], I), 'zxn_i2c_rtc': ([P, I, I, I, I, I, I, I, I], None), 'zxn_i2c_logging': ([P, I], None), 'zxn_i2c_log_len': ([P], I), 'zxn_i2c_log_get': ([P, I, U64P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
         'zxn_audio_capture': ([P, I], None), 'zxn_audio_take': ([P, U16P, I], I), 'zxn_audio_cap_len': ([P], I),
@@ -404,6 +404,26 @@ class Next:
         data = bytes(data)
         self.lib.zxn_uart_feed(self.z, n, data, len(data), bit_t28, int(frame[0]), {'N': 0, 'O': 1, 'E': 2}[frame[1].upper()],
                                int(frame[2]))
+
+    def uart_feed_levels(self, n, segments):
+        """Raw levels on the host's sending wire into UART n: [(level, ticks), ...], after any earlier feed, back to
+        back; the wire idles at 1 again after the last (§9.1 (18) i)."""
+        levels = bytes(1 if lv else 0 for lv, _ in segments)
+        ticks = (ctypes.c_uint64 * len(segments))(*[t for _, t in segments])
+        self.lib.zxn_uart_feed_levels(self.z, n, levels, ticks, len(segments))
+
+    def uart_tx_log(self, n, on=True):
+        """Log the host's receiving wire for UART n: [(t28, level)] at each change, after the gating and routing,
+        an undriven wire idle 1 (zx.uart_tx_events(n); §9.1 (18) i). Turning it off clears the log."""
+        self.lib.zxn_uart_tx_logging(self.z, n, 1 if on else 0)
+
+    def uart_tx_events(self, n):
+        out = (ctypes.c_uint64 * 2)()
+        res = []
+        for i in range(self.lib.zxn_uart_tx_log_len(self.z, n)):
+            self.lib.zxn_uart_tx_log_get(self.z, n, i, out)
+            res.append((out[0], bool(out[1])))
+        return res
 
     def uart_sent(self, n):
         """Every byte UART n put on its Tx pin since the last call, as [(t28, byte)], t28 the tick its start bit's

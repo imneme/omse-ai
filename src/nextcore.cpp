@@ -537,6 +537,11 @@ void serial_tick(ZXN& z) {
         const bool cts_n = rr ? jcts_n : n == 0 ? u.host_cts_n
                          : (uart_pi(z) && (u.frame & 0x20)) ? (uart_pi_talks(z) ? u.host_cts_n : true) : false;
         nserial::uart_tick(u, z.t28, false, rx, cts_n, !rr && host);
+        const bool wire = (!rr && host) ? u.t.out : true;             // what the host's receiving wire carries
+        if (wire != u.wire) {
+            u.wire = wire;
+            if (u.tx_logging) u.tx_events.push_back({z.t28, wire});
+        }
     }
     serial_edges(z);
 }
@@ -2438,6 +2443,19 @@ void zxn_set_joy(ZXN* z, int left, int right) {
 void zxn_uart_feed(ZXN* z, int n, const uint8_t* data, int len, uint64_t bit_t28, int bits, int parity, int stops) {
     z->uart[n & 1].feed(z->t28, data, len, bit_t28, bits, parity, stops);
     z->serial_on = true;
+}
+void zxn_uart_feed_levels(ZXN* z, int n, const uint8_t* levels, const uint64_t* ticks, int count) {
+    z->uart[n & 1].feed_levels(z->t28, levels, ticks, count);
+    z->serial_on = true;
+}
+void zxn_uart_tx_logging(ZXN* z, int n, int on) {
+    nserial::Uart& u = z->uart[n & 1];
+    u.tx_logging = on;
+    if (!on) u.tx_events.clear();
+}
+int zxn_uart_tx_log_len(ZXN* z, int n) { return (int)z->uart[n & 1].tx_events.size(); }
+void zxn_uart_tx_log_get(ZXN* z, int n, int i, uint64_t* out) {
+    out[0] = z->uart[n & 1].tx_events[i].first; out[1] = z->uart[n & 1].tx_events[i].second;
 }
 int zxn_uart_sent_len(ZXN* z, int n) { return (int)z->uart[n & 1].sent.size(); }
 void zxn_uart_sent_get(ZXN* z, int n, int i, uint64_t* out) { out[0] = z->uart[n & 1].sent[i].first; out[1] = z->uart[n & 1].sent[i].second; }

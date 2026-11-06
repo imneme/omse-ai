@@ -70,6 +70,8 @@ struct Uart {
     uint64_t feed_end = 0;
     std::vector<std::pair<uint64_t, uint8_t>> sent;   // the host's decode of Tx: (t28 of the start bit's fall, byte)
     bool host_cts_n = false;            // the host's CTS into this UART: clear to send by default
+    bool tx_logging = false, wire = true;   // §9.1 (18) i: the host's receiving wire, and its log
+    std::vector<std::pair<uint64_t, bool>> tx_events;
     uint32_t presc() const { return (uint32_t)presc_msb << 14 | presc_lsb; }
     bool fifo_reset(bool reset) const { return reset || (frame & 0x80); }
     bool status_rx_err() const { return st_overflow || st_framing; }
@@ -78,6 +80,14 @@ struct Uart {
                !line_level || r.counter < 4 || r.sync != 3 || !r.db || !r.rx_d;
     }
     void hard_reset() { frame = 0x18; presc_lsb = 243; presc_msb = 0; }
+    // queue raw levels on the host's sending wire, (level, ticks) each, then idle 1 (§9.1 (18) i)
+    void feed_levels(uint64_t now, const uint8_t* levels, const uint64_t* ticks, int n) {
+        uint64_t t = feed_end > now ? feed_end : now;
+        for (int i = 0; i < n; i++) { line.push_back({t, levels[i] != 0}); t += ticks[i]; }
+        line.push_back({t, true});
+        feed_end = t;
+        wake = 4;
+    }
     // queue a host frame stream: start bit, data LSB first, parity, stop bits, each bit_t28 ticks
     void feed(uint64_t now, const uint8_t* data, int len, uint64_t bit_t28, int bits, int par, int stops) {
         uint64_t t = feed_end > now ? feed_end : now;
