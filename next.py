@@ -58,6 +58,11 @@ def _load_lib():
         'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
+        'zxn_audio_capture': ([P, I], None), 'zxn_audio_take': ([P, U16P, I], I), 'zxn_audio_cap_len': ([P], I),
+        'zxn_audio_rate': ([P, I], None), 'zxn_audio_out_len': ([P], I),
+        'zxn_audio_out': ([P, ctypes.POINTER(ctypes.c_int16), I], I),
+        'zxn_audio_level': ([P, ctypes.POINTER(ctypes.c_int)], None),
+        'zxn_ay_chan': ([P, I, ctypes.POINTER(ctypes.c_int)], None), 'zxn_ay_env': ([P, I], I),
     }
     for name, (args, res) in sigs.items():
         f = getattr(lib, name)
@@ -411,6 +416,55 @@ class Next:
             self.lib.zxn_int_log_get(self.z, i, out)
             res.append((out[0], out[1] or None))           # None: still low (§9.1 (4))
         return res
+
+    # the sound (src/next_audio.h, Slide Fern): the mixer's output at every 1.75 MHz enable, 13 bits a side (0-5998),
+    # as audio_mixer.vhd makes it; or resampled (a box filter) to a rate, scaled to 0-29990
+    def audio_capture(self, on=True):
+        """Start (or stop) keeping the mixer's (L, R) at every enable, for audio_take()."""
+        self.lib.zxn_audio_capture(self.z, 1 if on else 0)
+
+    def audio_take(self):
+        """The captured enables since the last take: an int32 array of shape (n, 2), (L, R) each 0-5998."""
+        import numpy as np
+        n = self.lib.zxn_audio_cap_len(self.z)
+        buf = (ctypes.c_uint16 * max(n, 1))()
+        n = self.lib.zxn_audio_take(self.z, buf, n)
+        return np.frombuffer(buf, np.uint16, n).reshape(-1, 2).astype(np.int32)
+
+    def audio(self, rate=48000):
+        """Stereo audio since the last call at `rate` (the first call at a rate starts it): int16, shape (n, 2)."""
+        import numpy as np
+        self.lib.zxn_audio_rate(self.z, rate)
+        n = self.lib.zxn_audio_out_len(self.z)
+        buf = (ctypes.c_int16 * max(n, 1))()
+        n = self.lib.zxn_audio_out(self.z, buf, n)
+        return np.frombuffer(buf, np.int16, n).reshape(-1, 2).copy()
+
+    def audio_level(self):
+        """The mixer's (L, R) now, 0-5998 each."""
+        out = (ctypes.c_int * 2)()
+        self.lib.zxn_audio_level(self.z, out)
+        return out[0], out[1]
+
+    def ay_chan(self, chip):
+        """A chip's three channel outputs now (8 bits each, after its volume table)."""
+        out = (ctypes.c_int * 3)()
+        self.lib.zxn_ay_chan(self.z, chip, out)
+        return tuple(out)
+
+    def ay_env(self, chip):
+        """A chip's envelope step now, 0-31."""
+        return self.lib.zxn_ay_env(self.z, chip)
+
+    @staticmethod
+    def write_wav(path, samples, rate=48000):
+        """Write audio() output (int16, shape (n, 2)) as a stereo WAV."""
+        import wave
+        with wave.open(str(path), 'wb') as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(samples.astype('<i2').tobytes())
 
     def io_log(self, on=True):
         self.lib.zxn_io_logging(self.z, 1 if on else 0)

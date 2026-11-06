@@ -22,6 +22,7 @@
 // generated from machine/nextregs.tsv), ports 0x243B/0x253B, the logs. Contention, the other ports, the screen, the
 // SPI master and the fast boot are the next layers (machine-build-notes.md).
 
+#include "next_audio.h"                // the sound (Slide Fern): generators, DACs, beeper, mixer
 #include "z80.h"
 #include "sdcard.h"
 
@@ -148,6 +149,7 @@ struct ZXN {
     bool dm_button = false;             // divmmc.vhd's button_nmi
     uint16_t joy[2] = {0, 0};           // the joysticks: X Z Y START A C B U D L R in bits 10:0 (zxnext:3398-3400)
     uint8_t ay_reg[3][16] = {{0}};      // the AYs' register files (ym2149.vhd), chip 0 = AY_ID 11, 1 = 10, 2 = 01
+    nextaudio::Audio audio;             // what makes the sound (next_audio.h)
     uint8_t ay_addr[3] = {0, 0, 0};     // each chip's selected register (5 bits)
     int ay_sel = 0;                     // turbosound.vhd's ay_select, as a chip number
     uint8_t ulap_mode = 0, ulap_index = 0;   // port 0xBF3B (zxnext:4466-4478)
@@ -495,6 +497,11 @@ int nr_read(ZXN& z, int n) {
 
 void nr_write(ZXN& z, int n, int v) {
     v &= 0xFF;
+    if (n >= 0x2C && n <= 0x2E && (z.nr[0x08] & 8)) {               // the DACs from next registers (soundrive:66-90)
+        if (n == 0x2C) z.audio.dac[1] = v;                            // left: B
+        else if (n == 0x2E) z.audio.dac[2] = v;                       // right: C
+        else z.audio.dac[0] = z.audio.dac[3] = v;                     // mono: A and D
+    }
     switch (n) {
         case 0x00: case 0x01: case 0x0E: case 0x0F: case 0x1E: case 0x1F: case 0xB0: case 0xB1: case 0xB2: case 0xDA:
             return;                                                   // read-only (machine/nextregs.tsv)
@@ -872,7 +879,11 @@ uint8_t io_read(ZXN& z, uint16_t port) {
 void io_write(ZXN& z, uint16_t port, uint8_t v) {
     if (port == 0x243B) { z.nr_sel = v; return; }
     if (port == 0x253B) { nr_write(z, z.nr_sel, v); return; }
-    if (!(port & 1)) z.border = v & 7;                                // 0xFE, A0 = 0 (ref §5.1)
+    if (!(port & 1)) {                                                // 0xFE, A0 = 0 (ref §5.1)
+        z.border = v & 7;
+        z.audio.ear = (v >> 4) & 1;                                   // the beeper (zxnext:6410, audio_mixer:54-55)
+        z.audio.mic = ((v >> 3) & 1) && !(z.nr[0x08] & 1);
+    }
     if ((port & 0xFF) == 0xE7 && port_en(z, 11)) {                    // slave select: one device only (zxnext 3258-3290)
         bool flash_ok = z.config_mode || z.reset_type == 4;           // the flash: config mode or before the first soft reset
         if ((v & 3) == 1 || (v & 3) == 2 || (flash_ok && (v == 0xFB || v == 0xF7 || v == 0x7F))) z.spi_cs = v;
@@ -884,6 +895,16 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
         const bool dffd = (port >> 12) == 0xD && port_en(z, 2);
         if ((port >> 14) == 3 && !dffd) ay_select(z, v);
         else if ((port >> 14) == 2) ay_write(z, v);
+    }
+    if (z.nr[0x08] & 8) {                                             // the DACs, gated by NR 0x08 b3 (dac_hw_en)
+        const int lo = port & 0xFF;
+        const bool sd1 = port_en(z, 17), sd2 = port_en(z, 18), ad3f = port_en(z, 19), bc0f = port_en(z, 20);
+        const bool mono_ad = (lo == 0xFB && port_en(z, 21) && !sd2) || (lo == 0xDF && port_en(z, 23));
+        const bool mono_bc = lo == 0xB3 && port_en(z, 22);
+        if (mono_ad || (lo == 0x1F && sd1) || (lo == 0xF1 && sd2) || (lo == 0x3F && ad3f)) z.audio.dac[0] = v;
+        if (mono_bc || (lo == 0x0F && (sd1 || bc0f)) || (lo == 0xF3 && sd2)) z.audio.dac[1] = v;
+        if (mono_bc || (lo == 0x4F && (sd1 || bc0f)) || (lo == 0xF9 && sd2)) z.audio.dac[2] = v;
+        if (mono_ad || (lo == 0x5F && (sd1 || ad3f)) || (lo == 0xFB && sd2)) z.audio.dac[3] = v;
     }
     if (port == 0xBF3B && port_en(z, 24)) {                           // ULA+ mode and index (zxnext:4472-4477)
         z.ulap_mode = v >> 6;
@@ -1352,19 +1373,24 @@ void ay_reset(ZXN& z) {
     for (auto& r : z.ay_reg) r[7] = 0xFF;
     memset(z.ay_addr, 0, sizeof z.ay_addr);
     z.ay_sel = 0;
+    z.audio.reset_psgs();
 }
 inline bool ay_held(const ZXN& z) { return (z.nr[0x06] & 3) == 3; }  // NR 0x06 PSG mode 11 holds them in reset (6286)
 // 0xFFFD: with TurboSound on (NR 0x08 b1), 1xx111nn picks a chip (nn 10 -> 1, 01 -> 2, else 0); 000rrrrr selects
 // a register of the chosen chip (turbosound:80-100)
 void ay_select(ZXN& z, uint8_t v) {
     if (ay_held(z)) return;
-    if ((z.nr[0x08] & 2) && (v & 0x80) && (v & 0x1C) == 0x1C) z.ay_sel = (v & 3) == 2 ? 1 : (v & 3) == 1 ? 2 : 0;
+    if ((z.nr[0x08] & 2) && (v & 0x80) && (v & 0x1C) == 0x1C) {
+        z.ay_sel = (v & 3) == 2 ? 1 : (v & 3) == 1 ? 2 : 0;
+        z.audio.pan[z.ay_sel] = (v >> 5) & 3;                       // its pan, b6 L b5 R (turbosound:83-89)
+    }
     else if (!(v & 0xE0)) z.ay_addr[z.ay_sel] = v & 0x1F;
 }
 void ay_write(ZXN& z, uint8_t v) {                                    // 0xBFFD (ym2149:183-206)
     if (ay_held(z)) return;
     const int a = z.ay_addr[z.ay_sel];
     if (!(a & 0x10)) z.ay_reg[z.ay_sel][a] = v;
+    if (a == 13) z.audio.ym[z.ay_sel].env_reset(v);                  // env_reset (ym2149:205-207)
 }
 // what the chosen chip reads (ym2149:216-249): its ID and register number for 0xBFF5; 0xFF above 15 in YM mode; in
 // AY mode (NR 0x06 b0) the unused bits of the narrow registers read 0; R14/R15 read the I/O ports (pulled up) when
@@ -1841,6 +1867,10 @@ bool master_tick(ZXN& z) {
         draw_pixel(z);
     }
     ctc_tick(z);
+    if ((z.t28 & 15) == 0 && z.t28) {                                 // the 1.75 MHz enable (zxnext_top:1161-1180)
+        if (!(z.nr[0x08] & 8)) memset(z.audio.dac, 0x80, 4);          // held in reset while off (zxnext:6343)
+        z.audio.tick(z.ay_reg, z.ay_sel, z.nr[0x06], z.nr[0x08], z.nr[0x09], ay_held(z));
+    }
     z.t28++;
     return true;
 }
@@ -1875,6 +1905,28 @@ void zxn_set_bootrom(ZXN* z, const uint8_t* data, int n) {
 }
 
 uint64_t zxn_t28(ZXN* z) { return z->t28; }
+// the sound (next_audio.h): capture every enable's (L, R); resampled audio at a rate; the levels now
+void zxn_audio_capture(ZXN* z, int on) { z->audio.capturing = on; if (!on) {} }
+int zxn_audio_take(ZXN* z, uint16_t* out, int max) {
+    const int n = (int)std::min<size_t>(z->audio.cap.size(), (size_t)max);
+    memcpy(out, z->audio.cap.data(), n * sizeof(uint16_t));
+    z->audio.cap.erase(z->audio.cap.begin(), z->audio.cap.begin() + n);
+    return n;
+}
+int zxn_audio_cap_len(ZXN* z) { return (int)z->audio.cap.size(); }
+void zxn_audio_rate(ZXN* z, int rate) {
+    if (rate != z->audio.rate) { z->audio.rate = rate; z->audio.acc = 0; z->audio.sumL = z->audio.sumR = z->audio.nsum = 0; }
+}
+int zxn_audio_out_len(ZXN* z) { return (int)z->audio.outbuf.size(); }
+int zxn_audio_out(ZXN* z, int16_t* out, int max) {
+    const int n = (int)std::min<size_t>(z->audio.outbuf.size(), (size_t)max);
+    memcpy(out, z->audio.outbuf.data(), n * sizeof(int16_t));
+    z->audio.outbuf.erase(z->audio.outbuf.begin(), z->audio.outbuf.begin() + n);
+    return n;
+}
+void zxn_audio_level(ZXN* z, int* out) { out[0] = z->audio.L; out[1] = z->audio.R; }
+void zxn_ay_chan(ZXN* z, int c, int* out) { z->audio.ym[c].out(z->nr[0x06] & 1, out); }
+int zxn_ay_env(ZXN* z, int c) { return z->audio.ym[c].evol; }
 uint64_t zxn_cpu_clocks(ZXN* z) { return z->cpu_clocks; }
 uint64_t zxn_frame(ZXN* z) { return z->frame; }
 int zxn_hc_ula(ZXN* z) { return hc_ula(*z); }

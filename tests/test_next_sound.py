@@ -254,6 +254,30 @@ class Envelope(NextCase):
             self.assertTrue(aligned(got, np.array(want)), f'shape {shape}: the envelope as ym2149:359-437 steps it')
 
 
+    def test_shapes_as_the_datasheet_draws_them(self):
+        """Independent of the model above (which is my reading of the VHDL): the sixteen shapes as every AY/YM
+        datasheet draws them, as the envelope step at the end of the first and second cycles and the direction of
+        travel in each. d = down, u = up; after the first cycle: 0 hold low, 1 hold high, or the second cycle's
+        direction."""
+        want = {0: ('d', 0), 1: ('d', 0), 2: ('d', 0), 3: ('d', 0), 4: ('u', 0), 5: ('u', 0), 6: ('u', 0),
+                7: ('u', 0), 8: ('d', 'd'), 9: ('d', 0), 10: ('d', 'u'), 11: ('d', 1), 12: ('u', 'u'),
+                13: ('u', 1), 14: ('u', 'd'), 15: ('u', 0)}
+        for shape, (first, then) in want.items():
+            zx = bare()
+            ay(zx, 11, 1)
+            ay(zx, 12, 0)
+            ay(zx, 13, shape)
+            steps = []
+            for _ in range(70):                           # an envelope step every 8 enables at period 1
+                zx.run_ticks(16 * 8)
+                steps.append(zx.ay_env(0))
+            a, b = steps[2:30], steps[36:62]              # inside the first and the second cycle
+            go = lambda xs: 'u' if xs[-1] > xs[0] else 'd' if xs[-1] < xs[0] else ('1' if xs[0] == 31 else '0')
+            self.assertEqual(go(a), first, f'shape {shape}: first cycle')
+            got = go(b)
+            self.assertEqual(got, str(then) if then in (0, 1) else then, f'shape {shape}: after the first cycle')
+
+
 @needs_next
 class Noise(NextCase):
 
