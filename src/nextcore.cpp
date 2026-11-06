@@ -23,6 +23,7 @@
 // SPI master and the fast boot are the next layers (machine-build-notes.md).
 
 #include "z80.h"
+#include "sdcard.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -93,6 +94,14 @@ struct ZXN {
     uint8_t fb[FB_W * FB_H];            // indexed: 0-7, +8 for BRIGHT
     int flash_count = 0;
     bool flash_on = false;
+
+    // the SPI master (ref §1.7; spi_master.vhd by Alvin Albrecht and Fabio Belavenuto, zxnext 3240-3290)
+    SDCard sd;
+    uint8_t spi_cs = 0xFF;              // port 0xE7: bit 0 low selects card 0
+    int spi_state = 16;                 // idles at 16; a transfer runs 0..15, one state a CPU clock
+    uint8_t spi_rx = 0xFF;              // the read register port 0xEB returns
+    uint8_t spi_got = 0xFF;             // the byte the transfer in progress has received
+    bool spi_last_d = false;            // state_last_d: the edge after state 15 loads the read register
     uint8_t nr[256];
     int nr_sel = 0x24;                  // port 0x243B resets to 0x24 (ref §4.1)
     bool ula_int_disabled = false;      // port 0xFF bit 6 and its aliases (ref §2.3)
@@ -395,6 +404,7 @@ uint8_t io_read(ZXN& z, uint16_t port) {
         return 0xE0 | v;                                              // (EAR in, bit 6: later)
     }
     if ((port & 0xFF) == 0xFF) return floating_bus(z);                // always answered (ref §5.1)
+    if ((port & 0xFF) == 0xEB && port_en(z, 11)) return z.spi_rx;     // the previous transfer's byte (ref §1.7)
     return 0xFF;                                                      // nobody answers (ref §5.2)
 }
 
@@ -402,6 +412,11 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
     if (port == 0x243B) { z.nr_sel = v; return; }
     if (port == 0x253B) { nr_write(z, z.nr_sel, v); return; }
     if (!(port & 1)) z.border = v & 7;                                // 0xFE, A0 = 0 (ref §5.1)
+    if ((port & 0xFF) == 0xE7 && port_en(z, 11)) {                    // slave select: one device only (zxnext 3258-3290)
+        bool flash_ok = z.config_mode || z.reset_type == 4;           // the flash: config mode or before the first soft reset
+        if ((v & 3) == 1 || (v & 3) == 2 || (flash_ok && (v == 0xFB || v == 0xF7 || v == 0x7F))) z.spi_cs = v;
+        else z.spi_cs = 0xFF;
+    }
     if ((port & 0xFF) == 0xFF && port_en(z, 0)) {                     // Timex port: bit 6 disables the ULA INT
         z.portff = v;
         z.ula_int_disabled = v & 0x40;
@@ -432,7 +447,7 @@ inline bool contended_page(const ZXN& z, uint16_t a) {
 }
 // Is the port contended as the ULA's own? A0 = 0, and under 128K timing ports that decode as 7FFD (zxnext 4437).
 inline bool contended_port(const ZXN& z, uint16_t port) {
-    return !(port & 1) || (z.timing == 2 && !(port & 0x8000) && (port & 3) == 1);
+    return !(port & 1) || (z.timing == 2 && dec_7ffd(z, port));      // port_7ffd's own decode: not 1FFD, enabled (zxnext 2552)
 }
 // At each rising CPU edge: what does this T-state ask the ULA? zxula.vhd holds the clock for (a) a contended address
 // while MREQ was high at the last rising edge and no contended I/O has begun (a memory cycle's T1, or an internal
@@ -549,8 +564,26 @@ bool cpu_edge(ZXN& z) {
             io_write(z, port, v);
         }
     }
+    // the SPI master, clocked by the CPU (ref §1.7): the read register loads one edge after state 15; a transfer
+    // begins where port 0xEB's read or write strobe is active and the counter is idle (16) or at its last state (15);
+    // a second access sooner starts nothing. The card exchanges the byte at once (sdcard.h works in bytes).
+    {
+        const int old_state = z.spi_state;
+        if (z.spi_last_d) { z.spi_rx = z.spi_got; }
+        z.spi_last_d = old_state == 15;
+        if (old_state < 16) z.spi_state = old_state + 1;
+        const uint16_t port = Z80_GET_ADDR(p);
+        if ((p & Z80_IORQ) && !(p & Z80_M1) && (p & (Z80_RD | Z80_WR)) && (port & 0xFF) == 0xEB && port_en(z, 11) &&
+            (old_state == 16 || old_state == 15)) {
+            const uint8_t mosi = (p & Z80_WR) ? Z80_GET_DATA(p) : 0xFF;   // a read sends 0xFF
+            z.spi_got = z.sd.xfer(mosi, !(z.spi_cs & 1));                 // card 0 on select bit 0
+            z.spi_state = 0;
+        }
+    }
     // the effective speed follows the programmed one only between bus cycles (ref §1.3)
-    if (!(p & (Z80_MREQ | Z80_IORQ | Z80_M1))) z.speed_eff = z.speed_prog;
+    // (the VHDL samples MREQ, IORQ and M1 as they were before the edge: the previous T-state's pins, not this one's;
+    // Speccy-Zone's review)
+    if (!(saved_pins & (Z80_MREQ | Z80_IORQ | Z80_M1))) z.speed_eff = z.speed_prog;
     // the INT pulse is counted on rising CPU edges until 32 (48K, +3) or 36 (128K, Pentagon), then released on the
     // falling 28 MHz edge inside this same tick (zxnext:1993-2003): this edge still saw INT low, the next won't
     if (z.int_low && ++z.int_count >= T(z).int_len) {
@@ -582,9 +615,10 @@ bool master_tick(ZXN& z) {
         if ((hc_ula(z) & 1) == 0) z.cpu_clk_high = true;
         else {
             // o_cpu_contend, decided at this odd slot (48K and 128K timing; +3 pulls WAIT instead: later)
+            // (no rising CPU edge comes during a hold, so ioreqtw3_n and mreq23_n keep their values and both terms
+            // persist through it; Speccy-Zone's review, from zxnext.vhd:47's i_CLK_CPU)
             z.contend = z.contention && z.timing != 3 && (z.ck_mem || z.ck_port) && wait_s(z);
-            if (z.contend) z.ck_port = false;                          // the port term is the first IORQ T-state only
-            else z.cpu_clk_high = false;
+            if (!z.contend) z.cpu_clk_high = false;
         }
     }
     z.sc = sc_next;
@@ -736,6 +770,9 @@ void zxn_nr_write(ZXN* z, int n, int v) { nr_write(*z, n & 0xFF, v); }
 int zxn_io_in(ZXN* z, int port) { return io_read(*z, port & 0xFFFF); }
 void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
 uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
+int zxn_sd_insert(ZXN* z, const char* path, int writable, int kind) { return z->sd.insert(path, writable != 0, kind); }
+void zxn_sd_eject(ZXN* z) { z->sd.eject(); }
+int zxn_spi_state(ZXN* z) { return z->spi_state; }
 int zxn_fb_width() { return FB_W; }
 int zxn_fb_height() { return FB_H; }
 int zxn_border(ZXN* z) { return z->border; }
