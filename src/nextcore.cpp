@@ -82,7 +82,8 @@ struct ZXN {
     int speed_prog = 0, speed_eff = 0;  // NR 0x07 (ref §1.3)
     int reset_type = 4;                 // 100 at power-on (ref §4.3, NR 0x02)
     uint8_t mmu[8];
-    uint8_t port7ffd = 0, port1ffd = 0;
+    uint8_t port7ffd = 0, port1ffd = 0, portdffd = 0, porteff7 = 0, portff = 0;
+    uint8_t border = 0;                 // port 0xFE bits 2:0 (ref §2.5)
     uint8_t nr[256];
     int nr_sel = 0x24;                  // port 0x243B resets to 0x24 (ref §4.1)
     bool ula_int_disabled = false;      // port 0xFF bit 6 and its aliases (ref §2.3)
@@ -183,6 +184,26 @@ inline void mem_write(ZXN& z, uint16_t a, uint8_t v) {
     if (z.wr[s]) z.wr[s][a & 0x1FFF] = v;
 }
 
+// The legacy paging ports rewrite the MMU (ref §3.6; zxnext:4560-4625). (The hardware does it one 28 MHz cycle
+// after the write, port_memory_change_dly; here it's at once, inside the same I/O cycle.)
+void port_memory_change(ZXN& z, bool was_allram) {
+    if (z.port1ffd & 1) {                                             // all-RAM mode: four banks from 1FFD bits 2:1
+        static const int BANKS[4][4] = {{0, 1, 2, 3}, {4, 5, 6, 7}, {4, 5, 6, 3}, {4, 7, 6, 3}};
+        const int* b = BANKS[(z.port1ffd >> 1) & 3];
+        for (int i = 0; i < 4; i++) { z.mmu[2 * i] = 2 * b[i]; z.mmu[2 * i + 1] = 2 * b[i] + 1; }
+    } else {
+        if (z.porteff7 & 8) { z.mmu[0] = 0x00; z.mmu[1] = 0x01; }     // EFF7 bit 3: RAM bank 0 over the ROM
+        else { z.mmu[0] = z.mmu[1] = 0xFF; }
+        int bank = ((z.portdffd & 0x0F) << 3) | (z.port7ffd & 7);     // NR 0x8F mode 00 (Pentagon modes: later)
+        z.mmu[6] = (2 * bank) & 0xFF;
+        z.mmu[7] = (2 * bank + 1) & 0xFF;
+        if (was_allram) {                                             // MMU2-5 come back only on leaving all-RAM
+            z.mmu[2] = 0x0A; z.mmu[3] = 0x0B; z.mmu[4] = 0x04; z.mmu[5] = 0x05;
+        }
+    }
+    remap(z);
+}
+
 // ---- the Next registers (ref §4, machine/nextregs.tsv)
 
 void nr_write(ZXN& z, int n, int v);
@@ -262,7 +283,8 @@ void do_reset(ZXN& z, bool hard) {
     if (z.config_mode) z.bootrom_en = true;                           // ref §3.10
     static const uint8_t MMU0[8] = {0xFF, 0xFF, 0x0A, 0x0B, 0x04, 0x05, 0x00, 0x01};   // ref §3.3
     memcpy(z.mmu, MMU0, 8);
-    z.port7ffd = z.port1ffd = 0;
+    z.port7ffd = z.port1ffd = z.portdffd = z.porteff7 = z.portff = 0;
+    z.border = 0;
     z.speed_prog = z.speed_eff = 0;
     z.nr_sel = 0x24;
     z.ula_int_disabled = false;
@@ -274,17 +296,41 @@ void do_reset(ZXN& z, bool hard) {
     remap(z);
 }
 
-// ---- ports (layer 1: the Next register ports; everything else reads 0xFF, ref §2.5)
+// ---- ports (ref §5.1; zxnext:2537-2658). Layer 2: the Next register ports, 0xFE, 0xFF, and the legacy paging ports.
+
+// the internal enable for a port (NR 0x82-0x85, bit numbers as ref §5.1's table; the expansion bus: later)
+inline bool port_en(const ZXN& z, int bit) { return (z.nr[0x82 + bit / 8] >> (bit % 8)) & 1; }
+inline bool fd(uint16_t port) { return (port & 3) == 1; }             // A1:0 = 01, the 128K-style partial decode
+inline bool dec_1ffd(const ZXN& z, uint16_t port) { return (port >> 12) == 0x1 && fd(port) && port_en(z, 3); }
+inline bool dec_7ffd(const ZXN& z, uint16_t port) {
+    if ((port & 0x8000) || !fd(port) || !port_en(z, 1) || dec_1ffd(z, port)) return false;
+    return z.timing != 3 || (port & 0x4000);                          // A14 = 1 too under +3 timing
+}
+inline bool locked(const ZXN& z) { return z.port7ffd & 0x20; }        // 7FFD bit 5 (Pentagon 1024: later)
 
 uint8_t io_read(ZXN& z, uint16_t port) {
     if (port == 0x243B) return z.nr_sel;                              // both decode all 16 bits (ref §4.1)
     if (port == 0x253B) return nr_read(z, z.nr_sel);
-    return 0xFF;
+    if (!(port & 1)) return 0xFF;                                     // 0xFE: no keys down (the keyboard: later)
+    return 0xFF;                                                      // nobody answers (ref §5.2); floating bus: later
 }
 
 void io_write(ZXN& z, uint16_t port, uint8_t v) {
     if (port == 0x243B) { z.nr_sel = v; return; }
     if (port == 0x253B) { nr_write(z, z.nr_sel, v); return; }
+    if (!(port & 1)) z.border = v & 7;                                // 0xFE, A0 = 0 (ref §5.1)
+    if ((port & 0xFF) == 0xFF && port_en(z, 0)) {                     // Timex port: bit 6 disables the ULA INT
+        z.portff = v;
+        z.ula_int_disabled = v & 0x40;
+    }
+    bool was_allram = z.port1ffd & 1;
+    if (dec_7ffd(z, port) && !locked(z)) { z.port7ffd = v; port_memory_change(z, was_allram); }
+    else if ((port >> 12) == 0xD && fd(port) && port_en(z, 2) && !locked(z)) {
+        z.portdffd = v; port_memory_change(z, was_allram);
+    } else if (dec_1ffd(z, port) && !locked(z)) { z.port1ffd = v; port_memory_change(z, was_allram); }
+    else if ((port >> 12) == 0xE && (port & 0xFF) == 0xF7 && port_en(z, 26)) {
+        z.porteff7 = v; port_memory_change(z, was_allram);
+    }
 }
 
 // ---- the clock
