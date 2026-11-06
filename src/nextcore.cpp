@@ -98,6 +98,8 @@ struct ZXN {
                                         // address layer << 9 | second << 8 | index; data priority << 14 | RGB333
     uint8_t pal_idx = 0, pal_stored = 0;   // NR 0x40, and NR 0x44's first byte
     bool pal_sub = false;               // NR 0x44's write phase (reads in NR 0x03 b7)
+    uint8_t clip[4][4];                 // NR 0x18-0x1B: x1, x2, y1, y2 of Layer 2, sprites, the ULA, the tilemap
+    uint8_t clip_idx[4] = {0, 0, 0, 0};
     int flash_count = 0;
     bool flash_on = false;
 
@@ -459,6 +461,8 @@ int nr_read(ZXN& z, int n) {
             return ((st & 1) << 7) | (((st >> 11) & 1) << 6) | ((st >> 3) & 0x0F);
         }
         case 0xC6: return z.nr[0xC6] & 0x77;                          // (zxnext:6151-6152)
+        case 0x18: case 0x19: case 0x1A: case 0x1B: return z.clip[n - 0x18][z.clip_idx[n - 0x18]];   // (5854-5885)
+        case 0x1C: return z.clip_idx[3] << 6 | z.clip_idx[2] << 4 | z.clip_idx[1] << 2 | z.clip_idx[0];  // (5886-5887)
         case 0x40: return z.pal_idx;                                  // the palettes (zxnext:5942-5955)
         case 0x41: return (z.pal[pal_ram(z)][pal_addr(z)] >> 1) & 0xFF;
         case 0x44: { const uint16_t e = z.pal[pal_ram(z)][pal_addr(z)]; return (e >> 14) << 6 | (e & 1); }
@@ -507,6 +511,24 @@ void nr_write(ZXN& z, int n, int v) {
             z.portff = (z.portff & ~0x40) | ((v & 4) << 4);           // b2 is port FF b6 (zxnext:3577-3578)
             z.ula_int_disabled = z.portff & 0x40;
             z.nr[0x22] = v & 3;                                       // the line interrupt: enable, line b8 (zxnext:5233-5236)
+            return;
+        case 0x18: case 0x19: case 0x1A: case 0x1B: {                 // clip windows: x1, x2, y1, y2 in turn (5180-5230)
+            const int k = n - 0x18;
+            z.clip[k][z.clip_idx[k]] = v;
+            z.clip_idx[k] = (z.clip_idx[k] + 1) & 3;
+            return;
+        }
+        case 0x1C:                                                    // reset the clip indices (5216-5229)
+            for (int k = 0; k < 4; k++) if (v & (1 << k)) z.clip_idx[k] = 0;
+            return;
+        case 0x6A:                                                    // LoRes: Radastan b5, its display file b4, offset
+            z.nr[0x6A] = v & 0x3F;
+            return;
+        case 0x70:                                                    // Layer 2: resolution b5:4, palette offset b3:0
+            z.nr[0x70] = v & 0x3F;
+            return;
+        case 0x71:                                                    // Layer 2's X scroll, bit 8
+            z.nr[0x71] = v & 1;
             return;
         case 0x40:                                                    // the palette index (zxnext:5312-5314)
             z.pal_idx = v;
@@ -726,6 +748,11 @@ void do_reset(ZXN& z, bool hard) {
     z.speed_prog = z.speed_eff = 0;
     z.eff_cd = false;                                                 // (zxnext:5706-5709)
     z.l2_en = false;                                                  // (zxnext:3849)
+    {                                                                 // the clip windows (zxnext:4898-4920)
+        static const uint8_t C[4][4] = {{0, 255, 0, 191}, {0, 255, 0, 191}, {0, 255, 0, 191}, {0, 159, 0, 255}};
+        memcpy(z.clip, C, sizeof C);
+        memset(z.clip_idx, 0, sizeof z.clip_idx);
+    }
     z.pal_idx = 0;                                                    // (zxnext:4938-4948)
     z.pal_sub = false;
     z.cvc_off = 0;                                                    // NR 0x64 resets to 0 (zxnext:4963)
@@ -946,6 +973,39 @@ inline bool p3_wait_now(const ZXN& z) {
     return (adj >= 4 || adj <= 1) && (h & 0x1FF) < 256 && v < 192;
 }
 
+// ---- Layer 2 at the beam (video/layer2.vhd). (x, y) is the pixel relative to the ULA's paper; sample 0/1 the two
+// 14 MHz halves. 256 x 192 lines up with the paper; the wide modes' counters start 32 pixels left and 32 lines above
+// it (whc/wvc, ulat:476-507). Returns false where Layer 2 is off, outside its area, clipped, or past 2 MB.
+bool l2_pixel(const ZXN& z, int x, int y, int sample, uint16_t& rgb, bool& prio) {
+    if (!z.l2_en) return false;
+    const int res = (z.nr[0x70] >> 4) & 3;
+    const bool wide = res != 0;
+    const int hc = wide ? x + 32 : x, vc = wide ? y + 32 : y;
+    if (wide ? (hc < 0 || hc >= 320 || vc < 0 || vc >= 256) : (hc < 0 || hc >= 256 || vc < 0 || vc >= 192)) return false;
+    const uint8_t* c = z.clip[0];                                     // the clip window, X doubled in the wide modes
+    if (hc < (wide ? c[0] * 2 : c[0]) || hc > (wide ? c[1] * 2 + 1 : c[1]) || vc < c[2] || vc > c[3]) return false;
+    const int xp = hc + (z.nr[0x16] | (z.nr[0x71] & 1) << 8), yp = vc + z.nr[0x17];   // x_pre, y_pre (l2:150-160)
+    int xx, yy, addr;
+    if (!wide) {
+        xx = xp & 0xFF;
+        yy = ((yp & 0x100) || (yp & 0xC0) == 0xC0) ? (yp + 64) & 0xFF : yp & 0xFF;   // 192 lines: +64 past them (l2:157)
+        addr = yy << 8 | xx;                                          // row by row
+    } else {
+        xx = xp < 320 ? xp : (xp + 192) & 0x1FF;                      // one 320 taken off, mod 512 (l2:153-154)
+        yy = yp & 0xFF;
+        addr = xx << 8 | yy;                                          // column by column
+    }
+    const uint32_t sram = ((z.nr[0x12] & 0x7F) + 16) * 16384u + addr; // bank + 16, 16K units (l2:168-170)
+    if (sram >= SRAM_SIZE) return false;
+    uint8_t px = z.sram[sram];                                        // always SRAM, bank 5 included
+    if (res == 2) px = sample ? px & 15 : px >> 4;                   // 640 x 256 x 4: high nibble, then low
+    px = (((px >> 4) + (z.nr[0x70] & 15)) & 15) << 4 | (px & 15);    // the palette offset (l2:200-203)
+    const uint16_t e = z.pal[1][((z.nr[0x43] >> 2) & 1) << 8 | px];  // the second palette by NR 0x43 b2
+    rgb = e & 0x1FF;
+    prio = e >> 15;
+    return true;
+}
+
 // ---- the ULA screen, drawn at the beam (ref §2.5): pixel 0 of a line is hc_ula = 0x0C; the 256 x 192 area from
 // bank 5's block RAM (bank 7's with the shadow screen); the border from port 0xFE; FLASH every 16 frames, counted at
 // ULA position 0,0. APPROXIMATION: memory is read when the pixel is shown, not at its fetch slot 12 pixels earlier, so
@@ -995,8 +1055,78 @@ inline void draw_pixel(ZXN& z) {
     } else {
         idx = (on ? 0 : 0x10) | (attr & 0x40) >> 3 | (on ? attr & 7 : (attr >> 3) & 7);
     }
-    const uint16_t rgb = bgnd ? rgb9(z.nr[0x4A]) : z.pal[0][((z.nr[0x43] >> 1) & 1) << 8 | idx] & 0x1FF;
-    z.f9[fy * F9_W + 2 * fx] = z.f9[fy * F9_W + 2 * fx + 1] = rgb;
+    // LoRes (NR 0x15 b7) replaces the ULA's pixel inside the ULA's clip window (lores.vhd; zxnext:6831-6840): 128 x 96
+    // from bank 5 (rows 0-47 at 0000, 48-95 at 2000), or Radastan's 4-bit pixels from a Timex display file (NR 0x6A
+    // b5), scrolled by NR 0x32/0x33, through the ULA's palette
+    if (z.nr[0x15] & 0x80) {
+        const uint8_t* lc = z.clip[2];
+        const int vc = y < 0 ? y + t.vc_len : y;
+        if (x >= 0 && x < 256 && x >= lc[0] && x <= lc[1] && vc >= lc[2] && vc <= lc[3]) {
+            const int x8 = (x + z.nr[0x32]) & 0xFF, yp = vc + z.nr[0x33];
+            const int y8 = yp >= 192 ? (yp + 64) & 0xFF : yp & 0xFF;
+            const int off = z.nr[0x6A] & 15;
+            if (z.nr[0x6A] & 0x20) {                                  // Radastan (lores:62-68)
+                const int dfile = (z.portff & 1) ^ ((z.nr[0x6A] >> 4) & 1);
+                const uint8_t d = z.bram5[(dfile << 13 | (y8 >> 1) << 6 | x8 >> 2) & 0x3FFF];
+                const int hi = (z.ulap_en && !(z.nr[0x43] & 1)) ? (0xC | (off & 3)) : off;
+                idx = hi << 4 | ((x8 & 2) ? d & 15 : d >> 4);
+            } else {
+                const int a = ((y8 >> 1) << 7 | x8 >> 1) + (y8 >= 96 ? 0x800 : 0);
+                const uint8_t d = z.bram5[a & 0x3FFF];
+                idx = (((d >> 4) + off) & 15) << 4 | (d & 15);
+            }
+            bgnd = false;
+        }
+    }
+    const uint16_t urgb = bgnd ? rgb9(z.nr[0x4A]) : z.pal[0][((z.nr[0x43] >> 1) & 1) << 8 | idx] & 0x1FF;
+    // the compositor (zxnext:7000-7180). The ULA is transparent where its colour's bits 8:1 match NR 0x14, outside its
+    // clip window (NR 0x1A; never in the border), or when it's off (NR 0x68 b7); Layer 2 where it doesn't show or
+    // matches NR 0x14; its priority bit lifts it over everything. No sprites or tilemap yet: they're transparent.
+    // The blend modes add Layer 2 to a mix colour chosen by NR 0x68 b6:5 (00 the ULA's colour even if it's off,
+    // 10 the ULA as shown, 01/11 none: the ULA then sits below), 110 saturating at 7, 111 then less 5 (zxnext:7032-7250).
+    const uint8_t* uc = z.clip[2];
+    const bool uclip = !border && (x < uc[0] || x > uc[1] || y < uc[2] || y > uc[3]);
+    const bool ut = (urgb >> 1) == z.nr[0x14] || uclip || (z.nr[0x68] & 0x80);
+    const uint16_t fb9 = rgb9(z.nr[0x4A]);
+    const int order = (z.nr[0x15] >> 2) & 7;
+    for (int smp = 0; smp < 2; smp++) {
+        uint16_t lrgb = 0;
+        bool lp = false;
+        const bool lt = !l2_pixel(z, x, y, smp, lrgb, lp) || (lrgb >> 1) == z.nr[0x14];
+        if (lt) lp = false;
+        uint16_t out;
+        switch (order) {
+            case 1: case 3:                                           // L S U, L U S: Layer 2 on top anyway
+                out = !lt ? lrgb : !ut ? urgb : fb9;
+                break;
+            case 2: case 4: case 5:                                   // S U L, U S L, U L S
+                out = lp ? lrgb : !ut ? urgb : !lt ? lrgb : fb9;
+                break;
+            case 6: case 7: {
+                const int bm = (z.nr[0x68] >> 5) & 3;
+                const bool umt = (urgb >> 1) == z.nr[0x14] || uclip; // ula_mix_transparent: not the ULA's enable
+                bool mt = true, bt = true;
+                uint16_t mix = 0;
+                if (bm == 0 && !umt) { mix = urgb; mt = false; }
+                else if (bm == 2 && !ut) { mix = urgb; mt = false; }
+                else if ((bm == 1 || bm == 3) && !ut) bt = false;     // mix_bot: the ULA, under Layer 2's blend
+                const int lr = lt ? 0 : lrgb;
+                int ch[3];
+                for (int i = 0; i < 3; i++) {
+                    int v = ((lr >> (6 - 3 * i)) & 7) + ((mix >> (6 - 3 * i)) & 7);
+                    if (order == 6) v = v > 7 ? 7 : v;
+                    else if (!mt) v = v <= 4 ? 0 : v >= 12 ? 7 : v - 5;
+                    ch[i] = v;
+                }
+                const uint16_t mixer = ch[0] << 6 | ch[1] << 3 | ch[2];
+                out = lp ? mixer : !bt ? urgb : !lt ? mixer : fb9;    // priority L2, the bottom layer, plain L2 (7202-7211)
+                break;
+            }
+            default:                                                  // S L U
+                out = lp ? lrgb : !lt ? lrgb : !ut ? urgb : fb9;
+        }
+        z.f9[fy * F9_W + 2 * fx + smp] = out;
+    }
 }
 
 // ---- the clock
