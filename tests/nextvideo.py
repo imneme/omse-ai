@@ -47,7 +47,7 @@ class Video:
     sram (2 MB) is what Layer 2 reads (l2:169-188). Fill them as the test fills the machine.
     """
 
-    def __init__(self, palette='zero'):
+    def __init__(self, palette='zero', timing='p3', hz=50):
         # palette RAMs: 1K x 16 each, entry = priority(15:14) & "00000" & rgb(8:0) (zxnext:6879, 6932).
         # Address: bit 9 = layer (ULA 0 / tilemap 1; Layer 2 0 / sprites 1), bit 8 = second palette,
         # bits 7:0 = index (zxnext:6888, 6940). Power-on content is all zero: no init file (§9.1 (13)).
@@ -98,6 +98,7 @@ class Video:
         self.bram7 = bytearray(8192)
         self.sram = bytearray(2 * 1024 * 1024)
         self.flash = 0                  # flash phase: the ULA's counter bit 4 (ula:470-481), set by the test
+        self.timing, self.hz = timing, hz   # for blanking only (§9.1 (14)); bare starts in +3 timing at 50 Hz
         if palette == 'loader':
             self.load_loader_palette()
         elif palette != 'zero':
@@ -450,7 +451,7 @@ class Video:
         return pix, True
 
     # ------------------------------------------------------------------ the mixer
-    def frame9(self, schedule=None, rows=None):
+    def frame9(self, schedule=None, rows=None, blank=True):
         """The 704 x 288 9-bit picture of a static frame, as the mixer makes it (zxnext:6843-7263).
 
         schedule: optional [(sy, register, value), ...]: next-register writes made in the horizontal
@@ -595,6 +596,8 @@ class Video:
                     elif not L_t:
                         rgb = mixed
                 out.append(rgb)
+        if blank:
+            out = [0 if (b and x is not None) else x for x, b in zip(out, blank_mask(self))]
         return W, H, out
 
 
@@ -605,7 +608,7 @@ def _np():
     return np
 
 
-def frame9_np(v, schedule=None):
+def frame9_np(v, schedule=None, blank=True):
     """frame9 computed over the whole grid at once: the same rules as Video.frame9 (which is the cited
     reading; test_next_video.ModelSense checks the two agree), about a hundred times faster. A schedule
     splits the frame into row segments, each drawn with the registers as they stand."""
@@ -625,6 +628,8 @@ def frame9_np(v, schedule=None):
             _, n, val = pending.pop(0)
             cur.nr_write(n, val)
         start = stop
+    if blank:
+        out = np.where(np.array(blank_mask(v)).reshape(H, W), 0, out)
     return W, H, out.ravel().tolist()
 
 
@@ -856,3 +861,28 @@ def _frame_np(v):
         mixed = ((r & 7) << 6) | ((g & 7) << 3) | (b & 7)
         rgb = first([(~prio, mixed), (top_t, top), (S_t, S), (bot_t, bot), (L_t, mixed)])
     return rgb
+
+
+# ---------------------------------------------------------------------------- blanking (§9.1 (14))
+
+TIMING = {  # first paper pixel's raw hc (c_min_hactive), last horizontal-blank raw hc, lines, first paper line, last vertical-blank line
+    '48k': (128, 95, {50: (312, 64), 60: (264, 40)}, 7),
+    '128k': (136, 95, {50: (311, 64), 60: (264, 40)}, 7),
+    'p3': (136, 95, {50: (311, 64), 60: (264, 40)}, 7),
+    'pentagon': (128, 63, {50: (320, 80)}, 15),
+}   # ulat:147-312 (the timings), 154-168 and 184-204 (blanking); NEXT-MACHINE §2.2
+
+
+def blank_mask(v):
+    """True where frame9's sample is inside blanking, so the Next outputs black (zxnext:7311-7315).
+    Raw hc = phc + c_min_hactive and raw vc = (py + first paper line) mod lines (the blank signal travels the
+    pipeline beside the pixels, zxnext:6789-6792, 7274-7287)."""
+    cmin, hb_end, lines_by_hz, vb_end = TIMING[v.timing]
+    lines, first = lines_by_hz[v.hz]
+    out = []
+    for sy in range(H):
+        raw_vc = (sy - 48 + first) % lines
+        for sx in range(W):
+            raw_hc = sx // 2 - 48 + cmin
+            out.append(raw_vc <= vb_end or raw_hc <= hb_end)
+    return out

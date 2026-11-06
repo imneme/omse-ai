@@ -206,7 +206,7 @@ class ModelSense(unittest.TestCase):
         v = nv.Video(palette='loader')
         for b in range(8):
             v.io_out(0xFE, b)
-            self.assertEqual(v.frame9()[2][0], nv.rgb9_from8(nv.LOADER_ULA16[b]),
+            self.assertEqual(v.frame9(blank=False)[2][0], nv.rgb9_from8(nv.LOADER_ULA16[b]),
                              'border = ULA paper index 16 + colour (ula:418, 547-552; vdp:65-84)')
 
     def test_nr41_ninth_bit_is_b1_or_b0(self):
@@ -219,6 +219,18 @@ class ModelSense(unittest.TestCase):
         v.nr_write(0x41, 0xAB)
         self.assertEqual((v.ulatm[7], v.pal_idx), (nv.rgb9_from8(0xAB), 8), 'zxnext:4726, 5316-5318')
 
+    def test_blanking_margins(self):
+        """§9.1 (14): blanking is black; +3 timing shows 40 px of left border, 48K timing 32 (ulat:154-168;
+        zxnext:7311-7315)."""
+        for timing, black in (('p3', 16), ('48k', 32)):
+            v = nv.Video(palette='loader', timing=timing)
+            v.io_out(0xFE, 2)
+            f = nv.frame9_np(v)[2]
+            g = nv.frame9_np(v, blank=False)[2]
+            row = f[100 * nv.W:101 * nv.W]
+            self.assertEqual(row[:black + 1], [0] * black + [nv.rgb9_from8(0xA0)], timing)
+            self.assertEqual(set(g[100 * nv.W:100 * nv.W + black]), {nv.rgb9_from8(0xA0)}, timing)
+
     def test_layer2_priority_bit_from_nr44(self):
         v = nv.Video()
         v.nr_write(0x43, 0x10)
@@ -230,6 +242,17 @@ class ModelSense(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------- the palettes
+
+@needs_next
+class Blanking(VideoCase):
+    """§9.1 (14): frame9() is the screen with blanking (black), frame9(blank=False) the mixer's colour."""
+
+    def test_left_margin_is_black_and_unblanked_shows_border(self):
+        s = ula_scene(border=6)
+        zx = s.machine()
+        self.assertEqual(list(zx.frame9()[2]), nv.frame9_np(s.model())[2])
+        self.assertEqual(list(zx.frame9(blank=False)[2]), nv.frame9_np(s.model(), blank=False)[2])
+
 
 @needs_next
 class Palettes(VideoCase):
