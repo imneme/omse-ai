@@ -340,3 +340,170 @@ class Prescaler(NextCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@needs_next
+class Burst(NextCase):
+    """Burst mode (WR4 b6:5 = 10): in WAITING_CYCLES the DMA lets go of BUSRQ while the prescaler is still due
+    (dma:449-455). From READ_1 at E0: the WRITE_4 decision at E6 starts the wait, E7 lets go, BusReq_s follows at
+    E8, E9 releases the bus with the CPU's next T1. The wait ends at E(4P+2) (32P t28 at 8 a clock) into
+    START_DMA (BUSRQ was let go), which asks at E(4P+3); BusReq_s at E(4P+4); with NOPs the CPU's T_Res edges are
+    E9 + 4m, so the grant is at E(4P+5) and the next READ_1 at E(4P+6). The CPU is frozen 10 edges a byte."""
+
+    def test_burst_gives_the_cpu_the_waits(self):
+        for presc in (2, 3, 7):
+            with self.subTest(presc=presc):
+                n = 6
+                zx = bare()
+                data = bytes(range(40, 40 + n))
+                io, dma, clocks, t28 = run_enabled(zx, regs(n, presc=presc, mode=2), data, nops=400)
+                tw, cw = io[0][:2]
+                period = 4 * presc + 6
+                want = []
+                for i in range(n):
+                    want += expected_copy(cw, tw, 1, first=7 + period * i, src=SRC + i, dst=DST + i,
+                                          data=data[i:])
+                self.assertEqual(dma, want)
+                self.assertEqual(clocks, 7 + 11 + 4 * 400 + 10 * n)
+
+    def test_continuous_keeps_the_bus_through_the_waits(self):
+        # the same transfer in continuous mode: WAITING_CYCLES -> WAITING_ACK with the bus held (dma:457-462)
+        n, presc = 6, 3
+        zx = bare()
+        io, dma, clocks, t28 = run_enabled(zx, regs(n, presc=presc, mode=1), bytes(n), nops=400)
+        reads = [e[1] for e in dma if e[2] == 'mr']
+        self.assertEqual([b - a for a, b in zip(reads, reads[1:])], [4 * presc + 3] * (n - 1))
+        # frozen from the grant (7 clocks after the write, at e8) to the release: the last byte's wait ends at
+        # E(4P+2), FINISH at +1, IDLE lets go at +2, BusReq_s at +3, released at +4
+        frozen = 1 + (4 * presc + 3) * (n - 1) + (4 * presc + 2) + 4
+        self.assertEqual(clocks, 7 + 11 + 4 * 400 + frozen)
+
+
+@needs_next
+class Interrupts(NextCase):
+    """Giving the bus back (zxnext:1960-1968): im2_dma_delay is set while an im2 device whose DMA interrupt is
+    enabled (NR 0xCC-0xCE) is pending or in service, and held through im2_control's RETI states. A WRITE_4 that
+    sees it goes to START_DMA, which lets go of BUSRQ until it clears (dma:270-280, 420-425).
+
+    RETI, from its T1 at r0: ED's T4 edge (r3) enters S_ED_T4, 4D's (r7) S_ED4D_T4, then S_SRL_T1 (r8),
+    S_SRL_T2 (r9), S_0 (r10) (im2c). The device is idle again by then, so im2_dma_delay clears at r11, START_DMA
+    asks at r12, BusReq_s at r13, and the grant is RETI's own T_Res at r14: the DMA's next read is stamped just
+    before r15, before the CPU fetches anything after the RETI."""
+    HANDLER, I_REG = 0x9200, 0x90
+
+    def setup(self, c0=0xA1, cc=0x01, n=20000):
+        zx = bare()
+        zx.nr_write(0xC0, c0)                           # hardware IM2, vectors 101xxxx0
+        zx.nr_write(0xCC, cc)                           # b0: the ULA's interrupt delays the DMA
+        program(zx, regs(n, src=0xC000, dst=DST, b_inc=2))
+        code = [0xF3, 0x3E, self.I_REG, 0xED, 0x47, 0xED, 0x5E, 0xFB, 0x3E, 0x87, 0xD3, 0x6B, 0x18, 0xFE]
+        zx.load(CODE, bytes(code))                      # DI; LD I,90h; IM 2; EI; OUT (6Bh),87h; JR $
+        vec = self.I_REG << 8 | (c0 & 0xE0) | 11 << 1   # the ULA is device 11 (zxnext:1958)
+        zx.poke(vec, self.HANDLER & 0xFF)
+        zx.poke(vec + 1, self.HANDLER >> 8)
+        zx.load(self.HANDLER, bytes([0xFB, 0xED, 0x4D]))   # EI; RETI
+        launch(zx, CODE)
+        assert zx.run_until_pc(CODE, max_ticks=10**6)
+        zx.dma_log(True)
+        return zx
+
+    def test_im2_interrupt_takes_the_bus_and_reti_gives_it_back(self):
+        n = 20000
+        zx = self.setup(n=n)
+        reti = self.HANDLER + 1
+        stops = []
+        while len(stops) < 2:
+            assert zx.run_until_pc(reti, max_ticks=4 * 10**6), 'no interrupt was served'
+            if zx.dma_events:                           # (one before the transfer began doesn't count)
+                stops.append((zx.cpu_clocks, len(zx.dma_events)))
+            zx.run_ticks(8)
+        zx.run_ticks(8 * 6 * n)
+        dma = zx.dma_events
+        reads = [e for e in dma if e[2] == 'mr']
+        self.assertEqual([e[3] for e in reads], [(0xC000 + i) & 0xFFFF for i in range(n)])   # none lost or doubled
+        for s, k in stops:
+            nxt = dma[k]                                # the first event after the RETI's T1
+            self.assertEqual((nxt[1], nxt[2]), (s + 15, 'mr'))
+            self.assertGreater(nxt[1] - dma[k - 1][1], 15)   # and a real pause before it
+        self.assertFalse(zx.busak)
+
+    def test_without_the_enable_the_transfer_runs_on(self):
+        n = 20000
+        zx = self.setup(cc=0x00, n=n)
+        zx.run_ticks(8 * (6 * n + 400))
+        reads = [e[1] for e in zx.dma_events if e[2] == 'mr']
+        self.assertEqual(len(reads), n)
+        self.assertEqual(set(b - a for a, b in zip(reads, reads[1:])), {6})
+
+    def test_pulse_mode_never_delays(self):
+        n = 20000
+        zx = self.setup(c0=0xA0, n=n)                   # NR 0xC0 b0 = 0: pulse mode, no device states
+        zx.run_ticks(8 * (6 * n + 400))
+        reads = [e[1] for e in zx.dma_events if e[2] == 'mr']
+        self.assertEqual(set(b - a for a, b in zip(reads, reads[1:])), {6})
+
+    def test_nmi_takes_the_bus_with_nr_cc_b7(self):
+        # (nmi_activated and NR 0xCC b7) sets im2_dma_delay (zxnext:1966); RETN's im2_control states hold it
+        # (S_ED45_T4, S_SRL_T1, S_SRL_T2) exactly as RETI's do, so the DMA's next read is stamped at RETN's T1 + 15
+        for cc, pauses in ((0x80, True), (0x00, False)):
+            with self.subTest(cc=cc):
+                n = 3000
+                zx = bare()
+                zx.nr_write(0x03, 0x03)                 # out of config mode (no NMI in it, zxnext:2063)
+                zx.nr_write(0x06, zx.nr_read(0x06) | 0x08)   # the M1 button's NMI on (zxnext:2049)
+                zx.nr_write(0xCC, cc)
+                zx.sram[0x14066:0x14068] = bytes([0xED, 0x45])   # the multiface ROM (SRAM 0x14000): RETN at 0066
+                program(zx, regs(n, src=0xC000, dst=DST, b_inc=2))
+                code, end = enabler(nops=10)
+                zx.load(CODE, code)
+                launch(zx, CODE)
+                assert zx.run_until_pc(CODE, max_ticks=10**6)
+                zx.dma_log(True)
+                zx.run_ticks(8 * 600)                   # well into the transfer
+                zx.button('m1')
+                if pauses:
+                    assert zx.run_until_pc(0x0066, max_ticks=8 * 200)
+                    s, k = zx.cpu_clocks, len(zx.dma_events)
+                    zx.run_ticks(8 * 100)
+                    nxt = zx.dma_events[k]
+                    self.assertEqual((nxt[1], nxt[2]), (s + 15, 'mr'))
+                else:
+                    self.assertFalse(zx.run_until_pc(0x0066, max_ticks=8 * 6 * (n - 200)))
+                zx.run_ticks(8 * 6 * n)
+                reads = [e[3] for e in zx.dma_events if e[2] == 'mr']
+                self.assertEqual(reads, [0xC000 + i for i in range(n)])
+
+
+@needs_next
+class SpiWait(NextCase):
+    """dma_wait_n = z80_wait_n and spi_wait_n (zxnext:1803), spi_wait_n = state_idle or state_last_d (spi:177):
+    while the SPI master is mid-byte, the DMA's READ_4/WRITE_4 waits, its strobe still up (dma_rw_cancel only
+    with wait_n high, dma:146-155). Reading port 0xEB, the strobe that began a transfer is still there at state 15,
+    so spi_begin (spi:82) starts a second one, and the DMA waits for that too: 34 clocks a byte, two transfers a
+    byte, and each read returns the byte of the transfer before (the second of the previous pair)."""
+
+    def test_reading_eb_waits_and_starts_two_transfers_a_byte(self):
+        n = 5
+        zx = bare()
+        before = zx.spi_count
+        io, dma, clocks, t28 = run_enabled(zx, regs(n, src=DST, dst=0x00EB, atob=False, b_io=True, b_inc=2),
+                                           nops=400)
+        tw, cw = io[0][:2]
+        reads = [e for e in dma if e[2] == 'ir']
+        writes = [e for e in dma if e[2] == 'mw']
+        self.assertEqual([e[1] - cw for e in reads], [7 + 34 * i for i in range(n)])
+        self.assertEqual([w[1] - r[1] for r, w in zip(reads, writes)], [18] * n)
+        self.assertEqual(zx.spi_count - before, 2 * n)
+
+    def test_writing_eb_sends_each_byte_twice(self):
+        # memory -> 0xEB: the write's strobe, held through WRITE_4, begins the second transfer with the same byte
+        # (oshift_r <= i_spi_mosi_dat, spi:95-99); the next READ_4 waits for it
+        n = 4
+        zx = bare()
+        before = zx.spi_count
+        io, dma, clocks, t28 = run_enabled(zx, regs(n, dst=0x00EB, b_io=True, b_inc=2), bytes(range(1, 9)),
+                                           nops=400)
+        tw, cw = io[0][:2]
+        writes = [e for e in dma if e[2] == 'iw']
+        self.assertEqual([e[1] - cw for e in writes], [10 + 34 * i for i in range(n)])
+        self.assertEqual(zx.spi_count - before, 2 * n)
