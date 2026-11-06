@@ -236,5 +236,29 @@ class Tables(unittest.TestCase):
                 self.assertIn(f'when others => nr_03_machine_timing <= "{want:03b}"', text)
 
 
+    def test_p3_wait_model(self):
+        """Gap #5: the +3 WAIT model gives the documented +3 pattern 1,0,7,6,5,4,3,2
+        (rotated: by T1's phase 13,15,1,3,...), waits only on memory cycles, and
+        keeps the window's ends: hc 0 waits, hc 256 doesn't (zxula.vhd:583)."""
+        mmu = [0xFF, 0xFF, 0x0A, 0x0B, 4, 5, 0, 1]
+        c = ref.P3Contention('p3', mmu, 456, 311)
+        got = [c.run(q, 8, [(0x4000, 3)]) - 3 for q in range(13, 13 + 16, 2)]
+        self.assertEqual(got, [1, 0, 7, 6, 5, 4, 3, 2])
+        self.assertEqual(c.run(1, 8, [(0x4000, 1)] * 5), 5)            # internal
+        self.assertEqual(c.run(1, 8, [('io', 0x40FE)]), 4)             # I/O
+        self.assertEqual(c.run(1, 8, [(0x8000, 3)]), 3)                # page 4
+        self.assertEqual(c.run(1, 8, [(0x0000, 3)]), 3)                # ROM
+        self.assertEqual(c.run(453, 7, [(0x4000, 3)]), 4)              # T2 ends at hc 0
+        self.assertEqual(c.run(253, 8, [(0x4000, 3)]), 3)              # T2 ends at hc 256
+        self.assertEqual(c.run(251, 8, [(0x4000, 3)]), 4)              # 254 waits, 256 not
+        self.assertEqual(c.run(453, 191, [(0x4000, 3)]), 3)            # row 192
+        ula = (ref.SOURCES / 'src/video/zxula.vhd').read_text().splitlines()
+        self.assertIn('''(hc_adj(3 downto 1) = "000" and i_timing_p3 = '1'))''', ula[582])
+        self.assertIn("o_cpu_wait_n <= '0' when (i_cpu_mreq_n = '0' and i_contention_memory = '1')",
+                      ula[599])
+        t80na = (ref.SOURCES / 'src/cpu/t80na.vhd').read_text().splitlines()
+        self.assertIn('WAIT_n => Wait_n,', t80na[192])                # straight through
+
+
 if __name__ == '__main__':
     unittest.main()

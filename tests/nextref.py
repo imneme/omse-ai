@@ -562,3 +562,40 @@ class Contention:
         while self.q >= self.L:
             self.q -= self.L
             self.v = (self.v + 1) % self.N
+
+
+# +3 timing (gap #5): WAIT, not a stretched clock (zxula.vhd:600; window 582-583
+# with the hc_adj(3:1) = "000" term: hc(3:0) in 3..14, 15, 0). T80N holds T2
+# while WAIT_n = 0 at the edge ending T2 (Strobe, z80n/NOTES.md:206-208); that
+# edge ends the even pixel p = T1's pixel + 3, so a memory cycle (MREQ low at T2)
+# waits once for each consecutive even p, p+2, ... with p & 15 in P3_WAIT.
+# Internal T-states and I/O never wait. By T1's phase 1,3,...,15: 7,6,5,4,3,2,1,0,
+# the documented +3 pattern 1,0,7,6,5,4,3,2 rotated.
+P3_WAIT = {0, 4, 6, 8, 10, 12, 14}
+
+
+class P3Contention(Contention):
+
+    def waits(self, p, v):
+        if not self.enabled or v >= 192:
+            return 0
+        k = 0
+        while p + 2 * k < 256 and ((p + 2 * k) & 15) in P3_WAIT:
+            k += 1
+        return k
+
+    def run(self, q, v, events):
+        assert q & 1, f'a 3.5 MHz T-state starts on an odd hc_ula, not {q}'
+        self.q, self.v, total = q, v, 0
+        for e in events:
+            n = 4 if e[0] == 'io' else e[1]
+            if e[0] not in (None, 'io') and n >= 3 and self.mem(e[0]):
+                total += 2
+                self.advance(4)                     # T1, T2
+                w = self.waits(self.q - 1, self.v)  # the even pixel ending T2
+                total += w + n - 2
+                self.advance(2 * (w + n - 2))
+            else:
+                total += n
+                self.advance(2 * n)
+        return total
