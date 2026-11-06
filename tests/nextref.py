@@ -649,10 +649,13 @@ def p3_dma_run(q, v, cycles, contended, line_len, lines):
     total = 0
     for addr, n in cycles:
         k = 0
-        if addr is not None and contended(addr) and v < 192:
-            p = q + 2 * (n - 1)
-            while p + 2 * k < 256 and ((p + 2 * k) & 15) in P3_DMA_WAIT:
-                k += 1
+        if addr is not None and contended(addr):
+            p, pv = q + 2 * (n - 1), v                  # the sample may be on the next row
+            while p >= line_len:                        # (Kelp's catch: hc 455 + 6 is hc 5 below)
+                p, pv = p - line_len, (pv + 1) % lines
+            if pv < 192:
+                while p + 2 * k < 256 and ((p + 2 * k) & 15) in P3_DMA_WAIT:
+                    k += 1
         total += n + k
         q += 2 * (n + k)
         while q >= line_len:

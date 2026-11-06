@@ -285,6 +285,27 @@ class IOCycles(NextCase):
         self.assertEqual(zx.read(B, 4), bytes([0x0A] * 4))
 
 
+    def test_the_spi_wait_holds_every_dma_cycle(self):
+        """Port EBh: the SPI master (clocked by the CPU clock) begins at idle or
+        at state 15 while the strobe is up (spi:82), and its wait is low unless
+        idle or just past state 15 (spi:177). It gates every DMA cycle, not just
+        the port's (zxnext:1803). So the read strobe, held by the wait, is still
+        up at state 15 and begins a second transfer (D-15), and the next cycle,
+        a memory one, waits for that: 34 clocks and two transfers a byte.
+        (Kelp's reading; I had missed the second wait, and her core showed me.)"""
+        for name, args, want in [
+                ('EBh -> memory', dict(a=0x00EB, b=B, a_mode=FIXED, a_io=True), [18, 16] * 5 + [18]),
+                ('memory -> EBh', dict(a=A, b=0x00EB, b_mode=FIXED, b_io=True), [3] + [18, 16] * 5)]:
+            with self.subTest(name):
+                zx = machine()
+                zx.dma_log(True)
+                program(zx, n=6, **args)
+                zx.run_ticks(20000)
+                ev = zx.dma_events
+                self.assertEqual(len(ev), 12)
+                self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], want)
+
+
 @needs_next
 class Timing(NextCase):
 
@@ -443,7 +464,7 @@ class Interrupts(NextCase):
     (im2c:184-189, 238). In pulse mode the IM2 devices are held in reset
     (im2p:105), so nothing but an NMI interrupts a transfer."""
 
-    def setup(self, c0, cc):
+    def setup(self, c0, cc, n=BLOCK, pre=None):
         zx = bare(timing='48k')
         zx.nr_write(0x03, 0x00)                         # boot ROM off (see test_next_interrupts)
         zx.nr_write(0xC0, c0)
@@ -457,8 +478,17 @@ class Interrupts(NextCase):
         self.assertTrue(zx.run_until_pc(loop, max_ticks=F48))   # back, nothing pending: the next
         zx.poke(0x9800, 0)                                      # one is about a frame away
         zx.dma_log(True)
-        program(zx, 0xA000, 0xC000, BLOCK, a_mode=FIXED, b_mode=FIXED)
+        program(zx, 0xA000, 0xC000, n, a_mode=FIXED, b_mode=FIXED, pre=pre)
         return zx
+
+    def test_a_prescaled_continuous_transfer_never_yields(self):
+        """With a prescaler that's due, WRITE_4 goes to WAITING_CYCLES before it
+        looks at the delay (dma:424-432), and in continuous mode WAITING_CYCLES
+        returns to WAITING_ACK without looking at it either (dma:451-462). So an
+        enabled IM2 source still waits for the block. (Kelp's reading; mine too.)"""
+        zx = self.setup(0xA1, 0x01, n=4000, pre=10)     # 43 clocks a byte: about 2.5 frames
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=4 * F48))
+        self.assertEqual(len(zx.dma_events), 8000, 'the handler only after the block')
 
     def test_an_enabled_im2_source_takes_the_bus_between_bytes(self):
         zx = self.setup(0xA1, 0x01)                     # hardware IM2; NR CC b0: the ULA
@@ -535,9 +565,9 @@ class Interrupts(NextCase):
 class Contention(NextCase):
     MMU = [0xFF, 0xFF, 0x0A, 0x0B, 0x04, 0x05, 0x00, 0x01]
 
-    def block(self, timing, n=64, a_t=None, b_t=None):
-        """A bank-5 to page-4 block started near row 40; returns (q, v, events),
-        q the odd hc_ula of the first cycle's first clock."""
+    def block(self, timing, n=64, a_t=None, b_t=None, dst=0x8800, b_io=False):
+        """A bank-5 to page-4 block (or to a fixed port) started near row 40;
+        returns (q, v, events), q the odd hc_ula of the first cycle's first clock."""
         L, N, *_ = ref.TIMINGS[(timing, 50)]
         zx = machine(timing=timing)
         zx.write(0x4000, pattern(n))
@@ -547,7 +577,7 @@ class Contention(NextCase):
         assert zx.run_until_pc(0x8001, max_ticks=10**6)
         t0, h0, v0 = zx.t28, zx.hc_ula, zx.vc_ula
         zx.dma_log(True)
-        program(zx, 0x4000, 0x8800, n, a_t=a_t, b_t=b_t)
+        program(zx, 0x4000, dst, n, a_t=a_t, b_t=b_t, b_io=b_io, b_mode=FIXED if b_io else INC)
         zx.run_ticks(60000)
         ev = zx.dma_events
         self.assertEqual(len(ev), 2 * n)
@@ -557,7 +587,8 @@ class Contention(NextCase):
         while q >= L:
             q, v = q - L, v + 1
         self.assertTrue(30 <= v < 180, f'the block should start near row 40 (hc {q}, row {v})')
-        self.assertEqual(zx.read(0x8800, n), pattern(n))
+        if not b_io:
+            self.assertEqual(zx.read(dst, n), pattern(n))
         return q, v, ev
 
     def test_reads_from_bank_5_are_contended_like_the_cpus(self):
@@ -574,6 +605,21 @@ class Contention(NextCase):
         self.assertGreater(got[-1], 8 * 3 * 127, 'some contention')
         self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [3] * 127,
                          'held clocks add no cpu_clocks')
+
+    def test_io_cycles_take_only_the_memory_term(self):
+        """48K: a DMA I/O cycle's IORQ falls on a falling edge, after the ULA's
+        decision for that T-state, and by the next T-state ioreqtw3_n has caught
+        it (zxula.vhd:586-595; dma:146-155): the port's own term never holds it.
+        Only the memory term at its first clock, by the port's high byte, as for
+        a memory address. (Kelp's reading, and mine in dma-foil-notes.md.)"""
+        L, N, *_ = ref.TIMINGS[('48k', 50)]
+        for port in (0x00FE, 0x40FE):
+            with self.subTest(port=f'{port:04X}h'):
+                q, v, ev = self.block('48k', dst=port, b_io=True)
+                self.assertEqual({e[2] for e in ev}, {'mr', 'iw'})
+                per = [c for i in range(64) for c in [(0x4000 + i, 3), (port, 3)]]
+                want = [8 * ref.Contention('48k', self.MMU, L, N).run(q, v, per[:j]) for j in range(128)]
+                self.assertEqual([e[0] - ev[0][0] for e in ev], want, f'from hc_ula {q} row {v}')
 
     def test_p3_waits_on_the_falling_edge(self):
         """+3 timing: WAIT, not a held clock (zxula.vhd:600). The DMA samples it

@@ -260,5 +260,20 @@ class Tables(unittest.TestCase):
         self.assertIn('WAIT_n => Wait_n,', t80na[192])                # straight through
 
 
+    def test_p3_dma_wait_model(self):
+        """nextref.p3_dma_run: the DMA's falling-edge sample (dma:139-145) at hc
+        q + 2(n-1), 7..0 from q = 15 mod 16, memory only, and wrapped onto the
+        next row at the line's end (Kelp's catch)."""
+        c = lambda a: 0x4000 <= a < 0x8000
+        run = lambda q, v, cyc: ref.p3_dma_run(q, v, cyc, c, 456, 311)
+        self.assertEqual([run(q, 8, [(0x4000, 3)]) - 3 for q in range(15, 31, 2)], [7, 6, 5, 4, 3, 2, 1, 0])
+        self.assertEqual([run(q, 8, [(0x4000, 2)]) - 2 for q in range(1, 17, 2)], [7, 6, 5, 4, 3, 2, 1, 0])
+        self.assertEqual(run(1, 8, [(0x9000, 3)]), 3)                  # page 4
+        self.assertEqual(run(251, 8, [(0x4000, 3)]), 4)                # 255 waits, 257 not
+        self.assertEqual(run(455, 40, [(0x4000, 4)]), 10)              # sample at hc 5 of row 41: 6 waits
+        self.assertEqual(run(455, 191, [(0x4000, 4)]), 4)              # ... but row 192 is border
+        self.assertEqual(run(441, 191, [(0x4000, 3)]), 3)              # row 191's border, no wrap
+
+
 if __name__ == '__main__':
     unittest.main()
