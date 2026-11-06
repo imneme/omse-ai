@@ -100,8 +100,8 @@ struct ZXN {
     uint8_t spi_cs = 0xFF;              // port 0xE7: bit 0 low selects card 0
     int spi_state = 16;                 // idles at 16; a transfer runs 0..15, one state a CPU clock
     uint8_t spi_rx = 0xFF;              // the read register port 0xEB returns
-    uint8_t spi_got = 0xFF;             // the byte the transfer in progress has received
-    bool spi_last_d = false;            // state_last_d: the edge after state 15 loads the read register
+    struct { uint8_t byte; uint64_t due; } spi_pend[2];   // bytes received, each loading at its begin + 17 edges
+    int spi_npend = 0;
     uint64_t spi_count = 0;             // transfers begun (for tests)
     uint8_t nr[256];
     int nr_sel = 0x24;                  // port 0x243B resets to 0x24 (ref §4.1)
@@ -762,7 +762,12 @@ uint8_t io_read(ZXN& z, uint16_t port) {
         return 0xE0 | v;                                              // (EAR in, bit 6: later)
     }
     if ((port & 0xFF) == 0xFF) return floating_bus(z);                // always answered (ref §5.1)
-    if ((port & 0xFF) == 0xEB && port_en(z, 11)) return z.spi_rx;     // the previous transfer's byte (ref §1.7)
+    if ((port & 0xFF) == 0xEB && port_en(z, 11)) {                    // the read register as the CPU latches it, an edge
+        uint8_t v = z.spi_rx;                                         // after the strobe: a byte due by then has landed
+        for (int i = 0; i < z.spi_npend; i++)                         // (spi_master:155-175)
+            if (z.spi_pend[i].due <= z.cpu_clocks + 1) v = z.spi_pend[i].byte;
+        return v;
+    }
     if ((port & 0xFF) == 0x1F && port_en(z, 6) && joy_port_on(z, 0x1F)) return joy_read(z, 0x1F);   // (zxnext:2633)
     if ((port & 0xFF) == 0x37 && port_en(z, 7) && joy_port_on(z, 0x37)) return joy_read(z, 0x37);   // (zxnext:2634)
     { uint8_t v; if (mf_io(z, port, false, &v)) return v; }           // the multiface (zxnext:2569-2575, 4248-4263)
@@ -1394,14 +1399,21 @@ bool cpu_edge(ZXN& z) {
     // a second access sooner starts nothing. The card exchanges the byte at once (sdcard.h works in bytes).
     {
         const int old_state = z.spi_state;
-        if (z.spi_last_d) { z.spi_rx = z.spi_got; }
-        z.spi_last_d = old_state == 15;
+        // miso_dat loads 17 edges after a begin, from ishift_r, which still holds that transfer's bits even if the
+        // next one began at state 15 (spi_master:146-169); the card exchanges whole bytes at the begin, so each
+        // byte waits here for its load
+        while (z.spi_npend && z.spi_pend[0].due <= z.cpu_clocks) {
+            z.spi_rx = z.spi_pend[0].byte;
+            z.spi_pend[0] = z.spi_pend[1];
+            z.spi_npend--;
+        }
         if (old_state < 16) z.spi_state = old_state + 1;
         const uint16_t port = Z80_GET_ADDR(p);
         if ((p & Z80_IORQ) && !(p & Z80_M1) && (p & (Z80_RD | Z80_WR)) && (port & 0xFF) == 0xEB && port_en(z, 11) &&
             (old_state == 16 || old_state == 15)) {
             const uint8_t mosi = (p & Z80_WR) ? Z80_GET_DATA(p) : 0xFF;   // a read sends 0xFF
-            z.spi_got = z.sd.xfer(mosi, !(z.spi_cs & 1));                 // card 0 on select bit 0
+            const uint8_t miso = z.sd.xfer(mosi, !(z.spi_cs & 1));          // card 0 on select bit 0
+            if (z.spi_npend < 2) z.spi_pend[z.spi_npend++] = {miso, z.cpu_clocks + 17};
             z.spi_state = 0;
             z.spi_count++;
         }
