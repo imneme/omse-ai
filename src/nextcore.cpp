@@ -119,6 +119,7 @@ struct ZXN {
     bool p3_mem = false;                // +3 timing: the last T-state began a contended memory cycle
     bool p3_waiting = false;            // +3 timing: the last T-state was a contention wait
     bool wait_next = false;             // a 28 MHz read wait for the next CPU clock
+    bool stackless_retn = false;        // z80_stackless_retn_en: the next RETN pops from NR C2h/C3h (zxnext:2031-2042)
     bool contention = true;             // on, as the hardware is (zxn_contention can turn it off, for comparisons)
 
     // the interrupt
@@ -408,6 +409,8 @@ void do_reset(ZXN& z, bool hard) {
     z.int_log.clear();
     z.wait_next = false;
     z.pins = z80_init(&z.cpu);
+    z.cpu.z80n = true;                                                // the Z80N's instructions (Strobe Fern's z80.h)
+    z.stackless_retn = false;
     remap(z);
 }
 
@@ -587,6 +590,24 @@ bool cpu_edge(ZXN& z) {
     z.first_edge = false;
     z.wait_next = false;
     z.cpu_clocks++;
+    // The Z80N's side band, acted on as the cycle's T1 begins, before its memory access or any contention decision.
+    // NEXTREG writes its register (zxnext:4740-4840 via cpu_requester_0); the read on the pins is a dummy.
+    if (p & Z80N_NEXTREG) nr_write(z, Z80N_GET_NR_REG(p), Z80N_GET_NR_VAL(p));
+    // The NMI's pushes always land in NR C2h/C3h too; with the stackless NMI (NR C0h bit 3) they're kept out of memory,
+    // and the first RETN after the acknowledge pops NR C2h/C3h instead (zxnext:1787, 1809-1811, 2009-2044).
+    bool hide = false;
+    if ((p & (Z80N_NMIACK_LSB | Z80N_NMIACK_MSB)) && (p & Z80_WR)) {
+        z.nr[(p & Z80N_NMIACK_LSB) ? 0xC2 : 0xC3] = Z80_GET_DATA(p);
+        hide = z.nr[0xC0] & 8;
+    }
+    if ((p & (Z80N_RETN_LSB | Z80N_RETN_MSB)) && z.stackless_retn) {
+        hide = true;
+        Z80_SET_DATA(p, z.nr[(p & Z80N_RETN_LSB) ? 0xC2 : 0xC3]);
+    }
+    if (!(z.nr[0xC0] & 8)) z.stackless_retn = false;                  // the CPU-clocked flag (zxnext:2031-2042)
+    else if (p & Z80N_NMIACK_LSB) z.stackless_retn = true;
+    else if (p & Z80N_RETN_MSB) z.stackless_retn = false;
+    if (hide) p &= ~Z80_MREQ;                                         // MREQ hidden from the machine
     classify(z, p);
     z.p3_waiting = p3w;
     if (!p3w) z.p3_mem = (p & Z80_MREQ) && (p & (Z80_RD | Z80_WR)) && !(p & Z80_RFSH) && contended_page(z, Z80_GET_ADDR(p));
