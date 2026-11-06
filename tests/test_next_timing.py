@@ -413,7 +413,7 @@ class Contention48(NextCase):
         """Mutant survivor: under 48K timing page 0Bh (6000h-7FFFh) is contended
         like 0Ah (zxnext:4431, pages 0Ah-0Bh)."""
         if self.TIMING != '48k':
-            return
+            self.skipTest('48K timing only')
         self.check([0x21, 0x00, 0x60, 0x01, 0x00, 0x80], [0x7E],
                    lambda pc: [(pc, 4), (0x6000, 3)], 'LD A,(HL) from 6000h', prefixes=[0, 5])
 

@@ -168,6 +168,7 @@ class SpiGapBoundary(SpiGap):
 
     def test_a_read_15_apart_rereads(self):
         r0, r8 = self.run_cards([(CMD0, 'single'), (CMD8, 'single')], paired='gap15')
+        self.assertIn(0x01, r0, 'the card answered CMD0 (a live card, not all zeros)')
         pairs = list(zip(r8[0::2], r8[1::2]))
         self.assertTrue(all(a == b for a, b in pairs), f'15 apart: the same byte (spi:159-168) {pairs}')
 
