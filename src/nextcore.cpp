@@ -109,6 +109,8 @@ struct ZXN {
     bool eff_cd = false;                // eff_nr_08_contention_disable: NR 0x08 b6 as in effect (zxnext:5703-5733)
     int coreid = 1;                     // NR 0x10's core id (zxnext:1127)
     bool l2_en = false;                 // port_123b_layer2_en (port 0x123B b1, NR 0x69 b7; Layer 2 itself: later)
+    bool l2_wr = false, l2_rd = false, l2_shadow = false;   // port 0x123B b0, b2, b3 (zxnext:3845-3869)
+    int l2_seg = 0, l2_off = 0;         // b7:6, and the offset a write with b4 set stores
     uint8_t porte3 = 0;                 // divMMC's port 0xE3: conmem b7, mapram b6 (set only), bank b3:0 (zxnext:4114-4129)
     bool dm_hold = false, dm_held = false;   // divmmc.vhd's automap_hold and automap_held
     bool dm_instant = false;            // an instant entry, during the fetch that met it
@@ -242,6 +244,28 @@ void remap(ZXN& z) {
                 z.wr_kind[s] = K_NONE;
                 z.wr_tag[s] = T_NONE;
                 z.wr_val[s] = 0;
+            }
+        }
+        // Layer 2's map (ref §3.7; zxnext:2924-2930, 3024, 3036, 3059-3066): slots 0-1, or 0-5 in segment mode 3,
+        // for writes (0x123B b0) and reads (b2) separately. The page is ((NR 0x12, or NR 0x13 with b3) + the segment
+        // or A15:14 + the offset) x 2 + A13, low 8 bits, placed like an MMU page; 0xE0 and up is no memory. It always
+        // goes to SRAM, bank 5 included (zxnext:3062).
+        if ((z.l2_rd || z.l2_wr) && (s < 2 || (s < 6 && z.l2_seg == 3))) {
+            const int seg = z.l2_seg == 3 ? s >> 1 : z.l2_seg;
+            const int bank = (z.l2_shadow ? z.nr[0x13] : z.nr[0x12]) & 0x7F;
+            const int page = (((bank + ((seg + z.l2_off) & 15)) & 0xFF) * 2 + (s & 1)) & 0xFF;
+            uint8_t* p = page >= 0xE0 ? nullptr : z.sram + 0x40000 + page * 0x2000;
+            if (z.l2_rd) {
+                z.rd[s] = p;
+                z.rd_kind[s] = p ? K_SRAM : K_NONE;
+                z.rd_tag[s] = p ? T_L2 : T_NONE;
+                z.rd_val[s] = page;
+            }
+            if (z.l2_wr) {
+                z.wr[s] = p;
+                z.wr_kind[s] = p ? K_SRAM : K_NONE;
+                z.wr_tag[s] = p ? T_L2 : T_NONE;
+                z.wr_val[s] = page;
             }
         }
         // divMMC over slots 0-1, ahead of Layer 2, ROMCS, the alternate ROM and the rest (zxnext:3049-3066): with
@@ -388,6 +412,10 @@ void nr_write(ZXN& z, int n, int v) {
             z.ula_int_disabled = z.portff & 0x40;
             z.nr[0x22] = v & 3;                                       // the line interrupt: enable, line b8 (zxnext:5233-5236)
             return;
+        case 0x12: case 0x13:                                         // Layer 2's banks, 7 bits (zxnext:5157-5161)
+            z.nr[n] = v & 0x7F;
+            remap(z);
+            return;
         case 0xC5:                                                    // four CTC channels: b7:4 aren't there
             z.nr[0xC5] = v & 0x0F;                                    // (zxnext:4030, 6148-6149; ref §9 D-5)
             return;
@@ -527,6 +555,8 @@ void do_reset(ZXN& z, bool hard) {
     z.eff_cd = false;                                                 // (zxnext:5706-5709)
     z.l2_en = false;                                                  // (zxnext:3849)
     z.porte3 = 0;                                                     // (zxnext:4114-4117; divmmc:107-140)
+    z.l2_wr = z.l2_rd = z.l2_shadow = false;                          // (zxnext:3847-3854)
+    z.l2_seg = z.l2_off = 0;
     z.dm_hold = z.dm_held = z.dm_instant = z.dm_pending = false;
     z.snoop = 0;
     z.im_mode = 0;
@@ -584,6 +614,8 @@ uint8_t io_read(ZXN& z, uint16_t port) {
     if ((port & 0xFF) == 0xFF) return floating_bus(z);                // always answered (ref §5.1)
     if ((port & 0xFF) == 0xEB && port_en(z, 11)) return z.spi_rx;     // the previous transfer's byte (ref §1.7)
     if ((port & 0xFF) == 0xE3 && dm_en(z)) return z.porte3 & 0xCF;    // divMMC (zxnext:2567, 4131)
+    if (port == 0x123B && port_en(z, 15))                             // Layer 2 (zxnext:2594, 2781; the offset: unread)
+        return (z.l2_seg << 6) | (z.l2_shadow << 3) | (z.l2_rd << 2) | (z.l2_en << 1) | z.l2_wr;
     return 0xFF;                                                      // nobody answers (ref §5.2)
 }
 
@@ -595,6 +627,17 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
         bool flash_ok = z.config_mode || z.reset_type == 4;           // the flash: config mode or before the first soft reset
         if ((v & 3) == 1 || (v & 3) == 2 || (flash_ok && (v == 0xFB || v == 0xF7 || v == 0x7F))) z.spi_cs = v;
         else z.spi_cs = 0xFF;
+    }
+    if (port == 0x123B && port_en(z, 15)) {                           // Layer 2's control (zxnext:3855-3864)
+        if (v & 0x10) z.l2_off = v & 7;
+        else {
+            z.l2_en = v & 2;
+            z.l2_wr = v & 1;
+            z.l2_rd = v & 4;
+            z.l2_shadow = v & 8;
+            z.l2_seg = v >> 6;
+        }
+        remap(z);
     }
     if ((port & 0xFF) == 0xE3 && dm_en(z)) {                          // conmem, mapram (set only), bank (zxnext:4119-4122)
         z.porte3 = (v & 0x8F) | ((v | z.porte3) & 0x40);
@@ -730,7 +773,7 @@ inline DmEntry dm_entry(const ZXN& z, uint16_t a) {
 // map and the expansion bus's ROMCS would exclude it: later.)
 inline bool dm_rom3_active(const ZXN& z, uint16_t a) {
     const int s = a >> 13;
-    if (s >= 2 || z.mmu[s] < 0xE0 || z.config_mode) return false;
+    if (s >= 2 || z.mmu[s] < 0xE0 || z.config_mode || z.l2_rd) return false;   // Layer 2's read map excludes it
     const RomSel r = rom_select(z);
     return (z.nr[0x8C] & 0xC0) == 0x80 ? r.alt48 : r.rom3;
 }
