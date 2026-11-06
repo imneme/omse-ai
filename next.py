@@ -19,8 +19,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LIB_PATH = HERE / 'lib' / ('libzxcore.dylib' if sys.platform == 'darwin' else 'libzxcore.so')
-SOURCES = [HERE / 'src' / f for f in ('zxcore.cpp', 'nextcore.cpp', 'nextregs_reset.inc', 'z80.h',
-                                      'ay38910.h', 'sdcard.h', 'next_dma.h', 'next_dma_bus.inc', 'next_serial.h')]
+SOURCES = sorted(p for p in (HERE / 'src').iterdir() if p.suffix in ('.cpp', '.h', '.inc'))   # all of src/, so a
+                                                                                       # new header can't be missed
 TIMINGS = {'48k': 1, '128k': 2, 'p3': 3, 'pentagon': 4}
 REG_NAMES = ['pc', 'sp', 'af', 'bc', 'de', 'hl', 'ix', 'iy', "af'", "bc'", "de'", "hl'", 'ir', 'im', 'iff1', 'iff2']
 
