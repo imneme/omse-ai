@@ -501,6 +501,7 @@ void spr_mirror_write(ZXN& z, int n, int v) {
 int nr_read(ZXN& z, int n) {
     switch (n) {
         case 0x34: return z.spr_mirror & 0x7F;                        // '0' & the mirror's sprite (zxnext:5939-5940)
+        case 0x28: return z.pal_stored;                               // NR 0x44's stored first byte (5337, 5910-5911)
         case 0x02: return (z.reset_type == 2 ? 2 : z.reset_type == 1 ? 1 : 0) | (z.nr[0x02] & 0x80) | z.nmi_flags;
         case 0x03: return (z.pal_sub << 7) | (z.pend_timing << 4) | (z.lock << 3) | z.mtype;   // the registers, not the
                                                                       // timing in effect; b7 NR 0x44's phase (5800-5801)
@@ -1123,7 +1124,7 @@ bool l2_pixel(const ZXN& z, int x, int y, int sample, uint16_t& rgb, bool& prio)
     const uint32_t sram = ((z.nr[0x12] & 0x7F) + 16) * 16384u + addr; // bank + 16, 16K units (l2:168-170)
     if (sram >= SRAM_SIZE) return false;
     uint8_t px = z.sram[sram];                                        // always SRAM, bank 5 included
-    if (res == 2) px = sample ? px & 15 : px >> 4;                   // 640 x 256 x 4: high nibble, then low
+    if (res & 2) px = sample ? px & 15 : px >> 4;                    // 1X = 640 x 256 x 4: high nibble, then low (l2:41, 198)
     px = (((px >> 4) + (z.nr[0x70] & 15)) & 15) << 4 | (px & 15);    // the palette offset (l2:200-203)
     const uint16_t e = z.pal[1][((z.nr[0x43] >> 2) & 1) << 8 | px];  // the second palette by NR 0x43 b2
     rgb = e & 0x1FF;
@@ -1142,21 +1143,26 @@ inline uint8_t tm_byte(const ZXN& z, bool bank7, int page, int addr) {
 }
 bool tm_pixel(const ZXN& z, int x, int y, int smp, uint16_t& rgb, bool& below, bool& text) {
     const uint8_t ctl = z.nr[0x6B];
+    below = !(ctl & 1);                                               // the tilemap off: not NR 0x6B b0 (zxnext:6770)
     if (!(ctl & 0x80)) return false;
     const int whc = x + 32, wvc = y + 32;
     const uint8_t* c = z.clip[3];
-    if (whc < 0 || whc >= 320 || wvc < 0 || wvc >= 256 || whc < c[0] * 2 || whc > c[1] * 2 + 1 || wvc < c[2] || wvc > c[3])
-        return false;
     const bool wide = ctl & 0x40, strip = ctl & 0x20, t512 = ctl & 2;
     text = ctl & 8;
+    // the fetch runs a tile ahead from (whc + scroll) wrapped, whatever the clip says, and its buffer's bit 8 is the
+    // tile's below bit even where the pixel isn't shown (tilemap:388, 410, 445): so the tile comes first
+    const int m = wide ? 640 : 320;
     const int xs = (wide ? 2 * whc + smp : whc) + ((z.nr[0x2F] & 3) << 8 | z.nr[0x30]);
-    const int ax = wide ? xs % 640 : xs % 320;                        // the hardware's corrections (tilemap:120-127)
+    const int ax = (xs % m + m) % m;                                  // the hardware's corrections (tilemap:120-127)
     const int ay = (wvc + z.nr[0x31]) & 0xFF;
     const int idx = (ay >> 3) * (wide ? 80 : 40) + (ax >> 3);
     const bool mb7 = z.nr[0x6E] & 0x80, tb7 = z.nr[0x6F] & 0x80;
     const int mpg = z.nr[0x6E] & 0x3F, tpg = z.nr[0x6F] & 0x3F;
     const uint8_t tile = tm_byte(z, mb7, mpg, strip ? idx : 2 * idx);
     const uint8_t attr = strip ? z.nr[0x6C] : tm_byte(z, mb7, mpg, 2 * idx + 1);
+    below = ((attr & 1) || t512) && !(ctl & 1);                       // (tilemap:388: tm_on_top clears it)
+    if (whc < 0 || whc >= 320 || wvc < 0 || wvc >= 256 || whc < c[0] * 2 || whc > c[1] * 2 + 1 || wvc < c[2] || wvc > c[3])
+        return false;
     const int t9 = tile | ((t512 && (attr & 1)) ? 0x100 : 0);
     uint8_t px;
     bool shown;
@@ -1174,7 +1180,6 @@ bool tm_pixel(const ZXN& z, int x, int y, int smp, uint16_t& rgb, bool& below, b
         shown = nib != (z.nr[0x4C] & 15);                             // the transparent index (tilemap:260)
     }
     if (!shown) return false;
-    below = ((attr & 1) || t512) && !(ctl & 1);
     rgb = z.pal[0][1 << 9 | ((ctl >> 4) & 1) << 8 | px] & 0x1FF;
     return true;
 }
