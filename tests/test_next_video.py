@@ -512,10 +512,27 @@ class Layer2(VideoCase):
 
     def test_blend_modes(self):
         for order in (6, 7):
-            for blend in (0, 2, 3):
+            for blend in (0, 1, 2, 3):
                 with self.subTest(order=order, blend=blend):
                     s = l2_scene(0).nr(0x15, order << 2).nr(0x68, blend << 5)
                     self.assertFrameMatches(s, name=f'blend_{order}_{blend}')
+
+    def test_ula_off_still_blends(self):
+        for order in (6, 7):                          # blend 00 takes ula_mix, which ignores NR 0x68 b7;
+            for nr68 in (0x80, 0xC0):                 # blend 10 takes ula_final, which doesn't (zxnext:7007-7010,
+                with self.subTest(order=order, nr68=nr68):                                  # 7049-7058)
+                    s = l2_scene(0).nr(0x15, order << 2).nr(0x68, nr68).nr(0x4A, 0x31)
+                    self.assertFrameMatches(s, name=f'ula_off_blend_{order}_{nr68:02x}')
+
+    def test_256x192_y_scroll_past_192(self):
+        for sy in (200, 255):                         # y = vc + scroll - 192 once, so rows 192-254 of the
+            with self.subTest(sy=sy):                 # bank range show at the bottom (layer2:156-158)
+                s = l2_scene(0)
+                s.sram(nv.L2_SRAM_BASE + 11 * 0x4000, bytes(((a * 0x61) ^ (a >> 7)) & 0xFF for a in range(0x4000)))
+                self.assertFrameMatches(s.nr(0x17, sy), name=f'l2_scroll_y_{sy}')
+
+    def test_resolution_11_is_640(self):
+        self.assertFrameMatches(l2_scene(3).nr(0x70, 0x35))   # layer2:145, 202 (bit 5 alone decides)
 
 
 
@@ -626,6 +643,12 @@ class LoRes(VideoCase):
     def test_radastan(self):
         self.assertFrameMatches(self.lores_scene(radastan=True))
 
+    def test_radastan_under_ula_plus(self):
+        s = self.lores_scene(radastan=True).io(0xBF3B, 0x40).io(0xFF3B, 0x01)
+        for i in range(64):
+            s.io(0xBF3B, i).io(0xFF3B, (i * 0x47 + 3) & 0xFF)
+        self.assertFrameMatches(s)                    # 192 + offset(1:0) x 16 + nibble (lores:107; zxnext:4187)
+
 
 def tm_scene(control=0x80, seed=31, ula_seed=1):
     """The tilemap over the ULA scene: map in bank 5 at +0x2000 (NR 0x6E = 0x20), tile definitions in bank 7
@@ -682,12 +705,19 @@ class Tilemap(VideoCase):
     def test_transparent_index(self):
         self.assertFrameMatches(tm_scene(0x80).nr(0x4C, 0x03))
 
+    def test_text_mode_transparency_is_by_colour(self):
+        pal = unique_palette(31)                      # NR 0x4C is ignored in text mode; NR 0x14 matches the
+        for idx in (0x43, 0x86):                      # colour (zxnext:7016; tilemap:385-429)
+            with self.subTest(idx=idx):
+                s = tm_scene(0x88).nr(0x4C, 0x03).nr(0x14, pal[idx] >> 1)
+                self.assertFrameMatches(s, name=f'tm_text_trans_{idx:02x}')
+
     def test_stencil(self):
         self.assertFrameMatches(tm_scene(0x80).nr(0x68, 0x01))
 
     def test_blends_with_the_tilemap(self):
         for order in (6, 7):
-            for blend in (0, 2, 3):
+            for blend in (0, 1, 2, 3):
                 with self.subTest(order=order, blend=blend):
                     s = tm_scene(0x80)
                     s.ops += l2_scene(0).ops[len(ula_scene(1).ops):]     # Layer 2 over the same ULA
@@ -906,6 +936,27 @@ class SpriteSurvivors(VideoCase):
             s.io(0x5B, 0x00 if b == 0xE3 else b)
         self.assertFrameMatches(s)
 
+    def test_sprites_in_the_blend_modes(self):
+        for tm in (False, True):                            # the blend layer's partner sits above or below
+            for order in (6, 7):                            # sprites by tm_pixel_below (zxnext:7046-7085,
+                for blend in (1, 2, 3):                     # 7193-7258)
+                    with self.subTest(tm=tm, order=order, blend=blend):
+                        s = sprites_l2_scene(order)
+                        if tm:
+                            s.ops += tm_scene(0x80).ops[len(ula_scene(1).ops):]
+                        s.nr(0x68, blend << 5)
+                        self.assertFrameMatches(s, name=f'sprites_blend_{int(tm)}_{order}_{blend}')
+
+    def test_flags_ignore_display(self):
+        pair = [[100, 100, 0, 0x80 | 2], [108, 104, 0, 0x80 | 3]]
+        for nr15, clip in ((0x00, None), (0x01, (100, 120, 10, 20)), (0x23, (0, 0, 0, 0))):
+            with self.subTest(nr15=nr15, clip=clip):       # sprites off, or clipped away: the flags still
+                s = sprite_scene(nr15, pair)                # come from the line store (sprites:842, 971-991)
+                if clip:
+                    s.nr(0x1C, 0x02).nr(0x19, *clip)
+                self.assertEqual(nv.sprite_status(s.model()), 0x01)
+                self.assertEqual(s.machine().io_in(0x303B), 0x01, 'sprites:991, whatever is shown')
+
     def test_collision_flag(self):
         for spr, want in (([[100, 100, 0, 0x80 | 2], [108, 104, 0, 0x80 | 3]], 0x01),
                           ([[100, 100, 0, 0x80 | 2], [140, 104, 0, 0x80 | 3]], 0x00)):
@@ -915,6 +966,28 @@ class SpriteSurvivors(VideoCase):
                 zx = s.machine()
                 self.assertEqual(zx.io_in(0x303B), want, 'sprites:991')
                 self.assertEqual(zx.io_in(0x303B), 0x00, 'sprites:986-988')
+
+
+@needs_next
+class Registers(VideoCase):
+    """What port 0x253B reads back for the video registers (zxnext:5836-6024)."""
+
+    REGS = (0x12, 0x14, 0x15, 0x16, 0x17, 0x26, 0x27, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x42, 0x4A, 0x4B, 0x4C,
+            0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6E, 0x6F, 0x70, 0x71)
+
+    def test_video_register_readbacks(self):
+        for pat in (0xFF, 0xA5, 0x5A, 0x00):
+            with self.subTest(pat=pat):
+                s = ula_scene(1)
+                for n in self.REGS:
+                    s.nr(n, pat)
+                s.nr(0x43, pat & 0x7F).nr(0x44, pat)  # NR 0x28 keeps NR 0x44's first byte
+                s.nr(0x18, pat).nr(0x19, pat, pat ^ 0x0F).nr(0x1A, pat, 1, 2).nr(0x1C, 0x02)
+                s.nr(0x1B, pat ^ 0x33)
+                v, zx = s.model(), s.machine(frames=1)
+                bad = {f'{n:02X}': (f'{zx.nr_read(n):02X}', f'{v.nr_read(n):02X}')
+                       for n in self.REGS + (0x28, 0x43, 0x18, 0x19, 0x1A, 0x1B, 0x1C) if zx.nr_read(n) != v.nr_read(n)}
+                self.assertEqual(bad, {}, f'NR: (got, want) after writing {pat:02X}')
 
 
 def ulap_scene(seed=8):

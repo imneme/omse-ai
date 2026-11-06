@@ -224,8 +224,24 @@ class Video:
             ram, addr = self._pal_ram_and_addr()            # (zxnext:5954-5955, 6860)
             e = ram[addr]
             return (((e >> 14) & 3) << 6) | (e & 1)
-        return {0x42: self.nr42, 0x43: self.nr43, 0x14: self.nr14, 0x15: self.nr15,
-                0x4A: self.nr4a}[n]
+        if n == 0x28:
+            return self.pal_stored                          # NR 0x44's first byte (zxnext:5337, 5910-5911)
+        if n in (0x18, 0x19, 0x1A, 0x1B):                   # the entry at the clip index (zxnext:5854-5885)
+            return self.clip[n][self.clip_idx[n]]
+        if n == 0x1C:                                       # the four clip indices (zxnext:5886-5887)
+            ci = self.clip_idx
+            return (ci[0x1B] << 6) | (ci[0x1A] << 4) | (ci[0x19] << 2) | ci[0x18]
+        if n == 0x68:                                       # bit 3 is ULA+'s enable however it was set, bit 1
+            return (self.nr68 & 0xF5) | (self.ulap_en << 3) # isn't stored (zxnext:5999-6000)
+        if n == 0x69:                                       # zxnext:6002-6003
+            return (self.l2_en << 7) | (((self.port_7ffd >> 3) & 1) << 6) | (self.port_ff & 0x3F)
+        return {0x12: self.nr12, 0x14: self.nr14, 0x15: self.nr15, 0x16: self.nr16,      # zxnext:5836-5852,
+                0x17: self.nr17, 0x26: self.nr26, 0x27: self.nr27,                        # 5904-5908, 5924-5937,
+                0x2F: self.tm_scroll_x >> 8, 0x30: self.tm_scroll_x & 0xFF, 0x31: self.nr31,
+                0x32: self.nr32, 0x33: self.nr33, 0x42: self.nr42, 0x43: self.nr43,       # 5948-5964,
+                0x4A: self.nr4a, 0x4B: self.nr4b, 0x4C: self.nr4c, 0x6A: self.nr6a & 0x3F,
+                0x6B: self.nr6b, 0x6C: self.nr6c, 0x6E: self.nr6e, 0x6F: self.nr6f,       # 6005-6024
+                0x70: self.nr70 & 0x3F, 0x71: self.nr71 & 1}[n]
 
     def io_out(self, port, v):
         v &= 0xFF
