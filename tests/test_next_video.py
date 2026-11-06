@@ -190,6 +190,10 @@ class ModelSense(unittest.TestCase):
         scenes['ula+'] = s
         for order in range(8):
             scenes[f'order{order}'] = l2_scene(0).nr(0x15, order << 2).nr(0x68, (order % 4) << 5)
+        scenes['sprites'] = sprite_scene(0x03, mixed_sprites())
+        scenes['sprites0top'] = sprite_scene(0x41 | (4 << 2), mixed_sprites())
+        scenes['sprites-rel'] = sprite_scene(0x23, [[60, 40, 0x10, 0xC0 | 2, 0x20], [16, 0, 0x01, 0xC0 | 3, 0x41],
+                                                    [0, 16, 0x0A, 0xC0 | 4, 0x40]])
         rows = set(random.Random(5).sample(range(288), 4)) | {20, 60, 140}
         for name, sc in scenes.items():
             with self.subTest(scene=name):
@@ -648,6 +652,83 @@ class Tilemap(VideoCase):
                     s.ops += l2_scene(0).ops[len(ula_scene(1).ops):]     # Layer 2 over the same ULA
                     s.nr(0x15, order << 2).nr(0x68, blend << 5)
                     self.assertFrameMatches(s, name=f'tm_blend_{order}_{blend}')
+
+
+def sprite_scene(nr15=0x01, sprites=None, four_bit=False, seed=41, ula_seed=1):
+    """Sprites over the ULA scene. Patterns encode their own address (a few bytes are the transparent E3,
+    or nibble 3 in 4-bit); the sprite palette is unique. sprites: list of 4- or 5-byte attribute lists,
+    written through port 0x57 from sprite 0 (sprites.vhd:637-745)."""
+    s = ula_scene(ula_seed)
+    write_palette(s, 0b010, unique_palette(seed))           # sprite first palette (zxnext:6859-6860, 6918)
+    s.io(0x303B, 0x00)
+    for a in range(16384):
+        b = ((a * 0x4D) ^ (a >> 6) ^ (a >> 11)) & 0xFF
+        if not four_bit and a % 37 == 5:
+            b = 0xE3
+        s.io(0x5B, b)
+    s.io(0x303B, 0x00)
+    for attrs in sprites or []:
+        for b in attrs:
+            s.io(0x57, b)
+    s.nr(0x15, nr15)
+    return s
+
+
+def mixed_sprites():
+    """Sixteen sprites: every mirror/rotate combination, palette offsets, overlaps, one across the left
+    border, one wrapping past x 511, one partly below line 224."""
+    out = []
+    for i in range(16):
+        x, y = 20 + (i % 8) * 34, 30 + (i // 8) * 70 + (i % 3) * 5
+        a2 = ((i * 3) & 0xF0) | ((i & 7) << 1) | (x >> 8)
+        out.append([x & 0xFF, y, a2, 0x80 | (i * 5 & 0x3F)])
+    out.append([4, 100, 0x00, 0x80 | 7])                       # across the left border
+    out.append([500 & 0xFF, 120, 0x01, 0x80 | 9])              # x 500: wraps to 0-3
+    out.append([140, 216, 0x20, 0x80 | 11])                    # crosses line 224
+    out.append([150, 60, 0x40, 0x80 | 12])                     # overlaps sprite 4
+    return out
+
+
+@needs_next
+class Sprites(VideoCase):
+    """sprites.vhd: attributes, patterns, order, scaling, relatives, clip and the border (zxnext:7025-7192)."""
+
+    def test_mixed_sprites(self):
+        self.assertFrameMatches(sprite_scene(0x01, mixed_sprites()))
+
+    def test_sprite_zero_on_top(self):
+        self.assertFrameMatches(sprite_scene(0x41, mixed_sprites()))
+
+    def test_over_the_border(self):
+        for nr15 in (0x03, 0x23):                              # over border, with and without border clip
+            with self.subTest(nr15=nr15):
+                s = sprite_scene(nr15, mixed_sprites()).nr(0x1C, 0x02).nr(0x19, 4, 150, 3, 240)
+                self.assertFrameMatches(s, name=f'sprites_border_{nr15:02x}')
+
+    def test_clip_window(self):
+        s = sprite_scene(0x01, mixed_sprites()).nr(0x1C, 0x02).nr(0x19, 30, 200, 20, 170)
+        self.assertFrameMatches(s)
+
+    def test_four_bit_and_scaling(self):
+        spr = []
+        for i in range(12):
+            x, y = 10 + (i % 6) * 48, 20 + (i // 6) * 90
+            a4 = 0x80 | ((i & 1) << 6) | ((i % 4) << 3) | (((i // 2) % 4) << 1)
+            spr.append([x, y, ((i * 0x30) & 0xF0) | ((i & 3) << 2), 0xC0 | (i * 3 & 0x3F), a4])
+        self.assertFrameMatches(sprite_scene(0x03, spr, four_bit=True).nr(0x4B, 0x03))
+
+    def test_relative_sprites(self):
+        spr = [[60, 40, 0x10, 0xC0 | 2, 0x00],                 # composite anchor (5 bytes, bit 5 = 0)
+               [16, 0, 0x01, 0xC0 | 3, 0x40], [0, 16, 0x08, 0xC0 | 4, 0x41], [240, 240, 0x00, 0xC0 | 5, 0x40],
+               [150, 90, 0x26, 0xC0 | 6, 0x2A],                # unified anchor: rotate, mirror, 2x scale
+               [16, 0, 0x01, 0xC0 | 7, 0x40], [0, 16, 0x04, 0xC0 | 8, 0x41], [16, 16, 0x02, 0x80 | 9, 0x40]]
+        self.assertFrameMatches(sprite_scene(0x03, spr))
+
+    def test_border_exception_in_u_over_s(self):
+        for order in (3, 4, 5):
+            with self.subTest(order=order):
+                s = sprite_scene(0x03 | (order << 2), mixed_sprites())
+                self.assertFrameMatches(s, name=f'sprites_border_order_{order}')
 
 
 if __name__ == '__main__':
