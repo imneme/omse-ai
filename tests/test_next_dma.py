@@ -1,717 +1,759 @@
-"""The Next's zxnDMA (the builder's tests, Kelp Fern).
+"""The Next's zxnDMA (device/dma.vhd), through DESIGN.md §9.1 (16) only.
 
-From device/dma.vhd (core 3.02.02, by Victor Trucco and Alvin Albrecht), its
-wiring in zxnext.vhd (zxnext:1732-1835, 2602, 2727-2728) and the T80N's bus
-request (t80n.vhd:1645-1760, t80na.vhd:140-360), through DESIGN.md §9.1 (16).
-Every expected number is worked out from the VHDL in the comments.
+Programmed as a program would, through port 0x6B (or 0x0B, Z80-DMA mode);
+watched through dma_events (one per DMA bus cycle, stamped just before the
+edge that enters TRANSFERING_READ_1 or TRANSFERING_WRITE_1), busak, memory,
+and the port's own read-back. Written from the VHDL by Loam Fern, without
+reading the builder's code.
 
-The edges, for an OUT (n),A that enables the DMA (WR6 0x87) followed by NOPs.
-The I/O cycle is T1 (e0), the auto-wait (e1, still TState 1 in t80n.vhd
-1781-1782), T2 (e2), T3 (e3). The strobe starts just after e1 (IORQ_t2,
-t80na:349-356), which is where io_events stamps the write (Cw, after the
-edge). The DMA first sees it at e2 (cs_wr_v = "10") and enters START_DMA.
-At e3 START_DMA drops BUSRQ. At e4 the T80N's BusReq_s takes it, too late
-for e4's T_Res, so the CPU starts the NOP's M1 at e4. At e8, the NOP's T_Res,
-the request is granted: BusAck, with the CPU frozen in its last T-state. At
-e9 the DMA, in WAITING_ACK, sees BUSAK and enters TRANSFERING_READ_1: the
-first read, stamped just before e9, so at cpu_clocks Cw + 7.
-
-A byte then takes rl + wl clocks (each 2, 3 or 4 from the timing byte;
-3 after a reset). After the last WRITE_4, FINISH_DMA (1), IDLE raises BUSRQ
-(2), BusReq_s takes it (3), and the edge after that releases BUSAK and starts
-the CPU's next M-cycle: the CPU is frozen for (rl + wl) * n + 5 edges.
-
-Programs run from 0x8100 with data at 0x9000 and 0xA000 (pages 4 and 5,
-uncontended under +3 timing, the default).
+Facts used (dma.vhd, 3.02.02):
+- Reset (dma:211-244): both ports' timing 3 clocks, prescaler 0, continuous,
+  no auto-restart, read mask 7Fh, status 00E1101T = 3Ah, counter 0.
+- A byte is a read cycle with the source port's timing and a write cycle with
+  the destination's: 2, 3 or 4 clocks for timing bits 10, 01, 00 (11 is 4)
+  (dma:307-324, 359-378). No I/O wait states of the Z80's kind.
+- WRITE_1 counts and steps both addresses (inc 01, dec 00, fixed 1x;
+  dma:359-399); WRITE_4 goes on while counter < length (dma:426), so a
+  block of 0 or 1 moves one byte, and Z80 mode (counter loaded with FFFFh,
+  dma:667) one more.
+- IDLE clears T every clock (dma:265), so a finished block reads 1Ah.
+- A DMA cycle can't reach the DMA's own port (zxnext:2727-2728).
 """
+
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import nextref as ref                                   # noqa: E402
 from test_next_regs import Next, needs_next, NextCase, bare  # noqa: E402
 from test_next_timing import launch                      # noqa: E402
+from test_next_interrupts import main_loop, vector, CODE, F48  # noqa: E402
+from test_next_copper import load as load_copper, WAIT as copper_wait, MOVE as copper_move  # noqa: E402
+from test_next_copper import NEVER as COPPER_NEVER  # noqa: E402
 
-CODE, SRC, DST = 0x8100, 0x9000, 0xA000
-CLOCKS = {0: 4, 1: 3, 2: 2, 3: 4}     # a timing byte's b1:0 -> clocks (dma:312-316)
-
-
-def regs(n, src=SRC, dst=DST, a_tim=None, b_tim=None, presc=None, mode=1, atob=True, a_io=False, b_io=False,
-         a_inc=1, b_inc=1, wr5=None):
-    """The register writes for a transfer of n bytes, A at src, B at dst, then LOAD: WR6 C3 (reset), WR0, WR1,
-    WR2, WR4 (mode 0 byte, 1 continuous, 2 burst), WR5, WR6 CF. a_inc/b_inc: 1 increment, 0 decrement, 2 fixed."""
-    out = [0xC3, 0x79 | (4 if atob else 0), src & 0xFF, src >> 8, n & 0xFF, n >> 8]
-    wr1 = 0x04 | (8 if a_io else 0) | (a_inc << 4)
-    out += [wr1] if a_tim is None else [wr1 | 0x40, a_tim]
-    wr2 = 0x00 | (8 if b_io else 0) | (b_inc << 4)
-    if presc is not None:
-        out += [wr2 | 0x40, (1 if b_tim is None else b_tim) | 0x20, presc]
-    else:
-        out += [wr2] if b_tim is None else [wr2 | 0x40, b_tim]
-    out += [0x8D | (mode << 5), dst & 0xFF, dst >> 8]
-    if wr5 is not None:
-        out += [wr5]
-    return out + [0xCF]
+ZXN, Z80 = 0x6B, 0x0B
+DEC, INC, FIXED = 0, 1, 2
+BYTE, CONTINUOUS, BURST = 0, 1, 2
+T2, T3, T4 = 0b10, 0b01, 0b00                           # timing bytes
+A, B = 0x9000, 0xA100                                   # page 4 and page 5 (bank 2): SRAM, uncontended
+COUNTING_LOOP = bytes([0xF3, 0x23, 0x18, 0xFD])         # DI; L: INC HL; JR L
 
 
-def program(zx, writes, port=0x6B):
-    for v in writes:
+def pattern(n, seed=11):
+    return bytes((i * 37 + seed) & 0xFF for i in range(n))
+
+
+def program(zx, a, b, n, ab=True, a_mode=INC, b_mode=INC, a_io=False, b_io=False,
+            a_t=None, b_t=None, pre=None, mode=CONTINUOUS, restart=False, port=ZXN,
+            enable=True, op=0b01):
+    """Disable, WR0-WR5, LOAD and (unless told not to) ENABLE, as io_out writes
+    (dma:509-735). a and b are port A's and port B's addresses; ab=True is A -> B;
+    op is WR0's bits 1:0 (01 transfer; 10, 11 search on a Zilog)."""
+    out = [0x83, 0x78 | ab << 2 | op, a & 0xFF, a >> 8, n & 0xFF, n >> 8]
+    out.append(0x04 | a_io << 3 | a_mode << 4 | (a_t is not None) << 6)
+    if a_t is not None:
+        out.append(a_t)
+    more = b_t is not None or pre is not None
+    out.append(0x00 | b_io << 3 | b_mode << 4 | more << 6)
+    if more:
+        out.append((T3 if b_t is None else b_t) | (pre is not None) << 5)
+        if pre is not None:
+            out.append(pre)
+    out += [0x8D | mode << 5, b & 0xFF, b >> 8, 0x82 | restart << 5, 0xCF]
+    if enable:
+        out.append(0x87)
+    for v in out:
         zx.io_out(port, v)
 
 
-def enabler(nops=200, port=0x6B):
-    """LD A,87h; OUT (port),A; NOPs; JR $. Returns (code, end)."""
-    code = bytes([0x3E, 0x87, 0xD3, port] + [0x00] * nops + [0x18, 0xFE])
-    return code, CODE + 4 + nops
-
-
-def run_enabled(zx, writes, data=None, nops=200, port=0x6B, src=SRC):
-    """Program the DMA with io_out, then run LD A,87h; OUT (port),A; NOPs from CODE with both logs on.
-    Returns (io_events, dma_events, cpu_clocks from CODE to the end, t28 likewise)."""
-    program(zx, writes, port)
-    if data is not None:
-        zx.load(src, data)
-    code, end = enabler(nops, port)
-    zx.load(CODE, code)
-    launch(zx, CODE)
-    assert zx.run_until_pc(CODE, max_ticks=10**6)
-    c0, t0 = zx.cpu_clocks, zx.t28
-    zx.io_log(True)
-    zx.dma_log(True)
-    assert zx.run_until_pc(end, max_ticks=10**7), 'never reached the end'
-    return zx.io_events, zx.dma_events, zx.cpu_clocks - c0, zx.t28 - t0
-
-
-def expected_copy(cw, tw, n, rl=3, wl=3, k=8, first=7, src=SRC, dst=DST, data=None, rkind='mr', wkind='mw',
-                  src_step=1, dst_step=1):
-    """The DMA's events for a copy whose enabling OUT was stamped (tw, cw): the first read `first` clocks after
-    it (7: see the module's note), a byte every rl + wl clocks, k t28 to the clock. io_events' cpu_clocks counts
-    the write's own edge and its t28 doesn't (nextcore's cpu_edge), so the OUT's edge itself is at t28 tw, and a
-    DMA stamp r clocks after cw is r + 1 edges after it."""
-    out = []
-    for i in range(n):
-        r = first + (rl + wl) * i
-        v = data[i] if data is not None else None
-        out.append((tw + k * (r + 1), cw + r, rkind, (src + src_step * i) & 0xFFFF, v))
-        out.append((tw + k * (r + rl + 1), cw + r + rl, wkind, (dst + dst_step * i) & 0xFFFF, v))
-    return out
-
-
-def readback(zx, n=8, port=0x6B):
+def reads(zx, n, port=ZXN, restart=True):
+    """n reads of the read sequence, from its start if restart (WR6 A7h)."""
+    if restart:
+        zx.io_out(port, 0xA7)
     return [zx.io_in(port) for _ in range(n)]
+
+
+def machine(**kw):
+    """bare, the CPU in a loop counting in HL (so its progress shows)."""
+    zx = bare(**kw)
+    zx.load(0x8000, COUNTING_LOOP)
+    zx.set_regs(pc=0x8000, sp=0x7FF0, hl=0)
+    return zx
+
+
+def cycles(events):
+    return [(k, a, v) for _, _, k, a, v in events]
 
 
 @needs_next
 class Registers(NextCase):
-    """The read-back (dma:895-1140): status 00E1101T, then the counter and the two ports' addresses by the read
-    mask, in fixed wrap orders. io_out/io_in take no time (§9.1 (6))."""
 
-    def test_power_on_reads(self):
-        # after a reset: status E = 1 (endofblock_n), T = 0; counter 0; src and dest 0 (signals start at 0);
-        # the mask 7F walks all seven and wraps to the status
-        zx = bare()
-        self.assertEqual(readback(zx), [0x3A, 0, 0, 0, 0, 0, 0, 0x3A])
+    def test_status_and_read_sequence_at_power_on(self):
+        zx = machine()
+        got = reads(zx, 8, restart=False)
+        self.assertEqual(got[:3], [0x3A, 0x00, 0x00],
+                         'status 00E1101T with E=1 T=0, then the counter, 0 (dma:241-244, 902)')
+        self.assertEqual(got[7], 0x3A, 'mask 7Fh: seven items, then the status again (dma:239)')
 
-    def test_load_then_read_everything(self):
-        zx = bare()
-        program(zx, regs(0x0123, src=0x9876, dst=0xA543) + [0xBB, 0x7F, 0xA7])
-        # A -> B: port A reads src, port B dest (dma:995-1000); the counter loads 0 in zxn mode
-        self.assertEqual(readback(zx), [0x3A, 0x00, 0x00, 0x76, 0x98, 0x43, 0xA5, 0x3A])
+    def test_read_mask_picks_and_orders_the_items(self):
+        zx = machine()
+        zx.write(A, pattern(5))
+        program(zx, A, B, 5)
+        zx.run_ticks(20000)
+        for mask, want, why in [
+                (0x06, [0x05, 0x00, 0x05, 0x00], 'counter low, high, again'),
+                (0x01, [0x1A, 0x1A, 0x1A], 'status only'),
+                (0x18, [0x05, 0x90, 0x05], 'port A low, high, again'),
+                (0x60, [0x05, 0xA1, 0x05], 'port B low, high, again'),
+                (0x00, [0x1A, 0x1A], 'no bits: the status (dma:859-891)'),
+                (0x7E, [0x05, 0x00, 0x05, 0x90, 0x05, 0xA1, 0x05], 'no status: counter first')]:
+            zx.io_out(ZXN, 0xBB)
+            zx.io_out(ZXN, mask)
+            self.assertEqual(reads(zx, len(want), restart=False), want,
+                             f'mask {mask:02X}h: {why} (dma:859-891, 900-1125)')
+        zx.io_out(ZXN, 0xBB)
+        zx.io_out(ZXN, 0x06)
+        zx.io_in(ZXN)
+        self.assertEqual(reads(zx, 1), [0x05], 'A7h starts the sequence again (dma:694-722)')
 
-    def test_b_to_a_swaps_what_the_ports_read(self):
-        zx = bare()
-        program(zx, regs(0x10, src=0x9876, dst=0xA543, atob=False) + [0xA7])
-        # B -> A: src = B's start, dest = A's; port A reads dest = A's start, port B src = B's start
-        self.assertEqual(readback(zx, 7), [0x3A, 0, 0, 0x76, 0x98, 0x43, 0xA5])
-
-    def test_read_mask_orders(self):
-        zx = bare()
-        program(zx, regs(0x10, src=0x9876, dst=0xA543))
-        program(zx, [0xBB, 0x0A])               # counter lo and port A lo: the sequence starts at counter lo
-        self.assertEqual(readback(zx, 5), [0x00, 0x76, 0x00, 0x76, 0x00])
-        program(zx, [0xBB, 0x01])               # the status alone, for ever
-        self.assertEqual(readback(zx, 3), [0x3A] * 3)
-        program(zx, [0xBB, 0x00])               # nothing: the status (dma:880-882)
-        self.assertEqual(readback(zx, 3), [0x3A] * 3)
-        program(zx, [0xBB, 0x41])               # status, then B hi, then status (bit 0 is skipped only after it)
-        self.assertEqual(readback(zx, 4), [0x3A, 0xA5, 0x3A, 0xA5])
-        program(zx, [0xBB, 0x60, 0xBF])         # BF: read the status next, whatever the mask; then B lo
-        self.assertEqual(readback(zx, 4), [0x3A, 0x43, 0xA5, 0x43])
-
-    def test_z80_mode_loads_minus_one(self):
-        zx = bare()
-        program(zx, regs(0x10, src=0x9876, dst=0xA543) + [0xA7], port=0x0B)
-        self.assertEqual(readback(zx, 3, port=0x0B), [0x3A, 0xFF, 0xFF])   # "z80 dma loads -1" (dma:674-678)
-
-    def test_wr4_with_only_b4_locks_the_write_sequencer(self):
-        # WR4 b4 with b2, b3 clear enters R4_BYTE_2, which no case handles (dma:891): every later write is ignored
-        # (even WR6 C3) until a reset; reads go on
-        zx = bare()
-        program(zx, regs(0x10, src=0x1234) + [0xBB, 0x08, 0xA7])
-        self.assertEqual(readback(zx, 2), [0x34, 0x34])
-        program(zx, [0x91])
-        program(zx, regs(0x10, src=0x5678) + [0xBB, 0x01, 0xA7])
-        self.assertEqual(readback(zx, 2), [0x34, 0x34])
-        zx.reset()
-        program(zx, regs(0x10, src=0x5678) + [0xBB, 0x08, 0xA7])
-        self.assertEqual(readback(zx, 2), [0x78, 0x78])
-
-
-@needs_next
-class Copies(NextCase):
-    """Memory to memory, every byte stamped, at each speed and cycle length."""
-    DATA = bytes((i * 37 + 11) & 0xFF for i in range(256))
-
-    def copy(self, n, speed=0, **kw):
-        zx = bare(speed=speed)
-        io, dma, clocks, t28 = run_enabled(zx, regs(n, **kw), self.DATA)
-        return zx, io, dma, clocks
-
-    def test_copy_at_3m5(self):
-        n = 16
-        zx, io, dma, clocks = self.copy(n)
-        self.assertEqual(len(io), 1)
-        tw, cw, port, v, rw = io[0]
-        self.assertEqual((port, v, rw), (0x876B, 0x87, 'w'))
-        self.assertEqual(dma, expected_copy(cw, tw, n, data=self.DATA))
-        self.assertEqual(bytes(zx.read(DST, n + 1)), self.DATA[:n] + b'\x00')
-        # LD A,n (7) + OUT (n),A (11) + 200 NOPs, and the CPU frozen 6n + 5 edges
-        self.assertEqual(clocks, 7 + 11 + 4 * 200 + 6 * n + 5)
-
-    def test_copy_at_each_speed(self):
-        # 8 >> speed t28 to the clock; at 28 MHz the NOP after the OUT reads SRAM and waits a clock (ref §1.4), so
-        # its T_Res, and the grant, come an edge later; the DMA's own reads, 3 clocks, don't feel the wait
-        for speed in (1, 2, 3):
-            with self.subTest(speed=speed):
-                n = 10
-                zx, io, dma, clocks = self.copy(n, speed)
-                tw, cw = io[0][:2]
-                self.assertEqual(dma, expected_copy(cw, tw, n, k=8 >> speed, first=8 if speed == 3 else 7,
-                                                    data=self.DATA))
-                base = (7 + 11 + 4 * 200) if speed < 3 else (9 + 13 + 5 * 200)
-                self.assertEqual(clocks, base + 6 * n + 5)
-
-    def test_every_cycle_length(self):
-        for at in range(4):
-            for bt in range(4):
-                with self.subTest(a_tim=at, b_tim=bt):
-                    n = 3
-                    zx, io, dma, clocks = self.copy(n, a_tim=at, b_tim=bt)
-                    tw, cw = io[0][:2]
-                    rl, wl = CLOCKS[at], CLOCKS[bt]
-                    self.assertEqual(dma, expected_copy(cw, tw, n, rl, wl, data=self.DATA))
-                    self.assertEqual(clocks, 7 + 11 + 4 * 200 + (rl + wl) * n + 5)
-
-    def test_two_clock_reads_wait_at_28_mhz(self):
-        # sram_wait_n (zxnext:3130-3137) follows cpu_rd_n, which is the DMA's while it has the bus: low for the
-        # clock after READ_1, so a 2-clock read's READ_4 samples it and waits once; 3 clocks, nothing
-        n = 4
-        zx, io, dma, clocks = self.copy(n, speed=3, a_tim=2, b_tim=2)
-        tw, cw = io[0][:2]
-        self.assertEqual(dma, expected_copy(cw, tw, n, 3, 2, k=1, first=8, data=self.DATA))
-
-    def test_two_clock_cycles_at_14_mhz_dont_wait(self):
-        # "Avoid wait state for 14MHz" (dma:157-161): the strobe stretched through READ_4 and the byte latched on
-        # the rising edge; nothing waits, so 2 + 2
-        n = 4
-        zx, io, dma, clocks = self.copy(n, speed=2, a_tim=2, b_tim=2)
-        tw, cw = io[0][:2]
-        self.assertEqual(dma, expected_copy(cw, tw, n, 2, 2, k=2, data=self.DATA))
-
-    def test_decrement_and_fixed(self):
-        n = 5
-        zx, io, dma, clocks = self.copy(n, src=0x9010, dst=0xA020, a_inc=0, b_inc=2)
-        tw, cw = io[0][:2]
-        data = [self.DATA[0x10 - i] for i in range(n)]
-        self.assertEqual(dma, expected_copy(cw, tw, n, src=0x9010, dst=0xA020, src_step=-1, dst_step=0, data=data))
-        self.assertEqual(zx.peek(0xA020), data[-1])
-
-    def test_zxn_length_zero_moves_one_byte(self):
-        # WRITE_4 tests counter < len after WRITE_1's increment: len 0 still moves the first byte (dma:418)
-        zx, io, dma, clocks = self.copy(0)
-        tw, cw = io[0][:2]
-        self.assertEqual(dma, expected_copy(cw, tw, 1, data=self.DATA))
-
-    def test_z80_mode_moves_one_more(self):
-        # through port 0x0B the counter loads FFFF (dma:674-678), so len + 1 bytes move
-        n = 6
-        zx = bare()
-        io, dma, clocks, t28 = run_enabled(zx, regs(n), self.DATA[:n + 1], port=0x0B)
-        tw, cw = io[0][:2]
-        self.assertEqual(dma, expected_copy(cw, tw, n + 1, data=self.DATA))
-        self.assertEqual(clocks, 7 + 11 + 4 * 200 + 6 * (n + 1) + 5)
-        program(zx, [0xBB, 0x07, 0xA7], port=0x0B)
-        self.assertEqual(readback(zx, 3, port=0x0B), [0x1A, n, 0])
-
-    def test_status_and_addresses_after(self):
-        # FINISH clears endofblock_n; IDLE clears atleastone every clock (dma:264): 00 0 1101 0
-        n = 16
-        zx, io, dma, clocks = self.copy(n)
-        program(zx, [0xBB, 0x7F, 0xA7])
-        self.assertEqual(readback(zx), [0x1A, n, 0, (SRC + n) & 0xFF, (SRC + n) >> 8, (DST + n) & 0xFF,
-                                        (DST + n) >> 8, 0x1A])
-
-    def test_busak(self):
-        zx = bare()
-        program(zx, regs(100))
-        code, end = enabler()
-        zx.load(CODE, code)
-        launch(zx, CODE)
-        assert zx.run_until_pc(CODE + 4, max_ticks=10**6)       # just before the NOP's M1 (e4)
-        self.assertFalse(zx.busak)
-        zx.run_ticks(8 * 4)                                      # e4-e7: the NOP
-        self.assertFalse(zx.busak)
-        zx.run_ticks(8)                                          # e8: granted
-        self.assertTrue(zx.busak)
-        assert zx.run_until_pc(end, max_ticks=10**7)
-        self.assertFalse(zx.busak)
-
-    def test_auto_restart(self):
-        # WR5 b5: FINISH reloads and, still holding the bus, goes to WAITING_ACK (dma:477-494): a block every
-        # 6n + 2 clocks, for ever, and the CPU never runs again
-        n = 4
-        zx = bare()
-        program(zx, regs(n, wr5=0xA2))
-        zx.load(SRC, self.DATA[:n])
-        code, end = enabler()
-        zx.load(CODE, code)
-        launch(zx, CODE)
-        assert zx.run_until_pc(CODE, max_ticks=10**6)
-        zx.io_log(True)
+    def test_wr4_with_only_bit_4_locks_the_register_writes(self):
+        """WR4 with b4 set and b2, b3 clear sends the write sequence to
+        R4_BYTE_2 (dma:607-608), whose case is commented out (dma:835-857), so
+        `when others => null` (dma:891) keeps it there: every later write is
+        lost, C3h included, until a reset (dma:229). Reads still answer.
+        (Found by Tally's second-sources reader; checked in the VHDL.)"""
+        zx = machine()
+        zx.write(A, pattern(4))
+        zx.write(B, bytes(4))
+        zx.io_out(ZXN, 0x91)
+        zx.io_out(ZXN, 0xC3)
         zx.dma_log(True)
-        zx.run_ticks(8 * 200)
-        tw, cw = zx.io_events[0][:2]
-        dma = zx.dma_events
-        want = []
-        for b in range(5):
-            for e in expected_copy(cw, tw, n, data=self.DATA, first=7 + (6 * n + 2) * b):
-                want.append(e)
-        self.assertEqual(dma[:len(want)], want)
-        self.assertTrue(zx.busak)
+        program(zx, A, B, 4)
+        zx.run_ticks(20000)
+        self.assertEqual(zx.dma_events, [], 'nothing written after 91h reaches the DMA')
+        self.assertEqual(zx.read(B, 4), bytes(4))
+        self.assertEqual(reads(zx, 3, restart=False), [0x3A, 0x00, 0x00], 'reads still answer')
+        zx.reset()
+        zx.load(0x8000, COUNTING_LOOP)
+        zx.set_regs(pc=0x8000, sp=0x7FF0, hl=0)
+        zx.dma_log(True)
+        program(zx, A, B, 4)
+        zx.run_ticks(20000)
+        self.assertEqual(zx.read(B, 4), pattern(4), 'a reset frees it')
+
+    def test_reset_command(self):
+        zx = machine()
+        zx.write(A, pattern(4))
+        program(zx, A, B, 4)
+        zx.run_ticks(20000)
+        self.assertEqual(reads(zx, 1), [0x1A], 'a finished block')
+        zx.io_out(ZXN, 0xC3)
+        self.assertEqual(reads(zx, 1), [0x3A], 'C3h: E=1, T=0 (dma:637-646)')
+
+    def test_reset_command_restores_both_timings_and_clears_the_prescaler(self):
+        """C3h sets both ports' timing back to 3 clocks and the prescaler to 0
+        (dma:641-643). (A mutant survivor, Speccy-Zone's run 1.)"""
+        zx = machine()
+        zx.dma_log(True)
+        program(zx, A, B, 4, a_t=T2, b_t=T4, pre=5, enable=False)
+        zx.io_out(ZXN, 0xC3)
+        program(zx, A, B, 4)                            # no timing bytes this time
+        zx.run_ticks(20000)
+        ev = zx.dma_events
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [3] * 7,
+                         'three clocks each way, and no prescaler between bytes')
+
+    def test_reinitialise_status(self):
+        zx = machine()
+        zx.write(A, pattern(4))
+        program(zx, A, B, 4)
+        zx.run_ticks(20000)
+        self.assertEqual(reads(zx, 1), [0x1A], 'ended: E=0; and T=0, IDLE clears it (dma:265)')
+        zx.io_out(ZXN, 0x8B)
+        self.assertEqual(reads(zx, 1), [0x3A], '8Bh: E=1, T=0 (dma:690-692)')
 
 
 @needs_next
-class Ports(NextCase):
-    """Memory to port and port to memory: real bus cycles through the machine's decode (§9.1 (16))."""
+class Transfers(NextCase):
 
-    def test_memory_to_the_border(self):
-        n = 8
-        data = bytes([1, 2, 3, 4, 5, 6, 7, 2])
-        zx = bare()
-        io, dma, clocks, t28 = run_enabled(zx, regs(n, dst=0x00FE, b_io=True, b_inc=2), data)
-        tw, cw = io[0][:2]
-        self.assertEqual(len(io), 1)                             # DMA cycles never reach io_events
-        self.assertEqual(dma, expected_copy(cw, tw, n, dst=0x00FE, dst_step=0, wkind='iw', data=data))
-        self.assertEqual(zx.lib.zxn_border(zx.z), 2)
+    def test_memory_to_memory_a_to_b(self):
+        zx = machine()
+        p = pattern(16)
+        zx.write(A, p)
+        zx.write(B, bytes(16))
+        zx.dma_log(True)
+        program(zx, A, B, 16)
+        zx.run_ticks(20000)
+        self.assertEqual(zx.read(B, 16), p, 'the block copied')
+        self.assertEqual(zx.read(A, 16), p, 'the source untouched')
+        want = [c for i in range(16) for c in [('mr', A + i, p[i]), ('mw', B + i, p[i])]]
+        self.assertEqual(cycles(zx.dma_events), want, 'one read then one write per byte, in order')
+        self.assertFalse(zx.busak, 'the bus given back at the end')
+        self.assertEqual(reads(zx, 7), [0x1A, 16, 0, 0x10, 0x90, 0x10, 0xA1],
+                         'status ended; counter 16; port A (the source) and B one past the block')
 
-    def test_keyboard_to_memory(self):
-        # B -> A: port B (I/O, fixed) at 7FFE, the half-row with SPACE; SPACE down reads E0 | 1E
-        n = 4
-        zx = bare()
-        zx.set_keys([0, 0, 0, 0, 0, 0, 0, 0x01])
-        io, dma, clocks, t28 = run_enabled(zx, regs(n, src=DST, dst=0x7FFE, atob=False, b_io=True, b_inc=2))
-        tw, cw = io[0][:2]
-        self.assertEqual(dma, expected_copy(cw, tw, n, src=0x7FFE, dst=DST, src_step=0, rkind='ir',
-                                            data=[0xFE] * n))
-        self.assertEqual(bytes(zx.read(DST, n)), b'\xFE' * n)
+    def test_b_to_a_decrementing_into_a_fixed_address(self):
+        zx = machine()
+        p = pattern(16, seed=3)
+        zx.write(B, p)
+        zx.write(A, bytes([0xEE, 0xEE]))
+        zx.dma_log(True)
+        program(zx, A, B + 15, 16, ab=False, a_mode=FIXED, b_mode=DEC)
+        zx.run_ticks(20000)
+        want = [c for i in range(16) for c in [('mr', B + 15 - i, p[15 - i]), ('mw', A, p[15 - i])]]
+        self.assertEqual(cycles(zx.dma_events), want, 'B -> A: B counts down, A stays')
+        self.assertEqual(zx.read(A, 2), bytes([p[0], 0xEE]), 'the last byte read is the one left')
+        self.assertEqual(reads(zx, 7), [0x1A, 16, 0, 0x00, 0x90, 0xFF, 0xA0],
+                         'port A is the destination now (fixed); port B one below the block')
+
+    def test_block_lengths(self):
+        for length, port, n in [(0, ZXN, 1), (1, ZXN, 1), (5, ZXN, 5),
+                                (0, Z80, 1), (1, Z80, 2), (5, Z80, 6)]:
+            with self.subTest(length=length, port=f'{port:02X}h'):
+                self.assertEqual(ref.dma_block_bytes(length, port == Z80), n)
+                zx = machine()
+                zx.write(A, pattern(8))
+                zx.write(B, bytes([0xEE] * 8))
+                zx.dma_log(True)
+                program(zx, A, B, length, port=port)
+                zx.run_ticks(20000)
+                self.assertEqual(sum(1 for e in zx.dma_events if e[2] == 'mw'), n,
+                                 f'length {length} through port {port:02X}h moves {n}')
+                self.assertEqual(zx.read(B, 8), pattern(8)[:n] + bytes([0xEE] * (8 - n)))
+                count = n if port == ZXN else n - 1
+                self.assertEqual(reads(zx, 3, port=port)[1:], [count & 0xFF, count >> 8],
+                                 'the counter counts up from 0 (or FFFFh in Z80 mode)')
+
+    def test_continue_goes_on_from_where_it_stopped(self):
+        zx = machine()
+        p = pattern(8)
+        zx.write(A, p)
+        zx.dma_log(True)
+        program(zx, A, B, 4)
+        zx.run_ticks(20000)
+        self.assertEqual(reads(zx, 1), [0x1A])
+        zx.io_out(ZXN, 0xD3)
+        self.assertEqual(reads(zx, 3), [0x3A, 0, 0], 'D3h: E=1 and the counter cleared (dma:670-676)')
+        zx.io_out(ZXN, 0x87)
+        zx.run_ticks(20000)
+        self.assertEqual([(k, a) for k, a, v in cycles(zx.dma_events) if k == 'mw'],
+                         [('mw', B + i) for i in range(8)], 'the addresses carried on')
+        self.assertEqual(zx.read(B, 8), p)
+
+    def test_auto_restart_reloads_the_addresses(self):
+        zx = machine()
+        zx.write(A, pattern(3))
+        zx.dma_log(True)
+        program(zx, A, B, 3, restart=True, pre=8, mode=BURST)  # burst: the CPU gets to stop it
+        for _ in range(200000):
+            zx.run_ticks(1)
+            if len(zx.dma_events) >= 20 and not zx.busak:
+                break
+        zx.io_out(ZXN, 0x83)
+        got = [a for k, a, v in cycles(zx.dma_events) if k == 'mr']
+        self.assertGreaterEqual(len(got), 10, 'more than three blocks')
+        self.assertEqual(got, [A + i % 3 for i in range(len(got))], 'each block from the start again')
+        n = len(zx.dma_events)
+        zx.run_ticks(20000)
+        self.assertEqual(len(zx.dma_events), n, '83h stops it')
+
+    def test_z80_mode_auto_restart_blocks_are_length_plus_one(self):
+        """FINISH_DMA's reload loads the counter with FFFFh in Z80 mode
+        (dma:482-486), so every restarted block moves length + 1, like the first.
+        (A mutant survivor, Speccy-Zone's run 1.)"""
+        zx = machine()
+        zx.write(A, pattern(4))
+        zx.dma_log(True)
+        program(zx, A, B, 2, restart=True, pre=8, mode=BURST, port=Z80)
+        for _ in range(200000):
+            zx.run_ticks(1)
+            if len(zx.dma_events) >= 20 and not zx.busak:
+                break
+        zx.io_out(Z80, 0x83)
+        got = [a for k, a, v in cycles(zx.dma_events) if k == 'mr']
+        self.assertGreaterEqual(len(got), 10)
+        self.assertEqual(got, [A + i % 3 for i in range(len(got))], 'blocks of three from length 2')
+
+    def test_wr0_search_codes_still_transfer(self):
+        """WR0 is any base byte with b7 = 0 and bits 1:0 not 00 (dma:513): 10
+        and 11 (search, search/transfer on a Zilog) set the direction and take
+        their follow-on bytes like 01. (A mutant survivor, Speccy-Zone's run 1.)"""
+        for op in (0b10, 0b11):
+            for ab in (True, False):
+                with self.subTest(op=op, ab=ab):
+                    zx = machine()
+                    src, dst = (A, B) if ab else (B, A)
+                    zx.write(src, pattern(6, seed=op))
+                    zx.write(dst, bytes(6))
+                    program(zx, A, B, 6, ab=ab, op=op)
+                    zx.run_ticks(20000)
+                    self.assertEqual(zx.read(dst, 6), pattern(6, seed=op))
+
+    def test_the_dma_cannot_program_itself(self):
+        zx = machine()
+        zx.write(A, bytes([0x83] * 8))                  # "disable", eight times
+        zx.dma_log(True)
+        program(zx, A, ZXN, 8, b_mode=FIXED, b_io=True)
+        zx.run_ticks(20000)
+        self.assertEqual([k for k, a, v in cycles(zx.dma_events)], ['mr', 'iw'] * 8,
+                         'all eight written to port 6Bh, none reaching the DMA (zxnext:2727-2728)')
+        self.assertEqual(reads(zx, 1), [0x1A], 'and the block ended normally')
 
 
 @needs_next
-class Prescaler(NextCase):
-    """WR2's prescaler (dma:432-447): after a byte's WRITE_4, wait while P > timer(13:5), the timer counting t28
-    from READ_1 (it adds 8, 4, 2 or 1 a clock and clears in READ_1). WAITING_CYCLES then goes to WAITING_ACK
-    (bus held, continuous) and READ_1 an edge later. With k t28 to the clock: the decision edge sees 4k t28
-    (3 + 3 cycles), so it waits only if P > 4k/32; the wait ends at the first edge that sees 32P, and the next
-    READ_1 is 32P/k + 3 clocks after the last."""
+class IOCycles(NextCase):
 
-    def test_prescaled_period(self):
-        for speed, presc in ((0, 2), (0, 5), (1, 3), (2, 1), (3, 1), (3, 7), (0, 1)):
-            with self.subTest(speed=speed, presc=presc):
-                k = 8 >> speed
-                waits = presc > (4 * k) // 32
-                period = 32 * presc // k + 3 if waits else 6
-                n = 5
-                zx = bare(speed=speed)
-                io, dma, clocks, t28 = run_enabled(zx, regs(n, presc=presc), nops=400)
-                reads = [e for e in dma if e[2] == 'mr']
-                self.assertEqual([b[1] - a[1] for a, b in zip(reads, reads[1:])], [period] * (n - 1))
-                self.assertEqual([b[0] - a[0] for a, b in zip(reads, reads[1:])], [period * k] * (n - 1))
+    def test_memory_to_a_port(self):
+        zx = machine()
+        p = pattern(4, seed=0x40)
+        zx.write(A, p)
+        zx.io_out(0x243B, 0x7F)                         # NR 7Fh, the user register
+        zx.dma_log(True)
+        program(zx, A, 0x253B, 4, b_mode=FIXED, b_io=True)
+        zx.run_ticks(20000)
+        ev = zx.dma_events
+        self.assertEqual(cycles(ev), [c for i in range(4) for c in
+                                      [('mr', A + i, p[i]), ('iw', 0x253B, p[i])]])
+        self.assertEqual(zx.nr_read(0x7F), p[3], 'each write a real port write: NR 7Fh holds the last')
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [3] * 7,
+                         'three clocks each, I/O included: no automatic wait (dma:307-378)')
+
+    def test_a_port_to_memory(self):
+        zx = machine()
+        zx.write(B, bytes(4))
+        zx.io_out(0x243B, 0x00)                         # NR 00h, the machine ID: 0Ah
+        zx.dma_log(True)
+        program(zx, 0x253B, B, 4, a_mode=FIXED, a_io=True)
+        zx.run_ticks(20000)
+        self.assertEqual(cycles(zx.dma_events), [c for i in range(4) for c in
+                                                 [('ir', 0x253B, 0x0A), ('mw', B + i, 0x0A)]])
+        self.assertEqual(zx.read(B, 4), bytes([0x0A] * 4))
 
 
-if __name__ == '__main__':
-    unittest.main()
+    def test_the_spi_wait_holds_every_dma_cycle(self):
+        """Port EBh: the SPI master (clocked by the CPU clock) begins at idle or
+        at state 15 while the strobe is up (spi:82), and its wait is low unless
+        idle or just past state 15 (spi:177). It gates every DMA cycle, not just
+        the port's (zxnext:1803). So the read strobe, held by the wait, is still
+        up at state 15 and begins a second transfer (D-15), and the next cycle,
+        a memory one, waits for that: 34 clocks and two transfers a byte.
+        (Kelp's reading; I had missed the second wait, and her core showed me.)"""
+        for name, args, want in [
+                ('EBh -> memory', dict(a=0x00EB, b=B, a_mode=FIXED, a_io=True), [18, 16] * 5 + [18]),
+                ('memory -> EBh', dict(a=A, b=0x00EB, b_mode=FIXED, b_io=True), [3] + [18, 16] * 5)]:
+            with self.subTest(name):
+                zx = machine()
+                zx.dma_log(True)
+                program(zx, n=6, **args)
+                zx.run_ticks(20000)
+                ev = zx.dma_events
+                self.assertEqual(len(ev), 12)
+                self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], want)
 
 
 @needs_next
-class Burst(NextCase):
-    """Burst mode (WR4 b6:5 = 10): in WAITING_CYCLES the DMA lets go of BUSRQ while the prescaler is still due
-    (dma:449-455). From READ_1 at E0: the WRITE_4 decision at E6 starts the wait, E7 lets go, BusReq_s follows at
-    E8, E9 releases the bus with the CPU's next T1. The wait ends at E(4P+2) (32P t28 at 8 a clock) into
-    START_DMA (BUSRQ was let go), which asks at E(4P+3); BusReq_s at E(4P+4); with NOPs the CPU's T_Res edges are
-    E9 + 4m, so the grant is at E(4P+5) and the next READ_1 at E(4P+6). The CPU is frozen 10 edges a byte."""
+class Timing(NextCase):
 
-    def test_burst_gives_the_cpu_the_waits(self):
-        for presc in (2, 3, 7):
-            with self.subTest(presc=presc):
-                n = 6
-                zx = bare()
-                data = bytes(range(40, 40 + n))
-                io, dma, clocks, t28 = run_enabled(zx, regs(n, presc=presc, mode=2), data, nops=400)
-                tw, cw = io[0][:2]
-                period = 4 * presc + 6
-                want = []
-                for i in range(n):
-                    want += expected_copy(cw, tw, 1, first=7 + period * i, src=SRC + i, dst=DST + i,
-                                          data=data[i:])
-                self.assertEqual(dma, want)
-                self.assertEqual(clocks, 7 + 11 + 4 * 400 + 10 * n)
+    def intervals(self, zx):
+        ev = zx.dma_events
+        return [b[1] - a[1] for a, b in zip(ev, ev[1:])], [b[0] - a[0] for a, b in zip(ev, ev[1:])]
 
-    def test_continuous_keeps_the_bus_through_the_waits(self):
-        # the same transfer in continuous mode: WAITING_CYCLES -> WAITING_ACK with the bus held (dma:457-462)
-        n, presc = 6, 3
+    def test_cycle_lengths_follow_each_ports_timing(self):
+        for a_t, b_t in [(T2, T2), (T3, T3), (T4, T4), (T2, T4), (T4, T2), (0b11, T3)]:
+            for ab in (True, False):
+                with self.subTest(a=a_t, b=b_t, ab=ab):
+                    zx = machine()
+                    zx.dma_log(True)
+                    program(zx, A, B, 8, ab=ab, a_t=a_t, b_t=b_t)
+                    zx.run_ticks(20000)
+                    r = ref.DMA_TIMING[a_t if ab else b_t]
+                    w = ref.DMA_TIMING[b_t if ab else a_t]
+                    clocks, ticks = self.intervals(zx)
+                    self.assertEqual(len(clocks), 15)
+                    self.assertEqual(clocks, [r, w] * 7 + [r],
+                                     f'reads with the source port\'s timing ({r}), writes with the '
+                                     f'destination\'s ({w}) (dma:307-324, 359-378)')
+                    self.assertEqual(ticks, [8 * c for c in clocks], '3.5 MHz, uncontended')
+
+    def test_prescaler_in_continuous_mode(self):
+        for speed, m in [(0, 8), (1, 4), (2, 2), (3, 1)]:
+            for pre in (10, 40):
+                with self.subTest(speed=speed, prescaler=pre):
+                    zx = machine(speed=speed)
+                    zx.dma_log(True)
+                    program(zx, A, B, 4, pre=pre)
+                    zx.run_ticks(4 * 32 * pre + 20000)
+                    ev = [e for e in zx.dma_events if e[2] == 'mr']
+                    self.assertEqual(len(ev), 4)
+                    want = ref.dma_period(3, 3, pre, m)
+                    self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [want] * 3,
+                                     f'{want} clocks from byte to byte (nextref.dma_period)')
+                    self.assertEqual([b[0] - a[0] for a, b in zip(ev, ev[1:])],
+                                     [32 * pre + 3 * m] * 3,
+                                     '32 t28 a prescaler unit at any speed, plus three clocks')
+
+    def test_port_timing_resets_keep_the_prescaler(self):
+        """C7h and CBh reset only their port's timing (dma:647-651); only C3h
+        clears the prescaler (dma:643). (The wiki says all three do: probe.)"""
+        zx = machine()
+        zx.dma_log(True)
+        program(zx, A, B, 4, a_t=T2, b_t=T2, pre=10, enable=False)
+        zx.io_out(ZXN, 0xC7)
+        zx.io_out(ZXN, 0xCB)
+        zx.io_out(ZXN, 0x87)
+        zx.run_ticks(4 * 32 * 10 + 20000)
+        ev = zx.dma_events
+        self.assertEqual(len(ev), 8)
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])][0::2], [3] * 4,
+                         'reads back to 3 clocks')
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev[0::2], ev[2::2])], [ref.dma_period(3, 3, 10, 8)] * 3,
+                         'and the prescaler still spaces the bytes')
+
+    def test_the_prescaler_works_in_z80_mode_too(self):
+        """dma:424 and 451 have no mode term. (The wiki says zxnDMA mode only: probe.)"""
+        zx = machine()
+        zx.dma_log(True)
+        program(zx, A, B, 3, pre=10, port=Z80)
+        zx.run_ticks(4 * 32 * 10 + 20000)
+        ev = [e for e in zx.dma_events if e[2] == 'mr']
+        self.assertEqual(len(ev), 4, 'Z80 mode: length + 1')
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [ref.dma_period(3, 3, 10, 8)] * 3)
+
+    def out_then_sled(self, n, **kw):
+        """Program the DMA but leave it disabled; the CPU runs LD A,87h;
+        OUT (6Bh),A then a sled of ADD HL,BC (M-cycles 4, 4, 3: t80n_mcode:891-935).
+        Returns (cpu_clocks at the OUT's fetch, the events)."""
         zx = bare()
-        io, dma, clocks, t28 = run_enabled(zx, regs(n, presc=presc, mode=1), bytes(n), nops=400)
-        reads = [e[1] for e in dma if e[2] == 'mr']
-        self.assertEqual([b - a for a, b in zip(reads, reads[1:])], [4 * presc + 3] * (n - 1))
-        # frozen from the grant (7 clocks after the write, at e8) to the release: the last byte's wait ends at
-        # E(4P+2), FINISH at +1, IDLE lets go at +2, BusReq_s at +3, released at +4
-        frozen = 1 + (4 * presc + 3) * (n - 1) + (4 * presc + 2) + 4
-        self.assertEqual(clocks, 7 + 11 + 4 * 400 + frozen)
+        zx.load(0x8100, bytes([0x3E, 0x87, 0xD3, 0x6B] + [0x09] * 3000 + [0x18, 0xFE]))
+        zx.dma_log(True)
+        program(zx, A, B, n, enable=False, **kw)
+        launch(zx, 0x8100)
+        self.assertTrue(zx.run_until_pc(0x8102, max_ticks=10**6))
+        c0 = zx.cpu_clocks
+        zx.run_ticks(n * 32 * 30 + 20000)
+        return c0, zx.dma_events
+
+    def test_an_out_starts_the_dma_at_the_next_mcycle_end(self):
+        """The OUT's IORQ/WR fall at the rising edge after its first I/O T-state
+        (t80na:151-154, 334-356), and the DMA sees the write at its next rising
+        edge (dma:500-505), asks for the bus one later, and the T80N samples that
+        one later still (t80n:1663): too late for the OUT's own T_Res, so the
+        grant comes at the end of the next instruction's M1 (t80n:1742-1747).
+        From the OUT's fetch: 11 clocks of OUT, 4 of the M1, READ_1 at the 17th
+        edge, stamped c0 + 16. (Mutant survivors 4 and 5, Speccy-Zone's run 1.)"""
+        c0, ev = self.out_then_sled(4)
+        self.assertEqual(len(ev), 8)
+        self.assertEqual(ev[0][1] - c0, 16)
+
+    def test_burst_grants_wait_for_the_cpus_mcycle_ends(self):
+        """Burst mode with a prescaler: each byte's renewed request is granted
+        only where one of the CPU's M-cycles ends, internal ones included
+        (nextref.dma_burst_reads). Prescalers 20, 21, 22 put the grants at the
+        ends of the M1, the first internal M-cycle and the second."""
+        seen = set()
+        for pre in (20, 21, 22):
+            with self.subTest(prescaler=pre):
+                c0, ev = self.out_then_sled(6, pre=pre, mode=BURST)
+                want, grants = ref.dma_burst_reads(16, 6, 3, 3, pre, 8, [4, 4, 3], 0)
+                self.assertEqual([e[1] - c0 for e in ev if e[2] == 'mr'], want)
+                seen |= set(grants)
+        self.assertEqual(seen, {0, 1, 2}, 'grants at every kind of M-cycle end')
+
+    def test_the_speed_waits_for_the_dma_to_let_go(self):
+        """cpu_speed (and NR 08h's contention disable) are copied only at an edge
+        where the DMA isn't holding the bus (zxnext:5714). A copper MOVE of 3 to
+        NR 07h mid-block takes effect only after BUSAK falls. (Speccy-Zone's
+        finding in the core, run 1.)"""
+        zx = machine(timing='48k')
+        v = zx.cvc + 20 if zx.cvc + 20 < 300 else 10
+        load_copper(zx, [copper_wait(v), copper_move(0x07, 0x03), COPPER_NEVER])
+        zx.dma_log(True)
+        program(zx, 0xA000, 0xC000, 9000, a_mode=FIXED, b_mode=FIXED)
+        zx.nr_write(0x62, 0x40)
+        passed = False
+        for _ in range(9000 * 6 * 8 // 64 + 2000):
+            zx.run_ticks(64)
+            if not zx.busak and len(zx.dma_events) >= 18000:
+                break
+            if zx.busak:
+                passed |= zx.cvc > v
+                self.assertEqual(zx.speed, 0, f'the speed changed with the bus held '
+                                              f'({len(zx.dma_events)} cycles in)')
+        self.assertTrue(passed, 'the copper\'s line came and went inside the block')
+        ev = zx.dma_events
+        self.assertEqual(len(ev), 18000)
+        self.assertTrue(all(b[0] - a[0] == 8 * (b[1] - a[1]) for a, b in zip(ev, ev[1:])),
+                        'every DMA clock at 3.5 MHz')
+        zx.run_ticks(200)
+        self.assertEqual(zx.speed, 3, 'then 28 MHz')
+        self.assertEqual(zx.nr_read(0x07) & 0x03, 0x03, 'the copper did write it')
+
+    def test_continuous_mode_keeps_the_bus(self):
+        zx = machine()
+        zx.dma_log(True)
+        program(zx, A, B, 32)
+        for _ in range(20000):
+            if zx.dma_events:
+                break
+            zx.run_ticks(1)
+        self.assertTrue(zx.dma_events, 'the transfer never began')
+        hl = zx.regs()['hl']
+        for _ in range(64 * 3 * 8 + 100):
+            if len(zx.dma_events) >= 64:
+                break
+            self.assertTrue(zx.busak, f'busak dropped after {len(zx.dma_events)} cycles')
+            zx.run_ticks(1)
+        self.assertEqual(len(zx.dma_events), 64, 'all 32 bytes, three clocks a cycle')
+        self.assertEqual(zx.regs()['hl'], hl, 'the CPU did nothing meanwhile')
+        clocks, _ = self.intervals(zx)
+        self.assertEqual(sum(clocks), 63 * 3, 'cpu_clocks counts on through the DMA\'s cycles')
+        zx.run_ticks(20000)
+        self.assertFalse(zx.busak)
+        self.assertGreater(zx.regs()['hl'], hl, 'and the CPU runs again after')
+
+    def test_burst_mode_gives_the_bus_back_while_it_waits(self):
+        pre = 20
+        zx = machine()
+        zx.dma_log(True)
+        program(zx, A, B, 6, pre=pre, mode=BURST)
+        trace = []                                      # (events so far, busak, HL) after each tick
+        for _ in range(6 * 32 * pre + 20000):
+            zx.run_ticks(1)
+            trace.append((len(zx.dma_events), zx.busak, zx.regs()['hl']))
+            if trace[-1][0] == 12 and not zx.busak:
+                break
+        self.assertEqual(len(zx.dma_events), 12)
+        for i in range(1, 6):                           # between byte i-1's write and byte i's read
+            gap = [t for t in trace if t[0] == 2 * i]
+            self.assertTrue(gap and not all(t[1] for t in gap),
+                            f'busak low between bytes {i - 1} and {i} (dma:439-447)')
+            self.assertNotEqual(gap[0][2], gap[-1][2], f'the CPU ran between bytes {i - 1} and {i}')
+        ev = [e for e in zx.dma_events if e[2] == 'mr']
+        least = 8 * (ref.dma_period(3, 3, pre, 8) + 1)
+        for a, b in zip(ev, ev[1:]):
+            self.assertTrue(least <= b[0] - a[0] <= least + 8 * 24,
+                            f'byte to byte {b[0] - a[0]} t28: at least the continuous period and '
+                            f'one more clock to ask for the bus ({least}), then the CPU\'s answer')
+
+    def test_status_mid_block(self):
+        zx = machine()
+        zx.dma_log(True)
+        program(zx, A, B, 4, pre=20, mode=BURST)
+        for _ in range(4 * 32 * 20 + 20000):
+            if len(zx.dma_events) >= 2 and not zx.busak:
+                break
+            zx.run_ticks(1)
+        self.assertEqual(len(zx.dma_events), 2, 'one byte, then the bus given back to wait')
+        self.assertEqual(reads(zx, 3), [0x3B, 1, 0], 'one byte done: E=1, T=1; counter 1')
+
+    def test_28mhz_read_wait_reaches_the_dma(self):
+        """zxnext:3131-3135: at 28 MHz an SRAM read's first clock after the strobe
+        drops WAIT for one clock; the DMA samples WAIT on the falling edge and
+        tests it in READ_4 (dma:139-145, 342). A 2-clock read is in READ_4
+        by then and waits one clock; a 3-clock read is still in READ_3 and
+        doesn't. Writes never wait."""
+        for a_t, b_t, r, w in [(T2, T2, 3, 2), (T3, T3, 3, 3), (T4, T2, 4, 2), (T2, T4, 3, 4)]:
+            with self.subTest(a=a_t, b=b_t):
+                zx = machine(speed=3)
+                zx.dma_log(True)
+                program(zx, A, B, 6, a_t=a_t, b_t=b_t)
+                zx.run_ticks(20000)
+                clocks, ticks = self.intervals(zx)
+                self.assertEqual(clocks, [r, w] * 5 + [r])
+                self.assertEqual(ticks, clocks, '28 MHz: a t28 a clock')
+
+
+ISR = bytes([0x3A, 0x00, 0x98, 0x3C, 0x32, 0x00, 0x98,   # LD A,(9800h); INC A; LD (9800h),A
+             0xFB, 0xED, 0x4D])                           # EI; RETI (at 9208h)
+BLOCK = 30000                                           # fixed to fixed: about 2.6 frames at 48K
 
 
 @needs_next
 class Interrupts(NextCase):
-    """Giving the bus back (zxnext:1960-1968): im2_dma_delay is set while an im2 device whose DMA interrupt is
-    enabled (NR 0xCC-0xCE) is pending or in service, and held through im2_control's RETI states. A WRITE_4 that
-    sees it goes to START_DMA, which lets go of BUSRQ until it clears (dma:270-280, 420-425).
+    """NEXT-MACHINE §6.6. In hardware IM2 mode a source whose bit is set in NR
+    CC-CE drives im2_dma_int from its request until RETI (im2d:151;
+    zxnext:1916-1917), which holds the DMA's delay (zxnext:1960-1967): the DMA
+    gives the bus up after the byte under way (dma:426-428) and waits in
+    START_DMA (dma:269-275); RETI's own states keep it waiting through the pops
+    (im2c:184-189, 238). In pulse mode the IM2 devices are held in reset
+    (im2p:105), so nothing but an NMI interrupts a transfer."""
 
-    RETI, from its T1 at r0: ED's T4 edge (r3) enters S_ED_T4, 4D's (r7) S_ED4D_T4, then S_SRL_T1 (r8),
-    S_SRL_T2 (r9), S_0 (r10) (im2c). The device is idle again by then, so im2_dma_delay clears at r11, START_DMA
-    asks at r12, BusReq_s at r13, and the grant is RETI's own T_Res at r14: the DMA's next read is stamped just
-    before r15, before the CPU fetches anything after the RETI."""
-    HANDLER, I_REG = 0x9200, 0x90
-
-    def setup(self, c0=0xA1, cc=0x01, n=20000):
-        zx = bare()
-        zx.nr_write(0xC0, c0)                           # hardware IM2, vectors 101xxxx0
-        zx.nr_write(0xCC, cc)                           # b0: the ULA's interrupt delays the DMA
-        program(zx, regs(n, src=0xC000, dst=DST, b_inc=2))
-        code = [0xF3, 0x3E, self.I_REG, 0xED, 0x47, 0xED, 0x5E, 0xFB, 0x3E, 0x87, 0xD3, 0x6B, 0x18, 0xFE]
-        zx.load(CODE, bytes(code))                      # DI; LD I,90h; IM 2; EI; OUT (6Bh),87h; JR $
-        vec = self.I_REG << 8 | (c0 & 0xE0) | 11 << 1   # the ULA is device 11 (zxnext:1958)
-        zx.poke(vec, self.HANDLER & 0xFF)
-        zx.poke(vec + 1, self.HANDLER >> 8)
-        zx.load(self.HANDLER, bytes([0xFB, 0xED, 0x4D]))   # EI; RETI
+    def setup(self, c0, cc, n=BLOCK, pre=None):
+        zx = bare(timing='48k')
+        zx.nr_write(0x03, 0x00)                         # boot ROM off (see test_next_interrupts)
+        zx.nr_write(0xC0, c0)
+        zx.nr_write(0xCC, cc)
+        loop = main_loop(zx, 2)
+        zx.load(0x9200, ISR)
+        vector(zx, 0x90, (c0 & 0xE0) | 11 << 1, 0x9200)  # the ULA's vector
+        vector(zx, 0x90, 0xFF, 0x9200)                  # pulse mode's
         launch(zx, CODE)
-        assert zx.run_until_pc(CODE, max_ticks=10**6)
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=2 * F48), 'a first interrupt, DMA idle')
+        self.assertTrue(zx.run_until_pc(loop, max_ticks=F48))   # back, nothing pending: the next
+        zx.poke(0x9800, 0)                                      # one is about a frame away
         zx.dma_log(True)
+        program(zx, 0xA000, 0xC000, n, a_mode=FIXED, b_mode=FIXED, pre=pre)
         return zx
 
-    def test_im2_interrupt_takes_the_bus_and_reti_gives_it_back(self):
-        n = 20000
-        zx = self.setup(n=n)
-        reti = self.HANDLER + 1
-        stops = []
-        while len(stops) < 2:
-            assert zx.run_until_pc(reti, max_ticks=4 * 10**6), 'no interrupt was served'
-            if zx.dma_events:                           # (one before the transfer began doesn't count)
-                stops.append((zx.cpu_clocks, len(zx.dma_events)))
-            zx.run_ticks(8)
-        zx.run_ticks(8 * 6 * n)
-        dma = zx.dma_events
-        reads = [e for e in dma if e[2] == 'mr']
-        self.assertEqual([e[3] for e in reads], [(0xC000 + i) & 0xFFFF for i in range(n)])   # none lost or doubled
-        for s, k in stops:
-            nxt = dma[k]                                # the first event after the RETI's T1
-            self.assertEqual((nxt[1], nxt[2]), (s + 15, 'mr'))
-            self.assertGreater(nxt[1] - dma[k - 1][1], 15)   # and a real pause before it
+    def test_a_prescaled_continuous_transfer_never_yields(self):
+        """With a prescaler that's due, WRITE_4 goes to WAITING_CYCLES before it
+        looks at the delay (dma:424-432), and in continuous mode WAITING_CYCLES
+        returns to WAITING_ACK without looking at it either (dma:451-462). So an
+        enabled IM2 source still waits for the block. (Kelp's reading; mine too.)"""
+        zx = self.setup(0xA1, 0x01, n=4000, pre=10)     # 43 clocks a byte: about 2.5 frames
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=4 * F48))
+        self.assertEqual(len(zx.dma_events), 8000, 'the handler only after the block')
+
+    def test_an_enabled_im2_source_takes_the_bus_between_bytes(self):
+        zx = self.setup(0xA1, 0x01)                     # hardware IM2; NR CC b0: the ULA
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=2 * F48), 'the ULA\'s handler')
+        n = len(zx.dma_events)
+        self.assertTrue(0 < n < 2 * BLOCK, f'entered mid-block ({n} cycles done)')
+        self.assertEqual(n % 2, 0, 'between bytes')
         self.assertFalse(zx.busak)
+        self.assertTrue(zx.run_until_pc(0x9208, max_ticks=F48))
+        self.assertEqual(len(zx.dma_events), n, 'the DMA stays off the bus through the handler')
+        for _ in range(4000):
+            zx.run_ticks(1)
+            if len(zx.dma_events) > n:
+                break
+        self.assertGreater(len(zx.dma_events), n, 'the DMA came back')
+        self.assertEqual(zx.regs()['sp'], 0x7FF0, 'only after RETI\'s pops (im2c:184-189)')
+        zx.run_ticks(4 * F48)
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'and finished the block')
+        self.assertGreaterEqual(zx.peek(0x9800), 2, 'every interrupt in the block served')
 
-    def test_a_prescaled_continuous_transfer_never_gives_way(self):
-        # a due prescaler sends WRITE_4 to WAITING_CYCLES before the delay is looked at, and continuous mode leaves
-        # WAITING_CYCLES for WAITING_ACK with the bus held (dma:432-462): the interrupt waits for the block
-        n, presc = 700, 25
-        zx = bare()
-        zx.nr_write(0xC0, 0xA1)
-        zx.nr_write(0xCC, 0x01)
-        program(zx, regs(n, src=0xC000, dst=DST, b_inc=2, presc=presc))
-        code = [0xF3, 0x3E, self.I_REG, 0xED, 0x47, 0xED, 0x5E, 0xFB, 0x3E, 0x87, 0xD3, 0x6B, 0x18, 0xFE]
-        zx.load(CODE, bytes(code))
-        vec = self.I_REG << 8 | 0xA0 | 11 << 1
-        zx.poke(vec, self.HANDLER & 0xFF)
-        zx.poke(vec + 1, self.HANDLER >> 8)
-        zx.load(self.HANDLER, bytes([0xFB, 0xED, 0x4D]))
-        launch(zx, CODE)
-        assert zx.run_until_pc(CODE, max_ticks=10**6)
+    def test_without_its_enable_the_interrupt_waits_for_the_block(self):
+        zx = self.setup(0xA1, 0x00)
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=4 * F48))
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'continuous mode kept the bus to the end')
+
+    def nmi_setup(self, cc):
+        """The multiface NMI raised by a copper MOVE to NR 02h mid-block (the CPU
+        can't write it then: the DMA has the bus). It needs config mode left
+        (zxnext:2061), NR 06h b3 (zxnext:2049, 5105) and the multiface enabled
+        (NR 83h b1, FFh at power-on; zxnext:2374); its ROM (SRAM page 0Ah,
+        zxnext:2989-2991) holds the handler, RETN, at 0066h."""
+        zx = machine(timing='48k')
+        zx.nr_write(0x03, 0x01)                         # leave config mode: a 48K
+        zx.nr_write(0x06, zx.nr_read(0x06) | 0x08)
+        zx.nr_write(0xCC, cc)
+        for base in (0x14000, ref.ROM_SRAM[0]):         # the multiface's ROM, and ROM 0 should it not page in
+            zx.sram[base + 0x66], zx.sram[base + 0x67] = 0xED, 0x45
+        load_copper(zx, [copper_wait(100), copper_move(0x02, 0x08), COPPER_NEVER])
         zx.dma_log(True)
-        period = 4 * presc + 3
-        self.assertFalse(zx.run_until_pc(self.HANDLER, max_ticks=8 * period * (n - 10)))   # past a frame's INT
-        zx.run_ticks(8 * period * 20)
-        reads = [e[1] for e in zx.dma_events if e[2] == 'mr']
-        self.assertEqual(len(reads), n)
-        self.assertEqual(set(b - a for a, b in zip(reads, reads[1:])), {period})
-        self.assertTrue(zx.run_until_pc(self.HANDLER, max_ticks=10**6))           # and then it's served
+        program(zx, 0xA000, 0xC000, BLOCK, a_mode=FIXED, b_mode=FIXED)
+        zx.nr_write(0x62, 0x40)                         # copper: run once from the start
+        return zx
 
-    def test_without_the_enable_the_transfer_runs_on(self):
-        n = 20000
-        zx = self.setup(cc=0x00, n=n)
-        zx.run_ticks(8 * (6 * n + 400))
-        reads = [e[1] for e in zx.dma_events if e[2] == 'mr']
-        self.assertEqual(len(reads), n)
-        self.assertEqual(set(b - a for a, b in zip(reads, reads[1:])), {6})
+    def test_an_nmi_takes_the_bus_when_nr_cc_bit_7_says(self):
+        """NR CC b7 lets nmi_activated hold the DMA's delay (zxnext:1966), in any
+        interrupt mode; RETN's states keep it through the pops (im2c:238)."""
+        zx = self.nmi_setup(0x80)
+        self.assertTrue(zx.run_until_pc(0x0066, max_ticks=2 * F48), 'the NMI')
+        n = len(zx.dma_events)
+        self.assertTrue(0 < n < 2 * BLOCK, f'taken mid-block ({n} cycles done)')
+        self.assertEqual(n % 2, 0, 'between bytes')
+        self.assertFalse(zx.busak)
+        for _ in range(4000):
+            zx.run_ticks(1)
+            if len(zx.dma_events) > n:
+                break
+        self.assertGreater(len(zx.dma_events), n, 'the DMA came back')
+        self.assertEqual(zx.regs()['sp'], 0x7FF0, 'only after RETN\'s pops')
+        zx.run_ticks(4 * F48)
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'and finished the block')
 
-    def test_pulse_mode_never_delays(self):
-        n = 20000
-        zx = self.setup(c0=0xA0, n=n)                   # NR 0xC0 b0 = 0: pulse mode, no device states
-        zx.run_ticks(8 * (6 * n + 400))
-        reads = [e[1] for e in zx.dma_events if e[2] == 'mr']
-        self.assertEqual(set(b - a for a, b in zip(reads, reads[1:])), {6})
+    def test_without_nr_cc_bit_7_the_nmi_waits_for_the_block(self):
+        zx = self.nmi_setup(0x00)
+        self.assertTrue(zx.run_until_pc(0x0066, max_ticks=4 * F48), 'the NMI, in the end')
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'continuous mode kept the bus to the end')
 
-    def test_nmi_takes_the_bus_with_nr_cc_b7(self):
-        # (nmi_activated and NR 0xCC b7) sets im2_dma_delay (zxnext:1966); RETN's im2_control states hold it
-        # (S_ED45_T4, S_SRL_T1, S_SRL_T2) exactly as RETI's do, so the DMA's next read is stamped at RETN's T1 + 15
-        for cc, pauses in ((0x80, True), (0x00, False)):
-            with self.subTest(cc=cc):
-                n = 3000
-                zx = bare()
-                zx.nr_write(0x03, 0x03)                 # out of config mode (no NMI in it, zxnext:2063)
-                zx.nr_write(0x06, zx.nr_read(0x06) | 0x08)   # the M1 button's NMI on (zxnext:2049)
-                zx.nr_write(0xCC, cc)
-                zx.sram[0x14066:0x14068] = bytes([0xED, 0x45])   # the multiface ROM (SRAM 0x14000): RETN at 0066
-                program(zx, regs(n, src=0xC000, dst=DST, b_inc=2))
-                code, end = enabler(nops=10)
-                zx.load(CODE, code)
-                launch(zx, CODE)
-                assert zx.run_until_pc(CODE, max_ticks=10**6)
-                zx.dma_log(True)
-                zx.run_ticks(8 * 600)                   # well into the transfer
-                zx.button('m1')
-                if pauses:
-                    assert zx.run_until_pc(0x0066, max_ticks=8 * 200)
-                    s, k = zx.cpu_clocks, len(zx.dma_events)
-                    zx.run_ticks(8 * 100)
-                    nxt = zx.dma_events[k]
-                    self.assertEqual((nxt[1], nxt[2]), (s + 15, 'mr'))
-                else:
-                    self.assertFalse(zx.run_until_pc(0x0066, max_ticks=8 * 6 * (n - 200)))
-                zx.run_ticks(8 * 6 * n)
-                reads = [e[3] for e in zx.dma_events if e[2] == 'mr']
-                self.assertEqual(reads, [0xC000 + i for i in range(n)])
-
-
-@needs_next
-class SpiWait(NextCase):
-    """dma_wait_n = z80_wait_n and spi_wait_n (zxnext:1803), spi_wait_n = state_idle or state_last_d (spi:177):
-    while the SPI master is mid-byte, the DMA's READ_4/WRITE_4 waits, its strobe still up (dma_rw_cancel only
-    with wait_n high, dma:146-155). Reading port 0xEB, the strobe that began a transfer is still there at state 15,
-    so spi_begin (spi:82) starts a second one, and the DMA waits for that too: 34 clocks a byte, two transfers a
-    byte, and each read returns the byte of the transfer before (the second of the previous pair)."""
-
-    def test_reading_eb_waits_and_starts_two_transfers_a_byte(self):
-        n = 5
-        zx = bare()
-        before = zx.spi_count
-        io, dma, clocks, t28 = run_enabled(zx, regs(n, src=DST, dst=0x00EB, atob=False, b_io=True, b_inc=2),
-                                           nops=400)
-        tw, cw = io[0][:2]
-        reads = [e for e in dma if e[2] == 'ir']
-        writes = [e for e in dma if e[2] == 'mw']
-        self.assertEqual([e[1] - cw for e in reads], [7 + 34 * i for i in range(n)])
-        self.assertEqual([w[1] - r[1] for r, w in zip(reads, writes)], [18] * n)
-        self.assertEqual(zx.spi_count - before, 2 * n)
-
-    def test_writing_eb_sends_each_byte_twice(self):
-        # memory -> 0xEB: the write's strobe, held through WRITE_4, begins the second transfer with the same byte
-        # (oshift_r <= i_spi_mosi_dat, spi:95-99); the next READ_4 waits for it
-        n = 4
-        zx = bare()
-        before = zx.spi_count
-        io, dma, clocks, t28 = run_enabled(zx, regs(n, dst=0x00EB, b_io=True, b_inc=2), bytes(range(1, 9)),
-                                           nops=400)
-        tw, cw = io[0][:2]
-        writes = [e for e in dma if e[2] == 'iw']
-        self.assertEqual([e[1] - cw for e in writes], [10 + 34 * i for i in range(n)])
-        self.assertEqual(zx.spi_count - before, 2 * n)
+    def test_pulse_mode_never_interrupts_the_dma(self):
+        zx = self.setup(0xA0, 0x01)                     # pulse mode, NR CC b0 set all the same
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=4 * F48))
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'the IM2 devices are held in reset (im2p:105)')
 
 
 @needs_next
 class Contention(NextCase):
-    """What the ULA holds or waits for in a DMA cycle (zxula:586-600, on the muxed bus, zxnext:1786-1794). The
-    DMA's strobes start on a falling edge (dma:146-155), after the ULA has decided its T-state, and by the next
-    T-state mreq23_n/ioreqtw3_n have registered them. So a DMA cycle's first T-state is checked like a T1 (the
-    memory term, if its address is contended), its later ones not, and a contended port's own term never comes:
-    by the time IORQ is low, ioreqtw3_n is too. Under +3 timing the WAIT is MREQ low on a contended page, sampled
-    on the falling edge and tested in READ_4/WRITE_4 (dma:140-145, 395-397, 412-414)."""
+    MMU = [0xFF, 0xFF, 0x0A, 0x0B, 0x04, 0x05, 0x00, 0x01]
 
-    def start_in_paper(self, zx, timing, line=40):
-        import nextref as ref
-        from test_next_timing import goto_line
-        goto_line(zx, timing, 50, line)
-        return ref.TIMINGS[(timing, 50)][:2]
-
-    def test_a_contended_port_is_not_contended_for_the_dma(self):
-        # 48K timing, the paper area: the CPU's OUT to FE would be held in its second T-state; the DMA's write
-        # to 00FE is held nowhere (its address is in ROM's page, and the port's term needs ioreqtw3_n high)
-        n = 64
-        zx = bare(timing='48k')
-        program(zx, regs(n, dst=0x00FE, b_io=True, b_inc=2))
-        zx.load(SRC, bytes(i & 7 for i in range(n)))
-        code, end = enabler(nops=200)
-        zx.load(CODE, code)
-        self.start_in_paper(zx, '48k')
-        launch(zx, CODE)
-        assert zx.run_until_pc(CODE, max_ticks=10**6)
+    def block(self, timing, n=64, a_t=None, b_t=None, dst=0x8800, b_io=False):
+        """A bank-5 to page-4 block (or to a fixed port) started near row 40;
+        returns (q, v, events), q the odd hc_ula of the first cycle's first clock."""
+        L, N, *_ = ref.TIMINGS[(timing, 50)]
+        zx = machine(timing=timing)
+        zx.write(0x4000, pattern(n))
+        assert zx.run_until_pc(0x8001, max_ticks=10**6)
+        now = zx.vc_ula * L + zx.hc_ula
+        zx.run_ticks(((40 * L - 30 - now) % (L * N)) * ref.TICKS_PER_PIXEL)
+        assert zx.run_until_pc(0x8001, max_ticks=10**6)
+        t0, h0, v0 = zx.t28, zx.hc_ula, zx.vc_ula
         zx.dma_log(True)
-        assert zx.run_until_pc(end, max_ticks=10**7)
-        stamps = [e[0] for e in zx.dma_events]
-        self.assertEqual(len(stamps), 2 * n)
-        self.assertEqual(set(b - a for a, b in zip(stamps[0::2], stamps[2::2])), {48})
-        self.assertEqual(set(b - a for a, b in zip(stamps[0::2], stamps[1::2])), {24})
+        program(zx, 0x4000, dst, n, a_t=a_t, b_t=b_t, b_io=b_io, b_mode=FIXED if b_io else INC)
+        zx.run_ticks(60000)
+        ev = zx.dma_events
+        self.assertEqual(len(ev), 2 * n)
+        self.assertEqual((ev[0][0] - t0) % (2 * ref.TICKS_PER_PIXEL), 0,
+                         'a DMA cycle starts on a CPU edge')
+        q, v = h0 + (ev[0][0] - t0) // ref.TICKS_PER_PIXEL + 1, v0   # §9.1 (11): pre-edge stamps
+        while q >= L:
+            q, v = q - L, v + 1
+        self.assertTrue(30 <= v < 180, f'the block should start near row 40 (hc {q}, row {v})')
+        if not b_io:
+            self.assertEqual(zx.read(dst, n), pattern(n))
+        return q, v, ev
 
-    def test_p3_wait_is_sampled_in_read_4(self):
-        # +3 timing, 3-clock reads from bank 5 (contended): the window (Ratio's p3_wait_now: hc_ula + 1 at the edge
-        # before the falling edge) is looked at from the edge entering READ_4, and again each clock it holds;
-        # READ_3's falling edge counts for nothing. A byte drifts through every phase.
-        n = 40
-        zx = bare()
-        program(zx, regs(n, src=0x4000))
-        code, end = enabler(nops=400)
-        zx.load(CODE, code)
-        L, N = self.start_in_paper(zx, 'p3')
-        launch(zx, CODE)
-        assert zx.run_until_pc(CODE, max_ticks=10**6)
-        t0, pos0 = zx.t28, zx.vc_ula * L + zx.hc_ula
-        zx.dma_log(True)
-        assert zx.run_until_pc(end, max_ticks=10**7)
-        dma = zx.dma_events
+    def test_reads_from_bank_5_are_contended_like_the_cpus(self):
+        """48K timing at 3.5 MHz: the ULA holds the CPU clock, which clocks the
+        DMA (NEXT-MACHINE §6.6). A DMA cycle's first clock has MREQ high at the
+        last rising edge and its address already out (dma:285-299, 407-419), so
+        it's checked like a T1: the CPU's contention model, event for event."""
+        L, N, *_ = ref.TIMINGS[('48k', 50)]
+        q, v, ev = self.block('48k')
+        per = [c for i in range(64) for c in [(0x4000 + i, 3), (0x8800 + i, 3)]]
+        want = [8 * ref.Contention('48k', self.MMU, L, N).run(q, v, per[:j]) for j in range(128)]
+        got = [e[0] - ev[0][0] for e in ev]
+        self.assertEqual(got, want, f'from hc_ula {q} row {v}')
+        self.assertGreater(got[-1], 8 * 3 * 127, 'some contention')
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [3] * 127,
+                         'held clocks add no cpu_clocks')
 
-        def window(t):                                  # at the edge whose pre-edge t28 is t
-            pos = (pos0 + (t - t0) // 4) % (L * N)
-            v, h = pos // L, pos % L + 1
-            adj = ((h & 15) + 1) & 15
-            return (adj >= 4 or adj <= 1) and (h & 0x1FF) < 256 and v < 192
+    def test_io_cycles_take_only_the_memory_term(self):
+        """48K: a DMA I/O cycle's IORQ falls on a falling edge, after the ULA's
+        decision for that T-state, and by the next T-state ioreqtw3_n has caught
+        it (zxula.vhd:586-595; dma:146-155): the port's own term never holds it.
+        Only the memory term at its first clock, by the port's high byte, as for
+        a memory address. (Kelp's reading, and mine in dma-foil-notes.md.)"""
+        L, N, *_ = ref.TIMINGS[('48k', 50)]
+        for port in (0x00FE, 0x40FE):
+            with self.subTest(port=f'{port:04X}h'):
+                q, v, ev = self.block('48k', dst=port, b_io=True)
+                self.assertEqual({e[2] for e in ev}, {'mr', 'iw'})
+                per = [c for i in range(64) for c in [(0x4000 + i, 3), (port, 3)]]
+                want = [8 * ref.Contention('48k', self.MMU, L, N).run(q, v, per[:j]) for j in range(128)]
+                self.assertEqual([e[0] - ev[0][0] for e in ev], want, f'from hc_ula {q} row {v}')
 
-        t, want = dma[0][0], []
-        for i in range(n):
-            want.append((t, 'mr', 0x4000 + i))
-            k = 0
-            while window(t + 8 * (2 + k)):             # READ_4 entered 2 clocks after READ_1
-                k += 1
-            want.append((t + 8 * (3 + k), 'mw', DST + i))
-            t += 8 * (6 + k)
-        self.assertEqual([(e[0], e[2], e[3]) for e in dma], want)
-        self.assertTrue(any(e[0] - d[0] > 48 for d, e in zip(dma[0::2], dma[2::2])), 'no byte waited at all')
-
-
-@needs_next
-class SpeedRule(NextCase):
-    """The effective CPU speed follows NR 0x07 only on an edge where MREQ, IORQ and M1 are high and the DMA doesn't
-    hold the bus (zxnext:5714, dma_holds_bus = BUSAK, 1784). Between a DMA write's WRITE_4 and the next READ_1 no
-    strobe is low, so without the last term a speed change would land mid-transfer, and the DMA, clocked by the CPU
-    clock, would speed up (Speccy-Zone's review)."""
-
-    def test_a_speed_change_waits_for_the_dma_to_let_go(self):
-        # the DMA itself writes 3 to NR 0x07, four times, through port 0x253B: every byte stays at 3.5 MHz (8 t28
-        # a clock, 6 clocks a byte), and the change lands once the CPU has the bus again
-        n = 4
-        zx = bare()
-        zx.io_out(0x243B, 0x07)
-        io, dma, clocks, t28 = run_enabled(zx, regs(n, dst=0x253B, b_io=True, b_inc=2), bytes([3] * n))
-        stamps = [e[0] for e in dma]
-        self.assertEqual(len(stamps), 2 * n)
-        self.assertEqual([b - a for a, b in zip(stamps, stamps[1:])], [24] * (2 * n - 1))
-        self.assertEqual(zx.nr_read(0x07) >> 4 & 3, 3)
+    def test_p3_waits_on_the_falling_edge(self):
+        """+3 timing: WAIT, not a held clock (zxula.vhd:600). The DMA samples it
+        on the falling edge (dma:139-145), so an n-clock cycle starting at odd q
+        looks at hc q + 2(n-1), one T-state off the CPU's sample: its pattern
+        runs 7..0 from q = 15 mod 16 (nextref.p3_dma_run). Each wait is a clock."""
+        L, N, *_ = ref.TIMINGS[('p3', 50)]
+        mem = ref.P3Contention('p3', self.MMU, L, N).mem
+        for a_t, b_t, r, w in [(None, None, 3, 3), (T2, T2, 2, 2), (T4, T2, 4, 2)]:
+            with self.subTest(read=r, write=w):
+                q, v, ev = self.block('p3', a_t=a_t, b_t=b_t)
+                per = [c for i in range(64) for c in [(0x4000 + i, r), (0x8800 + i, w)]]
+                want = [ref.p3_dma_run(q, v, per[:j], mem, L, N) for j in range(128)]
+                got = [e[1] - ev[0][1] for e in ev]
+                self.assertEqual(got, want, f'cpu_clocks from the first cycle, from hc_ula {q} row {v}')
+                self.assertEqual([e[0] - ev[0][0] for e in ev], [8 * c for c in want],
+                                 'a wait is a whole clock: no held clocks under +3')
+                self.assertGreater(got[-1], (r + w) * 64 - w, 'some waits')
 
 
-@needs_next
-class Gaps(NextCase):
-    """Behaviour Speccy-Zone's mutants found no test for (dma-mutants-run1-18fad66.log)."""
-
-    def test_z80_mode_auto_restart_moves_one_more_every_block(self):
-        # FINISH reloads the counter with FFFF in Z80-DMA mode too (dma:482-486): n + 1 bytes a block, every block
-        n = 3
-        zx = bare()
-        data = bytes(range(50, 60))
-        program(zx, regs(n, wr5=0xA2), port=0x0B)
-        zx.load(SRC, data)
-        code, end = enabler(port=0x0B)
-        zx.load(CODE, code)
-        launch(zx, CODE)
-        assert zx.run_until_pc(CODE, max_ticks=10**6)
-        zx.io_log(True)
-        zx.dma_log(True)
-        zx.run_ticks(8 * 150)
-        tw, cw = zx.io_events[0][:2]
-        want = []
-        for b in range(4):
-            want += expected_copy(cw, tw, n + 1, data=data, first=7 + (6 * (n + 1) + 2) * b)
-        self.assertEqual(zx.dma_events[:len(want)], want)
-
-    def test_wr0_with_bits_1_0_equal_to_10_is_still_wr0(self):
-        # WR0 is any base byte with b7 = 0 and b1:0 not 00 (dma:514); 10 and 11 "behave like transfer"
-        n = 4
-        zx = bare()
-        w = regs(n)
-        w[1] = (w[1] & 0xFC) | 0x02
-        io, dma, clocks, t28 = run_enabled(zx, w, bytes(range(1, 9)))
-        tw, cw = io[0][:2]
-        self.assertEqual(dma, expected_copy(cw, tw, n, data=bytes(range(1, 9))))
-
-    def test_c3_puts_both_ports_back_to_three_clocks(self):
-        # WR6 C3 sets both timing bytes to 01 (dma:640-641): 2-clock timings written before it don't survive
-        n = 3
-        zx = bare()
-        io, dma, clocks, t28 = run_enabled(zx, [0x54, 0x02, 0x50, 0x02] + regs(n), bytes(range(1, 9)))
-        tw, cw = io[0][:2]
-        self.assertEqual(dma, expected_copy(cw, tw, n, 3, 3, data=bytes(range(1, 9))))
-
-    def test_48k_the_write_after_a_contended_port_read_is_checked_like_a_t1(self):
-        # keyboard port 00FE -> bank 5 (contended under 48K timing), in the paper. The read's address is in ROM's
-        # page and its port term never comes; by WRITE_1 the I/O strobe was cancelled at READ_4's falling edge, so
-        # ioreqtw3_n and mreq23_n are high and WRITE_1 gets the memory term: held as the ULA holds a T1 there
-        import nextref as ref
-        from test_next_timing import goto_line
-        n = 24
-        zx = bare(timing='48k')
-        program(zx, regs(n, src=0x4000, dst=0x00FE, atob=False, b_io=True, b_inc=2))
-        code, end = enabler(nops=300)
-        zx.load(CODE, code)
-        L, N = ref.TIMINGS[('48k', 50)][:2]
-        goto_line(zx, '48k', 50, 40)
-        launch(zx, CODE)
-        assert zx.run_until_pc(CODE, max_ticks=10**6)
-        t0, pos0 = zx.t28, zx.vc_ula * L + zx.hc_ula
-        zx.dma_log(True)
-        assert zx.run_until_pc(end, max_ticks=10**7)
-        dma = zx.dma_events
-        cont = ref.Contention('48k', [0, 0, 10, 11, 4, 5, 0, 1], L, N)
-
-        def held(t):                                    # a check in the T-state that begins at the edge after t28 t
-            pos = (pos0 + (t - t0) // 4) % (L * N)
-            return cont.holds(pos % L + 1, pos // L)
-
-        t, want = dma[0][0], []
-        for i in range(n):
-            want.append((t, 'ir', 0x00FE))
-            w = t + 24
-            want.append((w, 'mw', 0x4000 + i))
-            t = w + 8 * (3 + held(w))
-        self.assertEqual([(e[0], e[2], e[3]) for e in dma], want)
-        self.assertTrue(any(held(e[0]) for e in dma if e[2] == 'mw'), 'no write was held at all')
-
-    def test_status_mid_block_shows_at_least_one(self):
-        # T is set at each WRITE_4 (dma:415) and cleared only in IDLE (dma:264): in a burst-mode wait, with the block
-        # under way, the status reads 00 1 1101 1 = 3B; after the block, 1A
-        n = 4
-        zx = bare()
-        program(zx, regs(n, presc=7, mode=2) + [0xBB, 0x01])
-        code = bytes([0x3E, 0x87, 0xD3, 0x6B, 0x00, 0x00, 0xDB, 0x6B, 0x32, 0x00, 0xA1] + [0x00] * 200 + [0x18, 0xFE])
-        zx.load(CODE, code)                             # OUT (6Bh),87h; NOP; NOP; IN A,(6Bh); LD (A100h),A; NOPs
-        launch(zx, CODE)
-        assert zx.run_until_pc(CODE, max_ticks=10**6)
-        zx.dma_log(True)
-        assert zx.run_until_pc(CODE + 11 + 200, max_ticks=10**6)
-        reads = [e[1] for e in zx.dma_events if e[2] == 'mr']
-        self.assertEqual(len(reads), n)
-        self.assertEqual(zx.peek(0xA100), 0x3B)
-        self.assertEqual(zx.io_in(0x6B), 0x1A)
+if __name__ == '__main__':
+    unittest.main()

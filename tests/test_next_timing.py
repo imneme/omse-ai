@@ -328,9 +328,10 @@ class Contention48(NextCase):
     """§1.5: 48K timing, 3.5 MHz, from every phase of the pattern."""
 
     TIMING = '48k'
+    MODEL = ref.Contention
 
     def check(self, setup, body, per, name, mmu=MMU0, regs=None, line=8, prefixes=range(8),
-              reps=REPS, addr=CODE, at_hc=0):
+              reps=REPS, addr=CODE, at_hc=0, anchor=True):
         L, N, *_ = ref.TIMINGS[(self.TIMING, 50)]
         total_dt = total_plain = 0
         contended = False
@@ -348,7 +349,7 @@ class Contention48(NextCase):
                             f'{name}: the lone access must start in the pixel area '
                             f'(it started at hc_ula {q}, row {v})')
             events = [ev for i in range(reps) for ev in per(addr + s + i * len(body))]
-            want = ref.Contention(self.TIMING, mmu, L, N).run(q, v, events)
+            want = self.MODEL(self.TIMING, mmu, L, N).run(q, v, events)
             self.assertEqual(dt, 8 * want, f'{name}, prefix {k}, from hc_ula {q} row {v}: '
                                            f'{dt} ticks, the ULA rule says {8 * want}')
             total_dt += dt
@@ -357,7 +358,7 @@ class Contention48(NextCase):
             contended |= any(c.mem(e[1] if e[0] == 'io' else e[0] or 0) or
                              (e[0] == 'io' and ref.port_contended(self.TIMING, e[1]))
                              for e in per(addr + s) if e[0] is not None)
-        if contended and len(prefixes) > 1:             # one access from one phase may miss
+        if anchor and contended and len(prefixes) > 1:  # one access from one phase may miss
             self.assertGreater(total_dt, 8 * total_plain, f'{name}: no contention at all')
 
     def test_reads(self):                               # LD A,(HL): pc:4, hl:3
@@ -478,6 +479,51 @@ class Contention128(Contention48):
         self.check([0x01, 0xFD, 0x1F, 0xAF], [0xED, 0x79],
                    lambda pc: [(pc, 4), (pc + 1, 4), ('io', 0x1FFD)],
                    'OUT (C),A to 1FFD: port_7ffd excludes it (zxnext:2552)')
+
+
+@needs_next
+class ContentionP3Exact(Contention48):
+    """Gap #5: +3 timing's exact WAIT delay from all eight phases, by the
+    P3Contention model (nextref; derived from zxula.vhd:582-600 and T80N's
+    WAIT sampling, matching the documented +3 pattern 1,0,7,6,5,4,3,2)."""
+
+    TIMING = 'p3'
+    MODEL = ref.P3Contention
+    test_io_four_cases = test_one_ula_port_access_from_every_phase = None
+    test_contention_follows_the_page_not_the_address = test_upper_half_of_bank_5 = None
+    test_off_above_3_5_mhz = test_off_by_nr08_bit6 = test_none_under_pentagon_timing = None
+    test_rows_from_192_are_not_contended = test_t2_is_never_checked_from_32_starting_points = None
+
+    def test_internal_cycles_by_address(self):         # +3 never waits on internal T-states
+        self.check([0x01, 0x00, 0x80], [0x23], lambda pc: [(pc, 4), (0x4000, 1), (0x4000, 1)],
+                   'INC HL, IR in bank 5 under +3: no WAIT', regs={'i': 0x40}, prefixes=[0, 3],
+                   anchor=False)
+
+    def test_single_reads_across_the_whole_line(self):
+        """One LD A,(HL) from bank 5, launched from every reachable pixel of row 8:
+        each must match the model, including reads whose T2 ends at pixel 0 (waits:
+        hc 0 is in the window) and at pixel 256 (no wait: hc(8) = 1, zxula.vhd:583).
+        WAIT_n is sampled at the rising edge ending T2, where hc is still the even
+        pixel before it (T80na passes WAIT_n straight to T80N, t80na.vhd:193; hc and
+        the CPU clock both launch on the same 28 MHz edge, zxnext_top_issue2.vhd:1074-1151)."""
+        L, N, *_ = ref.TIMINGS[('p3', 50)]
+        ends = set()
+        for at in range(0, L - 1, 2):
+            for k in range(8):
+                zx = bare(timing='p3')
+                code, s, e = program([0x21, 0x00, 0x40, 0x01, 0x00, 0x80], [0x7E], 1, prefix=k)
+                dt, dc, q, v = run_block(zx, CODE, code, CODE + s, CODE + e, 'p3', 50, 8, at)
+                p = (q + 11) % L                    # the read's T1 is q + 8; T2 ends p
+                want = ref.P3Contention('p3', MMU0, L, N).run(q, v, [(CODE + s, 4), (0x4000, 3)])
+                self.assertEqual(dt, 8 * want,
+                                 f'one LD A,(HL) launched at hc_ula {q} row {v}: its read\'s T2 '
+                                 f'ends at pixel {p}: {dt} ticks, the +3 WAIT rule says {8 * want}')
+                ends.add(p)
+        for p in (0, 2, 254, 256):                      # the window's two ends
+            self.assertIn(p, ends, f'no launch put the read\'s T2 end at pixel {p}')
+        self.assertEqual({p & 15 for p in ends if p < 256}, set(range(0, 16, 2)),
+                         'every phase in the picture (goto_line launches in steps, so not every '
+                         'pixel: Ratio found 4 and 8 never reached)')
 
 
 @needs_next

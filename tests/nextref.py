@@ -129,7 +129,9 @@ POWER_ON = {
     0xC6: (0x00, 'zxnext:5037-5038', 'zxnext:6151-6152'),
     0xC8: (0x00, 'no interrupt yet', 'zxnext:6154-6155'),
     0xC9: (0x00, 'no interrupt yet', 'zxnext:6157-6158'),
-    0xCA: (0x00, 'no interrupt yet', 'zxnext:6160-6161'),
+    0xCA: (0x44, 'both UARTs\' Tx-empty status: their Tx FIFOs are empty through reset, so the first '
+                 'clock after it sees a rising request (im2_int_req, zxnext line 1900; im2p:93-101, 156-160); writes clear '
+                 '(zxnext:1911-1914)', 'zxnext:6160-6161'),
     0xCC: (0x00, 'zxnext:5040-5041', 'zxnext:6163-6164'),
     0xCD: (0x00, 'zxnext:5042', 'zxnext:6166-6167'),
     0xCE: (0x00, 'zxnext:5043-5044', 'zxnext:6169-6170'),
@@ -562,3 +564,130 @@ class Contention:
         while self.q >= self.L:
             self.q -= self.L
             self.v = (self.v + 1) % self.N
+
+
+# +3 timing (gap #5): WAIT, not a stretched clock (zxula.vhd:600; window 582-583
+# with the hc_adj(3:1) = "000" term: hc(3:0) in 3..14, 15, 0). T80N holds T2
+# while WAIT_n = 0 at the edge ending T2 (Strobe, z80n/NOTES.md:206-208); that
+# edge ends the even pixel p = T1's pixel + 3, so a memory cycle (MREQ low at T2)
+# waits once for each consecutive even p, p+2, ... with p & 15 in P3_WAIT.
+# Internal T-states and I/O never wait. By T1's phase 1,3,...,15: 7,6,5,4,3,2,1,0,
+# the documented +3 pattern 1,0,7,6,5,4,3,2 rotated.
+P3_WAIT = {0, 4, 6, 8, 10, 12, 14}
+
+
+class P3Contention(Contention):
+
+    def waits(self, p, v):
+        if not self.enabled or v >= 192:
+            return 0
+        k = 0
+        while p + 2 * k < 256 and ((p + 2 * k) & 15) in P3_WAIT:
+            k += 1
+        return k
+
+    def run(self, q, v, events):
+        assert q & 1, f'a 3.5 MHz T-state starts on an odd hc_ula, not {q}'
+        self.q, self.v, total = q, v, 0
+        for e in events:
+            n = 4 if e[0] == 'io' else e[1]
+            if e[0] not in (None, 'io') and n >= 3 and self.mem(e[0]):
+                total += 2
+                self.advance(4)                     # T1, T2
+                w = self.waits(self.q - 1, self.v)  # the even pixel ending T2
+                total += w + n - 2
+                self.advance(2 * (w + n - 2))
+            else:
+                total += n
+                self.advance(2 * n)
+        return total
+
+
+# The zxnDMA (device/dma.vhd; DESIGN.md §9.1 (16)). Clocked by the CPU clock.
+DMA_TIMING = {0b00: 4, 0b01: 3, 0b10: 2, 0b11: 4}      # timing byte bits 1:0 -> clocks (dma:310-324)
+DMA_STATUS_IDLE, DMA_STATUS_ENDED = 0x3A, 0x1A          # 00E1101T (dma:902); IDLE clears T (dma:265)
+
+
+def dma_block_bytes(length, z80_mode=False):
+    """Bytes a block moves: LOAD sets the counter to 0 (zxnDMA) or FFFF (Z80 mode),
+    WRITE_1 adds one, and WRITE_4 goes on while counter < length, unsigned
+    (dma:661-676, 361, 426). So 0 and 1 both move one byte; Z80 mode one more."""
+    if z80_mode:
+        return length + 1 if length else 1
+    return max(length, 1)
+
+
+def dma_period(r, w, prescaler, m):
+    """CPU clocks from one byte's READ_1 entry to the next, in continuous mode
+    (the bus kept), for read and write cycles of r and w clocks and m t28 per
+    clock (8, 4, 2, 1 at 3.5, 7, 14, 28 MHz). Edge E0 enters READ_1; at E1 the
+    timer is cleared (dma:309); after that it gains m a clock (dma:250-255), so
+    before edge k it holds m(k-2). WRITE_4 finishes at E(r+w) and waits if
+    prescaler > timer(13:5) (dma:424); WAITING_CYCLES leaves at the first edge
+    whose timer(13:5) >= prescaler (dma:451) for WAITING_ACK, and READ_1 follows
+    one clock later (dma:285-299)."""
+    k = r + w
+    if not prescaler or (m * (k - 2)) >> 5 >= prescaler:
+        return k
+    k += 1
+    while (m * (k - 2)) >> 5 < prescaler:
+        k += 1
+    return k + 1
+
+
+P3_DMA_WAIT = {3, 5, 7, 9, 11, 13, 15}                  # the +3 window (zxula.vhd:583) at odd hc
+
+
+def p3_dma_run(q, v, cycles, contended, line_len, lines):
+    """CPU clocks for DMA bus cycles under +3 timing at 3.5 MHz, from the odd
+    hc_ula q where the first starts. cycles: (addr, n clocks); contended(addr).
+    The DMA samples WAIT on the CPU clock's falling edge (dma:139-145), the step
+    from an odd hc to the even one after it, and tests it in READ_4/WRITE_4
+    (dma:342, 410): so an n-clock cycle's sample sees hc q + 2(n-1), and each
+    wait clock looks again 2 pixels on. WAIT is MREQ, a contended page and the
+    window (zxula.vhd:583, 600): memory only, odd hc 3..15 of each 16, hc < 256,
+    rows 0-191. One T-state off the CPU's own sample (the edge ending T2)."""
+    assert q & 1
+    total = 0
+    for addr, n in cycles:
+        k = 0
+        if addr is not None and contended(addr):
+            p, pv = q + 2 * (n - 1), v                  # the sample may be on the next row
+            while p >= line_len:                        # (Kelp's catch: hc 455 + 6 is hc 5 below)
+                p, pv = p - line_len, (pv + 1) % lines
+            if pv < 192:
+                while p + 2 * k < 256 and ((p + 2 * k) & 15) in P3_DMA_WAIT:
+                    k += 1
+        total += n + k
+        q += 2 * (n + k)
+        while q >= line_len:
+            q, v = q - line_len, (v + 1) % lines
+    return total
+
+
+def dma_burst_reads(first, n, r, w, prescaler, m, mcycles, j):
+    """READ_1 stamps (cpu_clocks) of an n-byte burst transfer with a due
+    prescaler, the first at `first`, while the CPU runs a sled whose M-cycles
+    repeat with lengths `mcycles`, frozen at the end of M-cycle j at the first
+    grant. Per byte from its READ_1 edge E0: WAITING_CYCLES releases BUSRQ at
+    E(r+w+1) (dma:441-447); the T80N samples it at E(r+w+2) and at E(r+w+3)
+    drops BUSAK and starts its next M-cycle (t80n:1661-1663, 1738-1752). The
+    DMA leaves WAITING at E_k (dma:451), asks again at E(k+1) (dma:269-283);
+    the T80N sees it at E(k+2) and grants only where an M-cycle ends, T_Res,
+    internal M-cycles too (t80n:1742-1747); READ_1 is the edge after.
+    Returns (stamps, the M-cycle index at each later grant)."""
+    assert (m * (r + w - 2)) >> 5 < prescaler, 'the prescaler must be due at WRITE_4'
+    stamps, grants = [first], []
+    for _ in range(n - 1):
+        k = r + w + 1
+        while (m * (k - 2)) >> 5 < prescaler:
+            k += 1
+        t = r + w + 3                                   # the CPU's next M-cycle starts here
+        while True:
+            j = (j + 1) % len(mcycles)
+            t += mcycles[j]                             # the edge that ends it
+            if t >= k + 3:
+                break
+        grants.append(j)
+        stamps.append(stamps[-1] + t + 1)
+    return stamps, grants
