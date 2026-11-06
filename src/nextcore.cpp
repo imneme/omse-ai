@@ -121,6 +121,12 @@ struct ZXN {
     uint16_t int_status = 0;            // each source's status (im2p:150-160), bit = source number
     uint16_t im2_req = 0;               // hardware IM2: pending until its service ends (im2p:162-176)
     uint8_t im2_state[14] = {0};        // im2_device.vhd: 0 idle, 1 requesting, 2 acknowledged, 3 in service
+    struct Ctc {                        // ctc_chan.vhd: one channel
+        uint8_t state = 0;              // 0 reset, 1 reset awaiting a time constant, 2 trigger, 3 run, 4 run awaiting one
+        uint8_t ctrl = 0;               // the control word's bits 7:3 (b4 int enable, b3 counter, b2 /256, b1 rising, b0 trigger)
+        uint8_t tc = 0, count = 0, p = 0;   // time constant, down counter, prescaler
+        bool trg_d = false, zc_d = false, edge_change = false;
+    } ctc[4];
 
     // time and the beam
     uint64_t t28 = 0, cpu_clocks = 0, frame = 0;
@@ -363,6 +369,7 @@ void do_reset(ZXN& z, bool hard);
 inline bool locked(const ZXN& z);
 void int_raise(ZXN& z, int i, bool unq);
 inline uint16_t int_status(const ZXN& z);
+void ctc_write(ZXN& z, int n, uint8_t v);
 
 int nr_read(ZXN& z, int n) {
     switch (n) {
@@ -392,6 +399,11 @@ int nr_read(ZXN& z, int n) {
             return ((st & 1) << 7) | (((st >> 11) & 1) << 6) | ((st >> 3) & 0x0F);
         }
         case 0xC6: return z.nr[0xC6] & 0x77;                          // (zxnext:6151-6152)
+        case 0xC5: {
+            int v = 0;
+            for (int n = 0; n < 4; n++) v |= ((z.ctc[n].ctrl >> 4) & 1) << n;
+            return v;
+        }
         case 0xC8: { const uint16_t st = int_status(z); return ((st & 1) << 1) | ((st >> 11) & 1); }   // (6154-6155)
         case 0xC9: return (int_status(z) >> 3) & 0xFF;                // CTC 7-0 (6157-6158)
         case 0xCA: {                                                  // the UARTs (6160-6161)
@@ -434,8 +446,9 @@ void nr_write(ZXN& z, int n, int v) {
             z.nr[n] = v & 0x7F;
             remap(z);
             return;
-        case 0xC5:                                                    // four CTC channels: b7:4 aren't there
-            z.nr[0xC5] = v & 0x0F;                                    // (zxnext:4030, 6148-6149; ref §9 D-5)
+        case 0xC5:                                                    // each channel's interrupt enable (control b7):
+            for (int n = 0; n < 4; n++)                               // four channels, b7:4 aren't there (zxnext:4020-4021,
+                z.ctc[n].ctrl = (z.ctc[n].ctrl & ~0x10) | (((v >> n) & 1) << 4);   // 4030, 6148-6149; ref §9 D-5)
             return;
         case 0x09:                                                    // b3 clears divMMC's mapram, reads 0 (zxnext:4125-4126,
             if (v & 0x08) z.porte3 &= ~0x40;                          // 5820)
@@ -606,6 +619,7 @@ void do_reset(ZXN& z, bool hard) {
     z.reti_seen = false;
     z.int_status = z.im2_req = 0;
     memset(z.im2_state, 0, sizeof z.im2_state);
+    for (auto& c : z.ctc) c = ZXN::Ctc();                             // (ctc_chan.vhd: reset_hard)
     z.nr_sel = 0x24;
     z.ula_int_disabled = false;
     z.int_req = z.int_low = false;
@@ -659,6 +673,8 @@ uint8_t io_read(ZXN& z, uint16_t port) {
     }
     if ((port & 0xFF) == 0xFF) return floating_bus(z);                // always answered (ref §5.1)
     if ((port & 0xFF) == 0xEB && port_en(z, 11)) return z.spi_rx;     // the previous transfer's byte (ref §1.7)
+    if ((port & 0xF8FF) == 0x183B && port_en(z, 27))                  // the CTC: channel by A10:8, 4-7 answer 00
+        return ((port >> 8) & 7) < 4 ? z.ctc[(port >> 8) & 7].count : 0x00;    // (zxnext:2649, 2792; ctc:155-176)
     if ((port & 0xFF) == 0xE3 && dm_en(z)) return z.porte3 & 0xCF;    // divMMC (zxnext:2567, 4131)
     if (port == 0x123B && port_en(z, 15))                             // Layer 2 (zxnext:2594, 2781; the offset: unread)
         return (z.l2_seg << 6) | (z.l2_shadow << 3) | (z.l2_rd << 2) | (z.l2_en << 1) | z.l2_wr;
@@ -674,6 +690,7 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
         if ((v & 3) == 1 || (v & 3) == 2 || (flash_ok && (v == 0xFB || v == 0xF7 || v == 0x7F))) z.spi_cs = v;
         else z.spi_cs = 0xFF;
     }
+    if ((port & 0xF8FF) == 0x183B && port_en(z, 27) && ((port >> 8) & 7) < 4) ctc_write(z, (port >> 8) & 7, v);
     if (port == 0x123B && port_en(z, 15)) {                           // Layer 2's control (zxnext:3855-3864)
         if (v & 0x10) z.l2_off = v & 7;
         else {
@@ -791,13 +808,59 @@ inline void draw_pixel(ZXN& z) {
 
 // One rising edge of the CPU clock. Returns false (and changes nothing) if a run_until_pc stop is due: the CPU is
 // about to begin T1 of an instruction's first opcode fetch at an address in the range (DESIGN.md §9.1 (5)).
+// ---- the CTC (ctc_chan.vhd). A write to a channel waiting for a time constant stores it; otherwise bit 0 = 1 is a
+// control word (bit 1 resets the channel, bit 2 says a time constant follows) and bit 0 = 0 a vector (unused here).
+void ctc_write(ZXN& z, int n, uint8_t v) {
+    ZXN::Ctc& c = z.ctc[n];
+    if (c.state == 1 || c.state == 4) {                               // iowr_tc (ctc_chan:212-217, 240-247)
+        c.tc = v;
+        c.state = c.state == 1 ? 2 : 3;
+        return;
+    }
+    if (!(v & 1)) return;                                             // iowr_vc: the Z80 CTC's vector, ignored
+    if (((v >> 4) & 1) != ((c.ctrl >> 1) & 1)) c.edge_change = true;  // clk_edge_change (ctc_chan:262)
+    if (v & 2) c.state = (v & 4) ? 1 : 0;                             // a software reset (ctc_chan:150-156)
+    else if (v & 4) c.state = c.state == 3 ? 4 : (c.state == 0 || c.state == 2) ? 1 : c.state;
+    c.ctrl = v >> 3;
+    if (c.state == 0) { c.count = c.tc; c.p = 0; }                  // reset_soft loads them every cycle in reset, so
+}                                                                 // ctc_tick may skip a channel resting there
+// one 28 MHz cycle for every channel (ctc_chan:91-139, 176-185); channel n is triggered by channel n-1's ZC/TO,
+// channel 0 by channel 3's (zxnext:4026). A channel's ZC/TO, a cycle late, is interrupt source 3 + n.
+void int_raise(ZXN& z, int i, bool unq);
+void ctc_tick(ZXN& z) {
+    bool busy = false;
+    for (const auto& c : z.ctc) busy |= c.state != 0 || c.zc_d || c.trg_d || c.edge_change;
+    if (!busy) return;                                                // all four held in reset: nothing moves
+    const bool trg[4] = {z.ctc[3].zc_d, z.ctc[0].zc_d, z.ctc[1].zc_d, z.ctc[2].zc_d};
+    bool zc[4];
+    for (int n = 0; n < 4; n++) {
+        ZXN::Ctc& c = z.ctc[n];
+        const bool edge = ((c.ctrl & 2) ? (trg[n] && !c.trg_d) : (c.trg_d && !trg[n])) || c.edge_change;
+        c.edge_change = false;
+        c.trg_d = trg[n];
+        const bool soft = c.state != 3 && c.state != 4;               // reset_soft
+        const bool pclk = (c.ctrl & 4) ? c.p == 0xFF : (c.p & 15) == 15;
+        const bool en = (c.ctrl & 8) ? edge : pclk;                   // counter mode: the trigger; timer: the prescaler
+        const uint8_t next = c.count - 1;
+        zc[n] = next == 0 && en && !soft;
+        c.p = soft ? 0 : c.p + 1;
+        if (soft || zc[n]) c.count = c.tc;
+        else if (en) c.count = next;
+        if (c.state == 2 && !(!(c.ctrl & 8) && (c.ctrl & 1) && !edge)) c.state = 3;   // a timer may wait for a trigger
+    }
+    for (int n = 0; n < 4; n++) {
+        if (zc[n] && !z.ctc[n].zc_d) int_raise(z, 3 + n, false);      // the request's edge (im2p:118-131)
+        z.ctc[n].zc_d = zc[n];
+    }
+}
+
 // ---- the interrupt controller (ref §6; zxnext:1887-1958). Fourteen sources by priority, the number also the vector's
 // middle bits: 0 line, 1 UART0 Rx, 2 UART1 Rx, 3-10 CTC 0-7, 11 ULA, 12 UART0 Tx, 13 UART1 Tx.
 inline bool hw_im2(const ZXN& z) { return z.nr[0xC0] & 1; }          // NR 0xC0 b0: hardware IM2 mode
 inline bool int_en(const ZXN& z, int i) {                             // im2_int_en (zxnext:1908-1909)
     if (i == 0) return z.nr[0x22] & 2;                                // the line interrupt (NR 0x22 b1 / NR 0xC4 b1)
     if (i == 11) return !(z.portff & 0x40);                           // the ULA (port FF b6, NR 0x22 b2, NR 0xC4 b0)
-    if (i >= 3 && i <= 10) return (z.nr[0xC5] >> (i - 3)) & 1;        // the CTC
+    if (i >= 3 && i <= 10) return i <= 6 && (z.ctc[i - 3].ctrl & 0x10);   // the CTC's control word b7 (ctc_int_en)
     if (i == 1) return z.nr[0xC6] & 0x03;                             // the UARTs (NR 0xC6)
     if (i == 2) return z.nr[0xC6] & 0x30;
     if (i == 12) return z.nr[0xC6] & 0x04;
@@ -1108,6 +1171,7 @@ bool master_tick(ZXN& z) {
         }
         draw_pixel(z);
     }
+    ctc_tick(z);
     z.t28++;
     return true;
 }
