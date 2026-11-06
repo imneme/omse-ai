@@ -369,6 +369,7 @@ typedef struct {
     uint16_t af2, bc2, de2, hl2; // shadow register bank
     uint8_t im;
     bool iff1, iff2;
+    bool z80n;          // the ZX Spectrum Next's Z80N: its extra ED instructions (off: a Zilog Z80)
 } z80_t;
 
 // initialize a new Z80 instance and return initial pin mask
