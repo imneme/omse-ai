@@ -931,95 +931,136 @@ def blank_mask(v):
 
 # ---------------------------------------------------------------------------- sprites
 
+LINE_HC = {'48k': 448, '128k': 456, 'p3': 456, 'pentagon': 448}   # c_max_hc + 1 (ulat:160, 196, 230, 262, 290)
+
+
+def sprite_budget(v):
+    """28 MHz cycles from one line reset to the next: whc reaches 511 once a line (ulat:476-490, sprites:517),
+    and CLK_28 is four CLK_7 periods in every video mode (one PLL, zxnext_top_issue2:938-941)."""
+    return 4 * LINE_HC[v.timing]
+
+
 def sprite_lines(v):
     """The sprites' line buffers for wvc 0..255: 256 lists of 320 entries, each None or an 8-bit index, as
     the renderer draws them in the line before (spr_cur_vcount = vcounter + 1, sprites:539), sprite 0 to 127
-    (sprites:841-866), later writers winning unless NR 0x15 bit 6 puts sprite 0 on top (sprites:972)."""
+    (sprites:841-866), later writers winning unless NR 0x15 bit 6 puts sprite 0 on top (sprites:972), and
+    within the line's time (sprite_budget; what doesn't fit is never drawn, sprites:831-832)."""
+    return [_sprite_line(v, row)[0] for row in range(256)]
+
+
+def sprite_status(v):
+    """Port 0x303B after one whole frame since the last read (sprites:974-995): bit 1 if any line ran out of
+    time (sprites:977), bit 0 if a sprite pixel was written over another (sprites:991). The engine renders
+    row wvc + 1 in every line of the frame, wvc running from -2 (ulat:494-505), so rows 511, 0, 1, ..."""
+    lines = TIMING[v.timing][2][v.hz][0]
+    over = coll = 0
+    for k in range(lines):
+        _, o, c = _sprite_line(v, (511 + k) & 0x1FF)
+        over, coll = over | o, coll | c
+    return (over << 1) | coll
+
+
+def _sprite_line(v, wvc, owners=None):
+    """One sprite row: (320 entries, overtime, collision). Cycle 0 has line_reset_re = "01" (sprites:519-537),
+    S_START is cycle 1 (sprites:831-832, 898-900), sprite 0 qualifies in cycle 2; each sprite spends one cycle
+    in S_QUALIFY and, if drawn, one per S_PROCESS pixel (sprites:844-866, 951-956). Line buffers write on the
+    inverted clock and swap at the next line reset (sprites:470-501, 531-537), so a cycle up to and including
+    the budget's lands; overtime if the machine is not idle at the next reset (sprites:977). owners, if
+    given (320 entries), records which sprite wrote each pixel, for tests and diagnosis."""
     zero_on_top = (v.nr15 >> 6) & 1
     trans = v.nr4b
-    lines = [[None] * 320 for _ in range(256)]
-    for wvc in range(256):
-        line = lines[wvc]
-        anchor = dict(vis=0, x=0, y=0, pat=0, pal=0, rel_type=0, h=0, rot=0, xm=0, ym=0, xs=0, ys=0)  # S_START
-        for idx in range(128):
-            a0, a1, a2, a3, a4 = v.spr_attr[idx]
-            five = (a3 >> 6) & 1
-            relative = five and ((a4 >> 6) & 3) == 1                                  # sprites:756
-            if relative:                                                              # sprites:760-786
-                rx0, ry0 = (a1, a0) if anchor['rot'] else (a0, a1)
-                if anchor['rot'] ^ anchor['xm']:
-                    rx0 = (-rx0) & 0xFF
-                if anchor['ym']:
-                    ry0 = (-ry0) & 0xFF
+    budget = sprite_budget(v)
+    t = 2
+    collision = 0
+    line = [None] * 320
+    anchor = dict(vis=0, x=0, y=0, pat=0, pal=0, rel_type=0, h=0, rot=0, xm=0, ym=0, xs=0, ys=0)  # S_START
+    for idx in range(128):
+        if t > budget:                                                            # cut mid-list
+            return line, 1, collision
+        t += 1                                                                    # S_QUALIFY
+        a0, a1, a2, a3, a4 = v.spr_attr[idx]
+        five = (a3 >> 6) & 1
+        relative = five and ((a4 >> 6) & 3) == 1                                  # sprites:756
+        if relative:                                                              # sprites:760-786
+            rx0, ry0 = (a1, a0) if anchor['rot'] else (a0, a1)
+            if anchor['rot'] ^ anchor['xm']:
+                rx0 = (-rx0) & 0xFF
+            if anchor['ym']:
+                ry0 = (-ry0) & 0xFF
 
-                def scale(q, sc):
-                    q = q - 256 if q & 0x80 else q                                    # sign-extend
-                    return (q << sc) & 0x1FF
-                x = (anchor['x'] + scale(rx0, anchor['xs'])) & 0x1FF
-                y = (anchor['y'] + scale(ry0, anchor['ys'])) & 0x1FF
-                pal = (a2 >> 4) if not (a2 & 1) else ((anchor['pal'] + (a2 >> 4)) & 15)
-                if anchor['rel_type']:                                                # unified: the anchor's
-                    xm_own = ((a2 >> 2) ^ (a2 >> 1)) & 1 if anchor['rot'] else (a2 >> 3) & 1   # transforms join
-                    ym_own = ((a2 >> 3) ^ (a2 >> 1)) & 1 if anchor['rot'] else (a2 >> 2) & 1
-                    xm, ym, rot = anchor['xm'] ^ xm_own, anchor['ym'] ^ ym_own, anchor['rot'] ^ ((a2 >> 1) & 1)
-                    xs, ys = anchor['xs'], anchor['ys']
-                else:
-                    xm, ym, rot = (a2 >> 3) & 1, (a2 >> 2) & 1, (a2 >> 1) & 1
-                    xs, ys = (a4 >> 3) & 3, (a4 >> 1) & 3
-                vis = anchor['vis'] & (a3 >> 7)
-                h = anchor['h']
-                n6 = ((a4 >> 5) & 1) & h
-                pat = (((a3 & 0x3F) << 1) | n6)
-                if a4 & 1:                                                            # sprites:803
-                    pat = (pat + anchor['pat']) & 0x7F
+            def scale(q, sc):
+                q = q - 256 if q & 0x80 else q                                    # sign-extend
+                return (q << sc) & 0x1FF
+            x = (anchor['x'] + scale(rx0, anchor['xs'])) & 0x1FF
+            y = (anchor['y'] + scale(ry0, anchor['ys'])) & 0x1FF
+            pal = (a2 >> 4) if not (a2 & 1) else ((anchor['pal'] + (a2 >> 4)) & 15)
+            if anchor['rel_type']:                                                # unified: the anchor's
+                xm_own = ((a2 >> 2) ^ (a2 >> 1)) & 1 if anchor['rot'] else (a2 >> 3) & 1   # transforms join
+                ym_own = ((a2 >> 3) ^ (a2 >> 1)) & 1 if anchor['rot'] else (a2 >> 2) & 1
+                xm, ym, rot = anchor['xm'] ^ xm_own, anchor['ym'] ^ ym_own, anchor['rot'] ^ ((a2 >> 1) & 1)
+                xs, ys = anchor['xs'], anchor['ys']
             else:
-                x = ((a2 & 1) << 8) | a0                                              # sprites:799
-                y = ((five & a4 & 1) << 8) | a1                                       # sprites:796-797
-                pal = a2 >> 4
                 xm, ym, rot = (a2 >> 3) & 1, (a2 >> 2) & 1, (a2 >> 1) & 1
-                xs, ys = ((a4 >> 3) & 3, (a4 >> 1) & 3) if five else (0, 0)          # sprites:807, 907-915
-                vis = a3 >> 7
-                h = ((a4 >> 7) & 1) & five                                            # sprites:801
-                n6 = ((a4 >> 6) & 1) & h                                              # sprites:802
-                pat = ((a3 & 0x3F) << 1) | n6
-                unified = five and (a4 >> 5) & 1
-                anchor = dict(vis=vis, x=x, y=y, pat=pat, pal=pal, rel_type=five & ((a4 >> 5) & 1),
-                              h=h, rot=rot if unified else 0, xm=xm if unified else 0,
-                              ym=ym if unified else 0, xs=xs if unified else 0,
-                              ys=ys if unified else 0)                                # sprites:929-950
-            yoff = (wvc - y) & 0x1FF                                                  # sprites:806-810
-            if ys:
-                yoff = ((yoff - 512 if yoff & 0x100 else yoff) >> ys) & 0x1FF
-            if not vis or (yoff >> 4) != 0:                                           # sprites:842, 918
-                continue
-            yi = (yoff & 15) ^ (15 if ym else 0)                                      # sprites:811
-            xme = xm ^ rot                                                            # sprites:813
-            xi = 15 if xme else 0
-            addr = ((pat >> 1) << 8) | ((xi << 4) | yi if rot else (yi << 4) | xi)    # sprites:816
-            delta = {(1, 1): -16, (1, 0): -1, (0, 1): 16, (0, 0): 1}[(xme, rot)]      # sprites:817-820
-            step = 8 >> xs                                                            # sprites:907-915
-            wrap = (0x1F << xs) & 0x1F                                                # sprites:919-927
-            hc, count = x, 0
-            while True:                                                               # S_PROCESS
-                if count & 0x80:
-                    break
-                if hc >= 320 and ((hc >> 4) & wrap) != wrap:                          # sprites:855
-                    break
-                a = addr & 0x3FFF
-                if h:                                                                 # 4-bit (sprites:962-968)
-                    byte = v.spr_pat[(a & 0x3F00) | ((pat & 1) << 7) | ((a & 0xFF) >> 1)]
-                    nib = (byte & 15) if (a & 1) else (byte >> 4)
-                    pix, opaque = (pal << 4) | nib, nib != (trans & 15)
-                else:
-                    byte = v.spr_pat[a]
-                    pix, opaque = ((((byte >> 4) + pal) & 15) << 4) | (byte & 15), byte != trans
-                if hc < 320 and opaque and (not zero_on_top or line[hc] is None):     # sprites:971-972
+                xs, ys = (a4 >> 3) & 3, (a4 >> 1) & 3
+            vis = anchor['vis'] & (a3 >> 7)
+            h = anchor['h']
+            n6 = ((a4 >> 5) & 1) & h
+            pat = (((a3 & 0x3F) << 1) | n6)
+            if a4 & 1:                                                            # sprites:803
+                pat = (pat + anchor['pat']) & 0x7F
+        else:
+            x = ((a2 & 1) << 8) | a0                                              # sprites:799
+            y = ((five & a4 & 1) << 8) | a1                                       # sprites:796-797
+            pal = a2 >> 4
+            xm, ym, rot = (a2 >> 3) & 1, (a2 >> 2) & 1, (a2 >> 1) & 1
+            xs, ys = ((a4 >> 3) & 3, (a4 >> 1) & 3) if five else (0, 0)          # sprites:807, 907-915
+            vis = a3 >> 7
+            h = ((a4 >> 7) & 1) & five                                            # sprites:801
+            n6 = ((a4 >> 6) & 1) & h                                              # sprites:802
+            pat = ((a3 & 0x3F) << 1) | n6
+            unified = five and (a4 >> 5) & 1
+            anchor = dict(vis=vis, x=x, y=y, pat=pat, pal=pal, rel_type=five & ((a4 >> 5) & 1),
+                          h=h, rot=rot if unified else 0, xm=xm if unified else 0,
+                          ym=ym if unified else 0, xs=xs if unified else 0,
+                          ys=ys if unified else 0)                                # sprites:929-950
+        yoff = (wvc - y) & 0x1FF                                                  # sprites:806-810
+        if ys:
+            yoff = ((yoff - 512 if yoff & 0x100 else yoff) >> ys) & 0x1FF
+        if not vis or (yoff >> 4) != 0:                                           # sprites:842, 918
+            continue
+        yi = (yoff & 15) ^ (15 if ym else 0)                                      # sprites:811
+        xme = xm ^ rot                                                            # sprites:813
+        xi = 15 if xme else 0
+        addr = ((pat >> 1) << 8) | ((xi << 4) | yi if rot else (yi << 4) | xi)    # sprites:816
+        delta = {(1, 1): -16, (1, 0): -1, (0, 1): 16, (0, 0): 1}[(xme, rot)]      # sprites:817-820
+        step = 8 >> xs                                                            # sprites:907-915
+        wrap = (0x1F << xs) & 0x1F                                                # sprites:919-927
+        hc, count = x, 0
+        while True:                                                               # S_PROCESS: a cycle,
+            if t > budget:                                                        # then the exit test
+                return line, 1, collision
+            t += 1
+            a = addr & 0x3FFF
+            if h:                                                                 # 4-bit (sprites:962-968)
+                byte = v.spr_pat[(a & 0x3F00) | ((pat & 1) << 7) | ((a & 0xFF) >> 1)]
+                nib = (byte & 15) if (a & 1) else (byte >> 4)
+                pix, opaque = (pal << 4) | nib, nib != (trans & 15)
+            else:
+                byte = v.spr_pat[a]
+                pix, opaque = ((((byte >> 4) + pal) & 15) << 4) | (byte & 15), byte != trans
+            if hc < 320 and opaque:                                               # sprites:971
+                collision |= line[hc] is not None                                 # sprites:991
+                if not zero_on_top or line[hc] is None:                           # sprites:972
                     line[hc] = pix
-                nxt = count + step
-                if (nxt ^ count) & 8:                                                 # sprites:954-956
-                    addr += delta
-                count, hc = nxt, (hc + 1) & 0x1FF
-    return lines
+                    if owners is not None:
+                        owners[hc] = idx
+            nxt = count + step
+            if (nxt ^ count) & 8:                                                 # sprites:954-956
+                addr += delta
+            count, hc = nxt, (hc + 1) & 0x1FF
+            if count & 0x80 or (hc >= 320 and ((hc >> 4) & wrap) != wrap):        # sprites:855
+                break
+    return line, int(t > budget), collision
 
 
 def sprite_window(v):
