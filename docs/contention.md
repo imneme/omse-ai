@@ -31,15 +31,16 @@ This is a first cut: principled, documented and tested, but whole T-states only,
 Read, never copied: the emulators' and cores' source is GPL, and omse-ai is MIT.
 
 - **The documented model**: the "Contended memory" and "Contended I/O" articles of the World of Spectrum FAQ (the ZX Spectrum FAQ wiki, faqwiki.zxnet.co.uk), which give the 6,5,4,3,2,1,0,0 pattern, the 14,335 start, the four I/O cases and the per-instruction tables (`pc:4`, `hl:3`, `ir:1 ×2`). The Next's ULA cites the same page.
-- **The ZX Spectrum Next's ULA** (`cores/zxnext/src/video/zxula.vhd`), real logic, agrees term for term:
+- **The ZX Spectrum Next's ULA** (`cores/zxnext/src/video/zxula.vhd`, core 3.02.02), real logic, agrees on all but one port:
   - it contends when the address is in a contended page and the previous T-state had no MREQ (`mreq23_n`);
   - for the ULA's port, only on the first IORQ T-state (`ioreqtw3_n`);
   - in six of every eight T-states, in the first 128 of each line, outside the vertical border (`wait_s`);
   - with bank 5 contended on a 48K and the odd banks on a 128 (`zxnext.vhd`, `mem_contend`).
+  - **The exception:** under 128 timing the Next also treats every port that decodes as 7FFD (`zxnext.vhd`, `port_7ffd`: A15 low, A1 low, A0 high) as the ULA's own (`port_contend`, which includes the ULA+ ports too). So there `OUT (7FFDh)` is C:1, C:3 and `OUT (3FFDh)` is N:1, C:3, where the documented table, and omse-ai, give C:1 ×4 and N:4. Which a real 128 does is open. omse-ai follows the documented table until a real machine says otherwise. (An earlier version of this page said the Next agreed term for term, and missed this.)
 - **The Z80 core** (chips' `z80.h`, as OMSE has it): it clears its control pins every T-state, so a memory cycle's first T-state is the only one showing MREQ with RD or WR. Its I/O cycles raise IORQ from their first T-state (a real Z80 raises it from the second), so omse-ai counts I/O cycles by phase.
 - **OMSE** (Melissa O'Neill's emulator): it holds the CPU while the address on the bus is contended and the ULA is in the first six T-states of each eight, with "lockouts" so a cycle isn't contended twice.
   - **Agrees:** holding the clock, rather than adding T-states afterwards; contending internal T-states by the address the core leaves on the bus; the lockout after a memory T-state, which is the same as the Next's `mreq23_n`.
-  - **Differs:** OMSE locks out the two T-states after an I/O access, so a contended high byte with bit 0 set is checked twice (C:1, C:1), not four times (C:1 ×4) as the documented table and the Next both say. omse-ai follows them.
+  - **Differs:** OMSE locks out the two T-states after an I/O access, so a contended high byte with bit 0 set is checked twice (C:1, C:1), not four times (C:1 ×4) as the documented table says, and the Next too for every port but those that decode as 7FFD (above). omse-ai follows them.
 
 ## How it's checked
 
