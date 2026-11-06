@@ -519,8 +519,11 @@ class ContentionP3Exact(Contention48):
                                  f'one LD A,(HL) launched at hc_ula {q} row {v}: its read\'s T2 '
                                  f'ends at pixel {p}: {dt} ticks, the +3 WAIT rule says {8 * want}')
                 ends.add(p)
-        for p in (0, 2, 254, 256) + tuple(range(4, 16, 2)):
+        for p in (0, 2, 254, 256):                      # the window's two ends
             self.assertIn(p, ends, f'no launch put the read\'s T2 end at pixel {p}')
+        self.assertEqual({p & 15 for p in ends if p < 256}, set(range(0, 16, 2)),
+                         'every phase in the picture (goto_line launches in steps, so not every '
+                         'pixel: Ratio found 4 and 8 never reached)')
 
 
 @needs_next
