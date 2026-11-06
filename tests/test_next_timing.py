@@ -254,6 +254,17 @@ class Waits(NextCase):
         self.assertEqual(self.clocks(3, [0x7E], [0x21, 0x00, 0xE0], mmu={7: 0xE0}), 8,
                          'page >= 0xE0 in slots 2-7: no request (zxnext:3019-3020)')
 
+    def test_nextreg_extra_reads_wait_at_28_mhz(self):
+        """Strobe (the Z80N me), from t80n.vhd: NEXTREG's idle cycles are real
+        reads of the operand, so each gets the 28 MHz wait (zxnext:3128-3140).
+        NEXTREG r,v: 20 T, 26 clocks at 28 MHz; NEXTREG r,A: 17 T, 22."""
+        nr7f_v = [0xED, 0x91, 0x7F, 0x55]               # NEXTREG 7Fh,55h
+        nr7f_a = [0xED, 0x92, 0x7F]                     # NEXTREG 7Fh,A
+        self.assertEqual(self.clocks(0, nr7f_v), 20, 'NEXTREG r,v at 3.5 MHz')
+        self.assertEqual(self.clocks(0, nr7f_a), 17, 'NEXTREG r,A at 3.5 MHz')
+        self.assertEqual(self.clocks(3, nr7f_v), 26, 'NEXTREG r,v at 28 MHz')
+        self.assertEqual(self.clocks(3, nr7f_a), 22, 'NEXTREG r,A at 28 MHz')
+
     def test_slower_speeds_have_no_waits(self):
         ld_hl = [0x21, 0x00, 0xC0]
         for speed in (0, 1, 2):
