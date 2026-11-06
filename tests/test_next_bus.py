@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import nextref as ref                                   # noqa: E402,F401
-from test_next_regs import Next, needs_next, NextCase, bare  # noqa: E402
+from test_next_regs import Next, needs_next, NextCase, bare, park  # noqa: E402
 from test_next_timing import launch                      # noqa: E402
 from test_next_interrupts import reached                 # noqa: E402
 
@@ -30,7 +30,9 @@ def bus_on(zx, nr80=0x80):
 
 
 def run_code(zx, code, end_offset=None):
-    """Load code at CODE (then JR $), launch it, run to the JR."""
+    """Load code at CODE (then JR $), park the CPU (a run before may have left it
+    at its own JR $; Ratio's catch), launch, run to the JR."""
+    park(zx)
     zx.load(CODE, bytes(code) + bytes([0x18, 0xFE]))
     launch(zx, CODE)
     end = CODE + len(code)
