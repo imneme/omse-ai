@@ -53,6 +53,7 @@ def _load_lib():
         'zxn_nr_read': ([P, I], I), 'zxn_nr_write': ([P, I, I], None),
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
+        'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
     }
@@ -172,6 +173,26 @@ class Next:
         self.lib.zxn_set_keys(self.z, bytes(rows))
 
     border = property(lambda self: self.lib.zxn_border(self.z))
+
+    # the picture: the ULA's screen as drawn at the beam (352 x 288 at 7 MHz, indexed 0-15)
+    PALETTE = [(0, 0, 0), (0, 0, 0xD7), (0xD7, 0, 0), (0xD7, 0, 0xD7), (0, 0xD7, 0), (0, 0xD7, 0xD7), (0xD7, 0xD7, 0),
+               (0xD7, 0xD7, 0xD7), (0, 0, 0), (0, 0, 0xFF), (0xFF, 0, 0), (0xFF, 0, 0xFF), (0, 0xFF, 0), (0, 0xFF, 0xFF),
+               (0xFF, 0xFF, 0), (0xFF, 0xFF, 0xFF)]
+
+    def framebuffer(self):
+        w, h = self.lib.zxn_fb_width(), self.lib.zxn_fb_height()
+        return w, h, bytes((ctypes.c_uint8 * (w * h)).from_address(self.lib.zxn_framebuffer(self.z)))
+
+    def image(self, path=None, scale=2):
+        """The screen as a PIL image (scaled), saved to path if given."""
+        from PIL import Image
+        w, h, data = self.framebuffer()
+        im = Image.frombytes('P', (w, h), data)
+        im.putpalette([c for rgb in self.PALETTE for c in rgb])
+        im = im.convert('RGB').resize((w * scale, h * scale), Image.NEAREST)
+        if path:
+            im.save(path)
+        return im
 
     # logs
     @property

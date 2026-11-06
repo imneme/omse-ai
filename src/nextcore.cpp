@@ -35,6 +35,7 @@ namespace {
 
 constexpr uint32_t SRAM_SIZE = 2u << 20;          // 2 MB (issue 4, ref §3.2)
 constexpr int BRAM5_SIZE = 16384, BRAM7_SIZE = 8192, BOOTROM_SIZE = 8192;
+constexpr int FB_W = 352, FB_H = 288, FB_BORDER = 48;  // the visible area at 7 MHz, as zxcore's (48 pixels of border)
 
 // Video timing per machine timing and 50/60 Hz (ref §2.2): pixels a line, lines, the raw hc where the 256-wide area
 // starts (c_min_hactive), the raw line of pixel row 0 (c_min_vactive), the ULA interrupt's raw position, and the
@@ -89,6 +90,9 @@ struct ZXN {
     uint8_t port7ffd = 0, port1ffd = 0, portdffd = 0, porteff7 = 0, portff = 0;
     uint8_t border = 0;                 // port 0xFE bits 2:0 (ref §2.5)
     uint8_t keys[8] = {0};              // the keyboard matrix: half-row r (A8+r low), bit set = key down
+    uint8_t fb[FB_W * FB_H];            // indexed: 0-7, +8 for BRIGHT
+    int flash_count = 0;
+    bool flash_on = false;
     uint8_t nr[256];
     int nr_sel = 0x24;                  // port 0x243B resets to 0x24 (ref §4.1)
     bool ula_int_disabled = false;      // port 0xFF bit 6 and its aliases (ref §2.3)
@@ -436,6 +440,31 @@ inline bool p3_wait_now(const ZXN& z) {
     return (adj >= 4 || adj <= 1) && (h & 0x1FF) < 256 && v < 192;
 }
 
+// ---- the ULA screen, drawn at the beam (ref §2.5): pixel 0 of a line is hc_ula = 0x0C; the 256 x 192 area from
+// bank 5's block RAM (bank 7's with the shadow screen); the border from port 0xFE; FLASH every 16 frames, counted at
+// ULA position 0,0. APPROXIMATION: memory is read when the pixel is shown, not at its fetch slot 12 pixels earlier, so
+// a change inside that gap shows a pixel early (the shift-register model: later).
+inline void draw_pixel(ZXN& z) {
+    const int h = hc_ula(z), v = vc_ula(z);
+    if (h == 0 && v == 0 && ++z.flash_count == 16) { z.flash_count = 0; z.flash_on = !z.flash_on; }
+    const Timing& t = T(z);
+    int x = h - 12, y = v;
+    if (x >= 256 + FB_BORDER) x -= t.hc_len;                          // the left border wraps round from the line end
+    if (y >= 192 + FB_BORDER) y -= t.vc_len;
+    const int fx = x + FB_BORDER, fy = y + FB_BORDER;
+    if (fx < 0 || fx >= FB_W || fy < 0 || fy >= FB_H) return;
+    uint8_t c = z.border;
+    if (x >= 0 && x < 256 && y >= 0 && y < 192) {
+        const uint8_t* scr = (z.port7ffd & 8) ? z.bram7 : z.bram5;
+        uint8_t bits = scr[((y & 0xC0) << 5) | ((y & 7) << 8) | ((y & 0x38) << 2) | (x >> 3)];
+        uint8_t attr = scr[0x1800 + (y >> 3) * 32 + (x >> 3)];
+        bool on = (bits >> (7 - (x & 7))) & 1;
+        if ((attr & 0x80) && z.flash_on) on = !on;
+        c = (on ? (attr & 7) : ((attr >> 3) & 7)) | ((attr & 0x40) ? 8 : 0);
+    }
+    z.fb[fy * FB_W + fx] = c;
+}
+
 // ---- the clock
 
 // One rising edge of the CPU clock. Returns false (and changes nothing) if a run_until_pc stop is due: the CPU is
@@ -549,6 +578,7 @@ bool master_tick(ZXN& z) {
         }
         const Timing& t2 = T(z);
         if (z.hc == t2.int_h && z.vc == t2.int_v && !z.ula_int_disabled) z.int_req = true;
+        draw_pixel(z);
     }
     z.t28++;
     return true;
@@ -670,6 +700,9 @@ int zxn_nr_read(ZXN* z, int n) { return nr_read(*z, n & 0xFF); }
 void zxn_nr_write(ZXN* z, int n, int v) { nr_write(*z, n & 0xFF, v); }
 int zxn_io_in(ZXN* z, int port) { return io_read(*z, port & 0xFFFF); }
 void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
+uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
+int zxn_fb_width() { return FB_W; }
+int zxn_fb_height() { return FB_H; }
 int zxn_border(ZXN* z) { return z->border; }
 void zxn_io_out(ZXN* z, int port, int v) { io_write(*z, port & 0xFFFF, v & 0xFF); }
 
