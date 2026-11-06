@@ -316,6 +316,23 @@ class Lines(NextCase):
         bus_on(zx)
         self.assertTrue(reached(zx, 0x0038, 2 * F48))
 
+    def test_int_round_the_bus_is_two_ticks_late(self):
+        """Ruling (19) b: the loop is the VHDL's. zxnext drives o_BUS_INT_n with
+        its own interrupt (1654); top4 registers the pin drive on CLK_28 (1967,
+        1988) and registers the line back on CLK_28 (752, 1925), so the INT the
+        CPU samples (int_log, §9.1 (4)) comes two master ticks later, at both
+        ends, while the bus is on and NR C4h b7 routes INT through it."""
+        def first(nr80, c4=0x81):
+            zx = bare(timing='48k')
+            zx.nr_write(0xC4, c4)
+            zx.nr_write(0x80, nr80)
+            zx.run_ticks(2 * F48)
+            self.assertTrue(zx.int_log, 'an interrupt in two frames')
+            return zx.int_log[0]
+        s, e = first(0x00)
+        self.assertEqual(first(0x80), (s + 2, e + 2))
+        self.assertEqual(first(0x80, c4=0x01), (s, e), 'C4h b7 clear: INT from inside, no loop')
+
     def test_a_device_nmi(self):
         """nmi_assert_expbus: bus on, memory enabled, the line held (zxnext:2047),
         and not in config mode (2061)."""
