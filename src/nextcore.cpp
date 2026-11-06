@@ -211,7 +211,7 @@ inline void mem_write(ZXN& z, uint16_t a, uint8_t v) {
 
 // The legacy paging ports rewrite the MMU (ref §3.6; zxnext:4560-4625). (The hardware does it one 28 MHz cycle
 // after the write, port_memory_change_dly; here it's at once, inside the same I/O cycle.)
-void port_memory_change(ZXN& z, bool was_allram) {
+void port_memory_change(ZXN& z, bool was_allram, bool set_top = true) {
     if (z.port1ffd & 1) {                                             // all-RAM mode: four banks from 1FFD bits 2:1
         static const int BANKS[4][4] = {{0, 1, 2, 3}, {4, 5, 6, 7}, {4, 5, 6, 3}, {4, 7, 6, 3}};
         const int* b = BANKS[(z.port1ffd >> 1) & 3];
@@ -219,9 +219,21 @@ void port_memory_change(ZXN& z, bool was_allram) {
     } else {
         if (z.porteff7 & 8) { z.mmu[0] = 0x00; z.mmu[1] = 0x01; }     // EFF7 bit 3: RAM bank 0 over the ROM
         else { z.mmu[0] = z.mmu[1] = 0xFF; }
-        int bank = ((z.portdffd & 0x0F) << 3) | (z.port7ffd & 7);     // NR 0x8F mode 00 (Pentagon modes: later)
-        z.mmu[6] = (2 * bank) & 0xFF;
-        z.mmu[7] = (2 * bank + 1) & 0xFF;
+        int bank;
+        switch (z.nr[0x8F] & 3) {                                     // the paging mode, NR 0x8F (ref §3.6)
+            case 2: bank = ((z.port7ffd >> 3) & 0x18) | (z.port7ffd & 7); break;            // Pentagon 512
+            case 3:
+                if (!(z.porteff7 & 4)) {                                                      // Pentagon 1024
+                    bank = ((z.port7ffd & 0x20)) | ((z.port7ffd >> 3) & 0x18) | (z.port7ffd & 7);
+                    break;
+                }
+                [[fallthrough]];
+            default: bank = ((z.portdffd & 0x0F) << 3) | (z.port7ffd & 7);                    // standard
+        }
+        if (set_top) {
+            z.mmu[6] = (2 * bank) & 0xFF;
+            z.mmu[7] = (2 * bank + 1) & 0xFF;
+        }
         if (was_allram) {                                             // MMU2-5 come back only on leaving all-RAM
             z.mmu[2] = 0x0A; z.mmu[3] = 0x0B; z.mmu[4] = 0x04; z.mmu[5] = 0x05;
         }
@@ -241,6 +253,9 @@ int nr_read(ZXN& z, int n) {
         case 0x05: return z.nr[0x05];
         case 0x07: return (z.speed_eff << 4) | z.speed_prog;                                  // ref §1.3
         case 0x0F: return z.issue == 4 ? 0x02 : 0x00;
+        case 0x8E:                                                    // the same layout, bit 3 = 1 (zxnext 6065-6066)
+            return ((z.portdffd & 1) << 7) | ((z.port7ffd & 7) << 4) | 8 | ((z.port1ffd & 1) << 2) |
+                   ((z.port1ffd & 1) ? ((z.port1ffd >> 1) & 3) : (((z.port1ffd >> 1) & 2) | ((z.port7ffd >> 4) & 1)));
         default:
             if (n >= 0x50 && n <= 0x57) return z.mmu[n - 0x50];
             return z.nr[n];
@@ -281,6 +296,25 @@ void nr_write(ZXN& z, int n, int v) {
             return;
         case 0x07:
             z.speed_prog = v & 3;                                     // takes effect between bus cycles (ref §1.3)
+            return;
+        case 0x8E: {                                                  // the 128K paging state at once, ignoring the lock
+            bool was_allram = z.port1ffd & 1;
+            if (v & 8) {
+                z.port7ffd = (z.port7ffd & ~7) | ((v >> 4) & 7);
+                z.portdffd = (v >> 7) & 1;                            // clears DFFD's high bits
+            }
+            z.port1ffd = (z.port1ffd & ~1) | ((v >> 2) & 1);
+            if (v & 4) z.port1ffd = (z.port1ffd & ~6) | ((v & 3) << 1);  // special mode: the all-RAM configuration
+            else {
+                z.port7ffd = (z.port7ffd & ~0x10) | ((v & 1) << 4);   // normal mode: the ROM selection
+                z.port1ffd = (z.port1ffd & ~4) | ((v & 2) << 1);
+            }
+            port_memory_change(z, was_allram, (v & 8) != 0);          // MMU6/7 kept after a write with bit 3 clear
+            return;
+        }
+        case 0x8F:
+            z.nr[0x8F] = v & 3;
+            port_memory_change(z, z.port1ffd & 1);
             return;
         default:
             if (n >= 0x50 && n <= 0x57) {
@@ -331,7 +365,8 @@ inline bool dec_7ffd(const ZXN& z, uint16_t port) {
     if ((port & 0x8000) || !fd(port) || !port_en(z, 1) || dec_1ffd(z, port)) return false;
     return z.timing != 3 || (port & 0x4000);                          // A14 = 1 too under +3 timing
 }
-inline bool locked(const ZXN& z) { return z.port7ffd & 0x20; }        // 7FFD bit 5 (Pentagon 1024: later)
+// 7FFD bit 5, except in Pentagon 1024 mode, where it's a bank bit (ref §3.6)
+inline bool locked(const ZXN& z) { return (z.port7ffd & 0x20) && !((z.nr[0x8F] & 3) == 3 && !(z.porteff7 & 4)); }
 
 // The floating bus on port 0xFF (ref §2.5; 48K and 128K timing only): inside the 256 x 192 area, the ULA's latest
 // fetch: the bitmap byte from slot 9, the attribute from slot B, the next bitmap from slot D, the next attribute from
