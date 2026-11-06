@@ -427,6 +427,31 @@ class Interrupts(NextCase):
             self.assertGreater(nxt[1] - dma[k - 1][1], 15)   # and a real pause before it
         self.assertFalse(zx.busak)
 
+    def test_a_prescaled_continuous_transfer_never_gives_way(self):
+        # a due prescaler sends WRITE_4 to WAITING_CYCLES before the delay is looked at, and continuous mode leaves
+        # WAITING_CYCLES for WAITING_ACK with the bus held (dma:432-462): the interrupt waits for the block
+        n, presc = 700, 25
+        zx = bare()
+        zx.nr_write(0xC0, 0xA1)
+        zx.nr_write(0xCC, 0x01)
+        program(zx, regs(n, src=0xC000, dst=DST, b_inc=2, presc=presc))
+        code = [0xF3, 0x3E, self.I_REG, 0xED, 0x47, 0xED, 0x5E, 0xFB, 0x3E, 0x87, 0xD3, 0x6B, 0x18, 0xFE]
+        zx.load(CODE, bytes(code))
+        vec = self.I_REG << 8 | 0xA0 | 11 << 1
+        zx.poke(vec, self.HANDLER & 0xFF)
+        zx.poke(vec + 1, self.HANDLER >> 8)
+        zx.load(self.HANDLER, bytes([0xFB, 0xED, 0x4D]))
+        launch(zx, CODE)
+        assert zx.run_until_pc(CODE, max_ticks=10**6)
+        zx.dma_log(True)
+        period = 4 * presc + 3
+        self.assertFalse(zx.run_until_pc(self.HANDLER, max_ticks=8 * period * (n - 10)))   # past a frame's INT
+        zx.run_ticks(8 * period * 20)
+        reads = [e[1] for e in zx.dma_events if e[2] == 'mr']
+        self.assertEqual(len(reads), n)
+        self.assertEqual(set(b - a for a, b in zip(reads, reads[1:])), {period})
+        self.assertTrue(zx.run_until_pc(self.HANDLER, max_ticks=10**6))           # and then it's served
+
     def test_without_the_enable_the_transfer_runs_on(self):
         n = 20000
         zx = self.setup(cc=0x00, n=n)
@@ -507,3 +532,72 @@ class SpiWait(NextCase):
         writes = [e for e in dma if e[2] == 'iw']
         self.assertEqual([e[1] - cw for e in writes], [10 + 34 * i for i in range(n)])
         self.assertEqual(zx.spi_count - before, 2 * n)
+
+
+@needs_next
+class Contention(NextCase):
+    """What the ULA holds or waits for in a DMA cycle (zxula:586-600, on the muxed bus, zxnext:1786-1794). The
+    DMA's strobes start on a falling edge (dma:146-155), after the ULA has decided its T-state, and by the next
+    T-state mreq23_n/ioreqtw3_n have registered them. So a DMA cycle's first T-state is checked like a T1 (the
+    memory term, if its address is contended), its later ones not, and a contended port's own term never comes:
+    by the time IORQ is low, ioreqtw3_n is too. Under +3 timing the WAIT is MREQ low on a contended page, sampled
+    on the falling edge and tested in READ_4/WRITE_4 (dma:140-145, 395-397, 412-414)."""
+
+    def start_in_paper(self, zx, timing, line=40):
+        import nextref as ref
+        from test_next_timing import goto_line
+        goto_line(zx, timing, 50, line)
+        return ref.TIMINGS[(timing, 50)][:2]
+
+    def test_a_contended_port_is_not_contended_for_the_dma(self):
+        # 48K timing, the paper area: the CPU's OUT to FE would be held in its second T-state; the DMA's write
+        # to 00FE is held nowhere (its address is in ROM's page, and the port's term needs ioreqtw3_n high)
+        n = 64
+        zx = bare(timing='48k')
+        program(zx, regs(n, dst=0x00FE, b_io=True, b_inc=2))
+        zx.load(SRC, bytes(i & 7 for i in range(n)))
+        code, end = enabler(nops=200)
+        zx.load(CODE, code)
+        self.start_in_paper(zx, '48k')
+        launch(zx, CODE)
+        assert zx.run_until_pc(CODE, max_ticks=10**6)
+        zx.dma_log(True)
+        assert zx.run_until_pc(end, max_ticks=10**7)
+        stamps = [e[0] for e in zx.dma_events]
+        self.assertEqual(len(stamps), 2 * n)
+        self.assertEqual(set(b - a for a, b in zip(stamps[0::2], stamps[2::2])), {48})
+        self.assertEqual(set(b - a for a, b in zip(stamps[0::2], stamps[1::2])), {24})
+
+    def test_p3_wait_is_sampled_in_read_4(self):
+        # +3 timing, 3-clock reads from bank 5 (contended): the window (Ratio's p3_wait_now: hc_ula + 1 at the edge
+        # before the falling edge) is looked at from the edge entering READ_4, and again each clock it holds;
+        # READ_3's falling edge counts for nothing. A byte drifts through every phase.
+        n = 40
+        zx = bare()
+        program(zx, regs(n, src=0x4000))
+        code, end = enabler(nops=400)
+        zx.load(CODE, code)
+        L, N = self.start_in_paper(zx, 'p3')
+        launch(zx, CODE)
+        assert zx.run_until_pc(CODE, max_ticks=10**6)
+        t0, pos0 = zx.t28, zx.vc_ula * L + zx.hc_ula
+        zx.dma_log(True)
+        assert zx.run_until_pc(end, max_ticks=10**7)
+        dma = zx.dma_events
+
+        def window(t):                                  # at the edge whose pre-edge t28 is t
+            pos = (pos0 + (t - t0) // 4) % (L * N)
+            v, h = pos // L, pos % L + 1
+            adj = ((h & 15) + 1) & 15
+            return (adj >= 4 or adj <= 1) and (h & 0x1FF) < 256 and v < 192
+
+        t, want = dma[0][0], []
+        for i in range(n):
+            want.append((t, 'mr', 0x4000 + i))
+            k = 0
+            while window(t + 8 * (2 + k)):             # READ_4 entered 2 clocks after READ_1
+                k += 1
+            want.append((t + 8 * (3 + k), 'mw', DST + i))
+            t += 8 * (6 + k)
+        self.assertEqual([(e[0], e[2], e[3]) for e in dma], want)
+        self.assertTrue(any(e[0] - d[0] > 48 for d, e in zip(dma[0::2], dma[2::2])), 'no byte waited at all')

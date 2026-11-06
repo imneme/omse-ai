@@ -1700,7 +1700,7 @@ bool cpu_edge(ZXN& z) {
     uint64_t p = z.pins;
     const bool p3w = p3_wait_now(z);
     if (z.wait_next || p3w) p |= Z80_WAIT; else p &= ~Z80_WAIT;
-    const bool dma_bus = dma_edge(z, bus_before, z.wait_next || p3w);   // the DMA's edge, and BUSRQ/BUSAK
+    const bool dma_bus = dma_edge(z, bus_before, z.wait_next, p3w);     // the DMA's edge, and BUSRQ/BUSAK
     im2_edge(z, bus_before);
     nmi_edge(z, bus_before);
     if (nmi_line(z)) p |= Z80_NMI; else p &= ~Z80_NMI;
@@ -1756,9 +1756,10 @@ bool cpu_edge(ZXN& z) {
         remap(z);
     }
     if (fetch) dm_fetch(z, Z80_GET_ADDR(p));
-    classify(z, p);
+    if (dma_bus) dma_classify(z, p); else classify(z, p);            // (the DMA's: next_dma_bus.inc)
     z.p3_waiting = p3w;
     if (!p3w) z.p3_mem = (p & Z80_MREQ) && (p & (Z80_RD | Z80_WR)) && !(p & Z80_RFSH) && contended_page(z, Z80_GET_ADDR(p));
+    if (dma_bus) z.p3_mem = z.p3_waiting = false;                    // the DMA's +3 WAIT is its own
     if (dma_bus) dma_cycle(z, p);                                     // the DMA's bus cycle (next_dma_bus.inc)
     else if (p & Z80_MREQ) {
         uint16_t a = Z80_GET_ADDR(p);

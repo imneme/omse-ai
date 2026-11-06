@@ -69,58 +69,79 @@ inline void im2c_edge(DmaBus& b, uint64_t before) {
     }
 }
 
+// The +3 timing's WAIT window (zxula:583, 600) for the falling edge after this rising edge: the slot hc_ula + 1, as
+// p3_wait_now reads it
+inline bool p3_window(const ZXN& z) {
+    if (!z.contention || z.timing != 3 || z.speed_eff != 0 || (z.nr[0x08] & 0x40)) return false;
+    const int h = hc_ula(z) + 1, v = vc_ula(z);
+    const int adj = ((h & 15) + 1) & 15;
+    return (adj >= 4 || adj <= 1) && (h & 0x1FF) < 256 && v < 192;
+}
+
 // One rising CPU edge for the DMA and the bus, from the values before it. before: the bus in the last T-state;
-// z80_wait: z80_wait_n low at the falling edge after this edge (the WAIT cpu_edge computes for the CPU). Returns
-// true if the DMA has the bus for the T-state this edge begins (BUSAK after the edge).
-bool dma_edge(ZXN& z, uint64_t before, bool z80_wait) {
+// wait_next, p3w: the 28 MHz read wait and the +3 WAIT cpu_edge computes for the CPU, for the falling edge after
+// this one. Returns true if the DMA has the bus for the T-state this edge begins (BUSAK after the edge).
+bool dma_edge(ZXN& z, uint64_t before, bool wait_next, bool p3w) {
     DmaBus& b = z.db;
-    const bool busak = b.busak, busreq_s = b.busreq_s, dma_busreq = b.dma.busreq();
+    NextDma& d = b.dma;
+    // the T80N (t80n:1650-1760): BusReq_s <= not BUSRQ_n each edge; frozen (ClkEn = CEN and not BusAck) while
+    // BusReq_s and BusAck; otherwise BusAck <= 0, and in the machine cycle's last T-state (T_Res) a request is
+    // granted instead of the next cycle's T1, TState not advanced
+    const bool busak = b.busak, busreq_s = b.busreq_s;
+    b.busreq_s = d.busreq();
+    b.busak = busreq_s && (busak || b.mc_end);
+    b.owned_before = busak;
+    b.strobe_before = b.strobe;
+    b.mreq_before = d.s.mreq;
+    b.a_before = d.s.a;
     bool im2_dma_int = false;                                         // im2_device's o_dma_int (im2_device:151)
     for (int i = 0; i < 14; i++) if (z.im2_state[i] && dma_int_en(z, i)) im2_dma_int = true;
     const bool dma_delay = im2c_dma_delay(b.im2c);
-    // dma_wait_n = z80_wait_n and spi_wait_n (zxnext:1803), as the DMA sampled it on the falling edge before this
-    // one. spi_wait_n = state_idle or state_last_d (spi:177); the SPI master here acts an edge before the VHDL's
-    // (at the edge where the strobe starts, as the CPU's port accesses do), so its state at this edge describes
-    // the falling edge after it
-    const bool wait_n = b.wait_n_s;
+    // dma_wait_n = z80_wait_n and spi_wait_n (zxnext:1803), as sampled on the falling edge before this one
+    d.edge(z.speed_eff, !busak, b.delay, b.wait_n_s);
+    // ... and for the falling edge after it. spi_wait_n = state_idle or state_last_d (spi:177); the SPI master here
+    // acts an edge before the VHDL's (at the edge where the strobe starts, as the CPU's port accesses do), so its
+    // state now describes the falling edge after this one. The +3 WAIT, while the DMA has the bus, is its own:
+    // MREQ low (its strobe, from an earlier falling edge) on a contended page, in the window (zxula:600)
     const bool spi_ok = z.spi_state == 16 || z.spi_last_d;
-    b.dma.edge(z.speed_eff, !busak, b.delay, wait_n);
-    b.wait_n_s = !z80_wait && spi_ok;
+    const bool p3 = b.busak ? (b.strobe_before && d.s.mreq && contended_page(z, d.s.a) && p3_window(z)) : p3w;
+    b.wait_n_s = !(wait_next || p3) && spi_ok;
     // im2_dma_delay (zxnext:1960-1968): a device with a DMA interrupt enabled is pending or in service, or an NMI
     // with NR 0xCC b7, or the delay held through im2_control's RETI/RETN states
     b.delay = im2_dma_int || (z.nmi_cause && (z.nr[0xCC] & 0x80)) || (b.delay && dma_delay);
     im2c_edge(b, before);
-    // the strobe of the DMA's I/O cycle as devices will see it at the next edge: from READ_1/WRITE_1 until the
-    // falling edge in READ_4/WRITE_4 where dma_wait_n is high (dma_rw_cancel, dma:146-155)
-    const NextDma::St& s = b.dma.s;
+    // the strobe as devices see it at the next edge: from READ_1/WRITE_1's falling edge until the falling edge in
+    // READ_4/WRITE_4 where dma_wait_n is high (dma_rw_cancel, dma:146-155)
+    const NextDma::St& s = d.s;
     b.strobe = (s.rd || s.wr) && !((s.seq == NextDma::READ_4 || s.seq == NextDma::WRITE_4) && b.wait_n_s);
-    // the T80N (t80n:1650-1760): BusReq_s <= not BUSRQ_n each edge; frozen (ClkEn = CEN and not BusAck) while
-    // BusReq_s and BusAck; otherwise BusAck <= 0, and in the machine cycle's last T-state (T_Res) a request is
-    // granted instead of the next cycle's T1, TState not advanced
-    b.busreq_s = dma_busreq;
-    if (busreq_s && busak) return true;
-    b.busak = false;
-    if (busreq_s && b.mc_end) { b.busak = true; return true; }
-    return false;
+    return b.busak;
 }
 
-// The bus as the DMA drives it in the T-state this edge begins, in z80.h's convention so that contention, the
-// waits and the SPI master read it as they read the CPU's: a memory cycle shows MREQ with RD or WR at its first
-// edge and MREQ alone after; an I/O cycle IORQ with RD or WR while its strobe lasts (dma:183-189), IORQ alone after.
-// Between cycles, the address alone (dma_a_s stays on the bus).
+// The bus as the DMA drives it in the T-state this edge begins, as its signals will be just before the next rising
+// edge (which is how z80.h's pins read for MREQ, and what the SPI master, the NMI's end and the speed change look
+// at): the address, and MREQ or IORQ with RD or WR while the strobe lasts (dma:183-189).
 uint64_t dma_pins(const ZXN& z) {
     const DmaBus& b = z.db;
     const NextDma& d = b.dma;
     uint64_t p = 0;
     Z80_SET_ADDR(p, d.s.a);
-    if (d.reading() || d.writing()) {
-        const bool first = d.act != NextDma::NONE;
-        const uint64_t rw = d.reading() ? Z80_RD : Z80_WR;
-        if (d.s.mreq) p |= Z80_MREQ | (first ? rw : 0);
-        else p |= Z80_IORQ | (b.strobe ? rw : 0);
-        if (d.writing()) Z80_SET_DATA(p, d.data);
-    }
+    if (b.strobe) p |= (d.s.mreq ? Z80_MREQ : Z80_IORQ) | (d.s.rd ? Z80_RD : Z80_WR);
+    if (d.writing()) Z80_SET_DATA(p, d.data);
     return p;
+}
+
+// What a DMA T-state asks the ULA (zxula:586-595, 48K and 128K timing): the memory term, if the address is
+// contended and neither MREQ nor a contended port's IORQ was low at this edge (mreq23_n, ioreqtw3_n). The port
+// term needs IORQ low now with ioreqtw3_n high: the DMA's IORQ falls on a falling edge, after this T-state's
+// decision, and is registered by the next, so it never comes. After the CPU's T-state, z80.h's MREQ says it.
+void dma_classify(ZXN& z, uint64_t p) {
+    const DmaBus& b = z.db;
+    const bool mreq_low = b.owned_before ? b.strobe_before && b.mreq_before : z.prev_mreq;
+    const bool iorq_c = b.owned_before && b.strobe_before && !b.mreq_before && contended_port(z, b.a_before);
+    z.ck_port = false;
+    z.ck_mem = !mreq_low && !iorq_c && contended_page(z, b.dma.s.a);
+    z.prev_mreq = p & Z80_MREQ;
+    z.prev_io = p & Z80_IORQ;
 }
 
 inline void dma_note(ZXN& z, int kind, uint16_t a, uint8_t v) {

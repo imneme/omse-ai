@@ -255,13 +255,16 @@ struct DmaBus {
     bool mc_end = false;                    // the CPU's last tick was its machine cycle's last T-state (T_Res)
     bool delay = false;                     // im2_dma_delay
     bool wait_n_s = true;                   // dma_wait_n at the last falling edge (dma:140-145)
-    bool strobe = false;                    // the DMA's I/O strobe, as devices see it at the next edge
+    bool strobe = false;                    // the DMA's strobe, as devices see it at the next edge
+    bool owned_before = false, strobe_before = false, mreq_before = false;   // the same, before this edge
+    uint16_t a_before = 0;
     int im2c = 0;                           // im2_control's state
     bool im2c_m1 = false;                   // in an opcode fetch, before its T3
     uint8_t im2c_op = 0;                    // cpu_opcode
     void reset() {
         dma.reset();
-        busak = busreq_s = delay = strobe = im2c_m1 = false;
+        busak = busreq_s = delay = strobe = im2c_m1 = owned_before = strobe_before = mreq_before = false;
+        a_before = 0;
         wait_n_s = true;
         im2c = 0;
         im2c_op = 0;
