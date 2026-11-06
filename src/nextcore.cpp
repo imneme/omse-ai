@@ -93,8 +93,12 @@ struct ZXN {
     int sc = 0;                         // 28 MHz sub-pixel count, 0-3 (ref §1.1)
     int hc = 0, vc = 0;                 // the raw frame counter (ref §2.1)
     bool cpu_clk_high = true;           // the 3.5 MHz clock's level (ref §1.2)
-    bool contend = false;               // the ULA holding the 3.5 MHz clock high (layer 2)
+    bool contend = false;               // the ULA holding the 3.5 MHz clock high (zxula.vhd's o_cpu_contend)
+    bool ck_mem = false, ck_port = false;  // what the current T-state asks the ULA (set at each rising CPU edge)
+    bool prev_mreq = false, prev_io = false;
+    int io_phase = 0;
     bool wait_next = false;             // a 28 MHz read wait for the next CPU clock
+    bool contention = true;             // on, as the hardware is (zxn_contention can turn it off, for comparisons)
 
     // the interrupt
     bool int_req = false;               // the ULA's registered pulse, seen at the next 7 MHz edge
@@ -333,6 +337,53 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
     }
 }
 
+// ---- contention (ref §1.5; zxula.vhd 577-600, zxnext 4422-4437)
+
+// Is the CPU's address in a contended page? Decided by the MMU page alone, pages 0x00-0x0F only, by the machine
+// *timing*: 48K bank 5; 128K pages with bit 1 set (banks 1, 3, 5, 7); +3 banks 4-7 (zxnext 4430-4434).
+inline bool contended_page(const ZXN& z, uint16_t a) {
+    int page = z.mmu[a >> 13];
+    if (page >= 0x10) return false;
+    switch (z.timing) {
+        case 1: return page == 0x0A || page == 0x0B;
+        case 2: return page & 2;
+        case 3: return page >= 8;
+        default: return false;
+    }
+}
+// Is the port contended as the ULA's own? A0 = 0, and under 128K timing ports that decode as 7FFD (zxnext 4437).
+inline bool contended_port(const ZXN& z, uint16_t port) {
+    return !(port & 1) || (z.timing == 2 && !(port & 0x8000) && (port & 3) == 1);
+}
+// At each rising CPU edge: what does this T-state ask the ULA? zxula.vhd holds the clock for (a) a contended address
+// while MREQ was high at the last rising edge and no contended I/O has begun (a memory cycle's T1, or an internal
+// T-state not after an MREQ one), and (b) a contended port on the first T-state with IORQ low. In z80.h's pins (as
+// zxcore.cpp's contend_check reads them, checked by Speccy-Zone against the documented tables): T1 shows MREQ with
+// RD or WR; T2 MREQ alone; an I/O cycle shows IORQ from its first T-state, counted by io_phase.
+inline void classify(ZXN& z, uint64_t p) {
+    const uint16_t a = Z80_GET_ADDR(p);
+    z.ck_mem = z.ck_port = false;
+    if ((p & Z80_IORQ) && !(p & Z80_M1)) {
+        z.io_phase = z.prev_io ? z.io_phase + 1 : 1;
+        if (contended_port(z, a)) z.ck_port = z.io_phase == 2 || (contended_page(z, a) && z.io_phase == 1);
+        else z.ck_mem = contended_page(z, a);                          // a contended high byte: every T-state
+    } else if (p & Z80_MREQ) {
+        z.ck_mem = (p & (Z80_RD | Z80_WR)) && !(p & Z80_RFSH) && contended_page(z, a);
+    } else {
+        z.ck_mem = !z.prev_mreq && !(p & Z80_IORQ) && contended_page(z, a);
+    }
+    z.prev_mreq = p & Z80_MREQ;
+    z.prev_io = (p & Z80_IORQ) && !(p & Z80_M1);
+}
+// wait_s (zxula.vhd 582-583): slots with hc_ula(3:0) in 3-14 (decided a slot early: hc_adj = hc + 1), in the
+// 256 x 192 area; only at 3.5 MHz, not with NR 0x08 bit 6, not in Pentagon timing (zxnext 4422).
+inline bool wait_s(const ZXN& z) {
+    if (z.speed_eff != 0 || (z.nr[0x08] & 0x40) || z.timing == 4) return false;
+    int h = hc_ula(z), v = vc_ula(z);
+    int adj = ((h & 15) + 1) & 15;
+    return adj >= 4 && h < 256 && v < 192;
+}
+
 // ---- the clock
 
 // One rising edge of the CPU clock. Returns false (and changes nothing) if a run_until_pc stop is due: the CPU is
@@ -357,6 +408,7 @@ bool cpu_edge(ZXN& z) {
     z.first_edge = false;
     z.wait_next = false;
     z.cpu_clocks++;
+    classify(z, p);
     if (p & Z80_MREQ) {
         uint16_t a = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
@@ -409,7 +461,12 @@ bool master_tick(ZXN& z) {
     if (edge && !cpu_edge(z)) return false;
     if (z.speed_eff == 0 && edge7) {
         if ((hc_ula(z) & 1) == 0) z.cpu_clk_high = true;
-        else if (!z.contend) z.cpu_clk_high = false;
+        else {
+            // o_cpu_contend, decided at this odd slot (48K and 128K timing; +3 pulls WAIT instead: later)
+            z.contend = z.contention && z.timing != 3 && (z.ck_mem || z.ck_port) && wait_s(z);
+            if (z.contend) z.ck_port = false;                          // the port term is the first IORQ T-state only
+            else z.cpu_clk_high = false;
+        }
     }
     z.sc = sc_next;
     if (edge7) {
@@ -464,6 +521,7 @@ ZXN* zxn_new(int timing, int hz60, int speed, int issue) {
 }
 
 void zxn_free(ZXN* z) { free(z->sram); delete z; }
+void zxn_contention(ZXN* z, int on) { z->contention = on != 0; }
 void zxn_reset(ZXN* z, int hard) { do_reset(*z, hard != 0); }
 void zxn_set_bootrom(ZXN* z, const uint8_t* data, int n) {
     memset(z->bootrom, 0xFF, sizeof z->bootrom);

@@ -40,6 +40,7 @@ def _load_lib():
     U64P, U16P = ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint16)
     sigs = {
         'zxn_new': ([I, I, I, I], P), 'zxn_free': ([P], None), 'zxn_reset': ([P, I], None),
+        'zxn_contention': ([P, I], None),
         'zxn_set_bootrom': ([P, ctypes.c_char_p, I], None),
         'zxn_t28': ([P], U64), 'zxn_cpu_clocks': ([P], U64), 'zxn_frame': ([P], U64),
         'zxn_hc_ula': ([P], I), 'zxn_vc_ula': ([P], I), 'zxn_hc': ([P], I), 'zxn_vc': ([P], I),
@@ -85,6 +86,10 @@ class Next:
 
     def reset(self, hard=False):
         self.lib.zxn_reset(self.z, 1 if hard else 0)
+
+    def contention(self, on=True):
+        """Contention is on, as the hardware is; off is for comparisons only."""
+        self.lib.zxn_contention(self.z, 1 if on else 0)
 
     # time and the beam
     t28 = property(lambda self: self.lib.zxn_t28(self.z))
