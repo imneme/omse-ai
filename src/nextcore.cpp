@@ -58,7 +58,7 @@ const Timing TIMINGS[5][2] = {
 
 enum Kind : uint8_t { K_NONE, K_SRAM, K_BRAM5, K_BRAM7, K_BOOT };
 // what a slot shows, for slot_page (DESIGN.md §9.1 (8)): the tag and its value
-enum Tag : uint8_t { T_PAGE, T_ROM, T_ALTROM, T_BOOT, T_CONFIG, T_DIVROM, T_DIV, T_MFROM, T_MFRAM, T_L2, T_NONE };
+enum Tag : uint8_t { T_PAGE, T_ROM, T_ALTROM, T_BOOT, T_CONFIG, T_DIVROM, T_DIV, T_MFROM, T_MFRAM, T_L2, T_BUS, T_NONE };
 
 struct IoEvent { uint64_t t28, cpu_clocks; uint16_t port; uint8_t value, write; };
 struct DmaEvent { uint64_t t28, cpu_clocks; uint16_t addr; uint8_t value, kind; };   // §9.1 (16)
@@ -178,6 +178,19 @@ struct ZXN {
     nserial::Rtc rtc;                   // the optional DS1307 at 0x68 (none by default, §9.1 (18))
     bool i2c_logging = false;
     std::vector<std::array<uint64_t, 3>> i2c_log;
+    // the expansion bus (§9.1 (19)): what's plugged in, the lines it holds, and the enables as they take effect
+    std::vector<uint8_t> bus_rom;       // a cartridge asserting ROMCS, 16K (8K mirrored); empty: none
+    struct BusIo { uint16_t mask, value; uint8_t byte; };
+    std::vector<BusIo> bus_io;          // static answers for reads the bus gets
+    bool bus_wait = false, bus_int = false, bus_nmi = false;   // held device lines, true asserted
+    int bus_wait_next = 0, bus_wait_left = 0;                  // bus_wait(n): n waits on the next bus cycle
+    bool bus_eff_en = false, bus_eff_dis_io = false, bus_eff_dis_mem = false;   // expbus_eff_* (zxnext:5705-5720)
+    bool bus_logging = false;
+    std::vector<std::array<uint64_t, 4>> bus_log;
+    bool bus_inten = false, bus_int_q = false;   // top4's INT loop: o_zxn_bus_inten (1967), bus_int_n_i_q (752)
+    bool bus_int_seen = false;          // bus_int_q as it stood before this tick's edge: what the CPU samples
+    bool bus_nmi_q = false, bus_nmi_db = false;   // top4: the NMI pin registered (753), then debounced (1931-1946)
+    int bus_nmi_cnt = 0;                // asymmetrical_debounce's counter, to 8 enable pulses (9.362 ms each)
     uint8_t ay_reg[3][16] = {{0}};      // the AYs' register files (ym2149.vhd), chip 0 = AY_ID 11, 1 = 10, 2 = 01
     nextaudio::Audio audio;             // what makes the sound (next_audio.h)
     DmaBus db;                          // the zxnDMA and the bus request (next_dma.h, next_dma_bus.inc)
@@ -286,6 +299,9 @@ inline bool dm_en(const ZXN& z) { return z.nr[0x83] & 1; }
 inline bool dm_automap_reset(const ZXN& z) { return !dm_en(z) || !(z.nr[0x0A] & 0x10); }
 inline bool dm_automap(const ZXN& z) { return !dm_automap_reset(z) && (z.dm_held || z.dm_instant); }
 
+// the expansion bus's ROMCS as the decode sees it: a device asserting it, the bus on with memory cycles
+// (sram_pre_romcs_n, zxnext:2977)
+inline bool bus_romcs(const ZXN& z) { return !z.bus_rom.empty() && z.bus_eff_en && !z.bus_eff_dis_mem; }
 // Rebuild the page table (ref §3.4's decode order, the parts this layer has: boot ROM, MMU page, config mode, ROM).
 void remap(ZXN& z) {
     for (int s = 0; s < 8; s++) {
@@ -329,6 +345,19 @@ void remap(ZXN& z) {
                 z.wr_kind[s] = K_NONE;
                 z.wr_tag[s] = T_NONE;
                 z.wr_val[s] = 0;
+            }
+            // the expansion bus's ROMCS: over the ROM only (override bit 0, zxnext:3038), ahead of the alternate ROM
+            // and under divMMC, Layer 2 and the multiface; read-only; the bus's data, or with NR 0x80 b6 divMMC
+            // banks 14 and 15 (3066-3073, 1816-1817)
+            if (bus_romcs(z)) {
+                if (z.nr[0x80] & 0x40) {
+                    z.rd[s] = z.sram + 0x20000 + (14 + s) * 0x2000;
+                    z.rd_kind[s] = K_SRAM; z.rd_tag[s] = T_DIV; z.rd_val[s] = 14 + s;
+                } else {
+                    z.rd[s] = z.bus_rom.data() + s * 0x2000;
+                    z.rd_kind[s] = K_NONE; z.rd_tag[s] = T_BUS; z.rd_val[s] = 0;
+                }
+                z.wr[s] = nullptr; z.wr_kind[s] = K_NONE; z.wr_tag[s] = T_NONE; z.wr_val[s] = 0;
             }
         }
         // the multiface (ref §3.9; zxnext:2988-2995): its ROM (SRAM 0x014000, read-only) and RAM (0x016000) over
@@ -642,7 +671,9 @@ int nr_read(ZXN& z, int n) {
         case 0x22:                                                    // the pulse, port FF b6, the line interrupt's
             if (z.in_latch_dt >= 0) z.in_latch_at = z.t28 + z.in_latch_dt;   // an IN: b7 is set again at its latch
             return (z.int_low ? 0x80 : 0) | ((z.portff >> 4) & 4) | (z.nr[0x22] & 3);       // (zxnext:5898-5899)
-        case 0x81: return 0x80 | (z.nr[0x81] & 0x70);                 // b7 the bus's ROMCS pin, high (zxnext:6032)
+        case 0x8A: return z.nr[0x8A] & 0x3F;                          // six bits (zxnext:5462, 6059-6060)
+        case 0x81:                                                    // b7 the bus's ROMCS pin (zxnext:6033): inactive
+            return (!z.bus_rom.empty() ? 0x80 : 0) | (z.nr[0x81] & 0x70); // unplugged, a board resistor (ruling (19) a)
         case 0x2C: case 0x2E: return 0x80;                            // the Pi's I2S audio, off: 0x200 >> 2 (zxnext:2316-2317,
                                                                       // 5912-5913)
         case 0x2D: return 0x00;                                       // the Pi's latched I2S sample: none (zxnext:5917-5918)
@@ -689,6 +720,7 @@ int nr_read(ZXN& z, int n) {
 void nr_write(ZXN& z, int n, int v) {
     v &= 0xFF;
     if (n == 0x0B || n == 0xA0 || n == 0xC6) { z.uart[0].wake = z.uart[1].wake = 4; z.serial_on = true; }   // routing, interrupts
+    if (n == 0x80) { z.nr[0x80] = v; remap(z); return; }             // b6 picks ROMCS's source at once (sram_pre, 2978)
     if (n >= 0x2C && n <= 0x2E && (z.nr[0x08] & 8)) {               // the DACs from next registers (soundrive:66-90)
         if (n == 0x2C) z.audio.dac[1] = v;                            // left: B
         else if (n == 0x2E) z.audio.dac[2] = v;                       // right: C
@@ -1024,6 +1056,11 @@ void do_reset(ZXN& z, bool hard) {
     z.pins = z80_init(&z.cpu);
     z.cpu.z80n = true;                                                // the Z80N's instructions (Strobe Fern's z80.h)
     z.stackless_retn = false;
+    z.nr[0x80] = (z.nr[0x80] & 0x0F) | (z.nr[0x80] & 0x0F) << 4;     // any reset: b7:4 <- b3:0 (zxnext:2140-2145)
+    z.bus_eff_en = z.nr[0x80] & 0x80; z.bus_eff_dis_io = z.nr[0x80] & 0x20; z.bus_eff_dis_mem = z.nr[0x80] & 0x10;
+    z.bus_wait_left = 0;
+    z.bus_inten = z.bus_int_q = z.bus_int_seen = false;
+    z.bus_nmi_db = false; z.bus_nmi_cnt = 0;                         // asymmetrical_debounce's reset
     remap(z);
     // the Tx FIFOs are empty through the reset, so those requests rise at the first clock after it and their statuses
     // set, enabled or not (im2p:92-101, 156-160; Loam's foil): nothing can look sooner, so it's done here
@@ -1033,7 +1070,11 @@ void do_reset(ZXN& z, bool hard) {
 // ---- ports (ref §5.1; zxnext:2537-2658). Layer 2: the Next register ports, 0xFE, 0xFF, and the legacy paging ports.
 
 // the internal enable for a port (NR 0x82-0x85, bit numbers as ref §5.1's table; the expansion bus: later)
-inline bool port_en(const ZXN& z, int bit) { return (z.nr[0x82 + bit / 8] >> (bit % 8)) & 1; }
+// the internal port enables, ANDed with the bus's (NR 0x86-0x89) while the bus is on (zxnext:2349-2350)
+inline bool port_en(const ZXN& z, int bit) {
+    const bool b = (z.nr[0x82 + bit / 8] >> (bit % 8)) & 1;
+    return z.bus_eff_en ? b && ((z.nr[0x86 + bit / 8] >> (bit % 8)) & 1) : b;
+}
 inline bool fd(uint16_t port) { return (port & 3) == 1; }             // A1:0 = 01, the 128K-style partial decode
 inline bool dec_1ffd(const ZXN& z, uint16_t port) { return (port >> 12) == 0x1 && fd(port) && port_en(z, 3); }
 inline bool dec_7ffd(const ZXN& z, uint16_t port) {
@@ -1065,6 +1106,82 @@ inline bool dma_port_decode(const ZXN& z, uint16_t port);       // port_dma (nex
 inline bool dma_port(const ZXN& z, uint16_t port);
 uint8_t dma_port_read(ZXN& z, uint16_t port);
 void dma_port_write(ZXN& z, uint16_t port, uint8_t v);
+// ---- the expansion bus's I/O (zxnext:1828-1838, 2170-2183, 2650-2656)
+int bus_io_answer(const ZXN& z, uint16_t port) {                      // a device's answer, or -1
+    for (const auto& e : z.bus_io) if ((port & e.mask) == e.value) return e.byte;
+    return -1;
+}
+inline int mf_type(const ZXN& z);
+inline bool mf_en(const ZXN& z);
+// port_internal_response: every decode the core has, with its enable (the +3 floating bus and FDC decodes aren't here
+// yet)
+inline bool port_internal(const ZXN& z, uint16_t port) {
+    const int lo = port & 0xFF;
+    if (!(port & 1) || lo == 0xFF) return true;                       // FE, FF (no enable, zxnext:2541)
+    if (dec_7ffd(z, port) || dec_1ffd(z, port)) return true;
+    if ((port >> 12) == 0xD && fd(port) && port_en(z, 2)) return true;            // DFFD
+    if ((port >> 12) == 0xE && lo == 0xF7 && port_en(z, 26)) return true;        // EFF7
+    if (lo == 0xE3 && dm_en(z)) return true;
+    if (mf_en(z)) {
+        const int t = mf_type(z);
+        if (lo == ((t & 2) ? 0x9F : (t & 1) ? 0xBF : 0x3F) || lo == ((t & 2) ? 0x1F : (t & 1) ? 0x3F : 0xBF)) return true;
+    }
+    if ((lo == 0xE7 || lo == 0xEB) && port_en(z, 11)) return true;
+    if (port == 0x243B || port == 0x253B) return true;
+    if ((port == 0x103B || port == 0x113B) && port_en(z, 10)) return true;
+    if (port == 0x123B && port_en(z, 15)) return true;
+    if (lo == 0x3B && (port >> 11) == 2 && (((port >> 10) ^ ((port >> 9) & (port >> 8))) & 1) && port_en(z, 12)) return true;
+    if (fd(port) && (port & 4) && (port >> 14) >= 2 && port_en(z, 16)) return true;   // FFFD, BFFD
+    if (z.nr[0x08] & 8) {                                             // the DACs (as io_write decodes them)
+        const bool sd1 = port_en(z, 17), sd2 = port_en(z, 18), ad3f = port_en(z, 19), bc0f = port_en(z, 20);
+        if ((lo == 0xFB && port_en(z, 21) && !sd2) || (lo == 0xDF && port_en(z, 23)) || (lo == 0xB3 && port_en(z, 22)) ||
+            ((lo == 0x1F || lo == 0x0F || lo == 0x4F || lo == 0x5F) && sd1) || ((lo == 0xF1 || lo == 0xF3 || lo == 0xF9 || lo == 0xFB) && sd2) ||
+            ((lo == 0x3F || lo == 0x5F) && ad3f) || ((lo == 0x0F || lo == 0x4F) && bc0f)) return true;
+    }
+    if (lo == 0xDF && port_en(z, 13) && ((port >> 8) & 0x0F) >= 0x0A && ((port >> 8) & 0x0F) != 0x0C &&
+        ((port >> 8) & 0x0F) != 0x0D && ((port >> 8) & 0x0F) != 0x0E) return true;   // the mouse: xADF, xBDF, xFDF
+    if ((lo == 0x1F && port_en(z, 6) && joy_port_on(z, 0x1F)) || (lo == 0x37 && port_en(z, 7) && joy_port_on(z, 0x37))) return true;
+    if ((lo == 0x57 || lo == 0x5B || port == 0x303B) && port_en(z, 14)) return true;
+    if ((port == 0xBF3B || port == 0xFF3B) && port_en(z, 24)) return true;
+    if ((port & 0xF8FF) == 0x183B && port_en(z, 27)) return true;
+    if (dma_port_decode(z, port)) return true;                        // port_dma, ungated by busak (2602, 2657)
+    return false;
+}
+// NR 0x8A: internal port cycles that go out on the bus as well (zxnext:2170-2176)
+inline bool bus_propagated(const ZXN& z, uint16_t port) {
+    const int p = z.nr[0x8A];
+    return ((p & 1) && !(port & 1)) || ((p & 2) && dec_7ffd(z, port)) || ((p & 4) && (port >> 12) == 0xD && fd(port) && port_en(z, 2)) ||
+           ((p & 8) && dec_1ffd(z, port)) || ((p & 0x10) && (port & 0xFF) == 0xFF) ||
+           ((p & 0x20) && (port >> 12) == 0xE && (port & 0xFF) == 0xF7 && port_en(z, 26));
+}
+// bus_iorq_n and bus_mreq_n (zxnext:2178-2179): which cycles reach the connector
+inline bool bus_io_visible(const ZXN& z, uint16_t port) {
+    return z.bus_eff_en && (((!port_internal(z, port)) && !z.bus_eff_dis_io) || bus_propagated(z, port));
+}
+inline bool bus_mem_visible(const ZXN& z, uint16_t a, bool write) {
+    if (!z.bus_eff_en || z.bus_eff_dis_mem) return false;
+    const int s = a >> 13;
+    if (s >= 2) return true;
+    const Tag t = (Tag)z.rd_tag[s];                                   // sram_mem_hide_n: the ROM, ROMCS, the alternate
+    return (t == T_ROM || t == T_ALTROM || t == T_BUS) && !(write && z.wr_tag[s] == T_L2);   // ROM show; the rest hide
+}
+void bus_cycle(ZXN& z, int kind, uint16_t a, uint8_t v) {             // a cycle on the connector: log it, start a wait
+    if (z.bus_wait_next) { z.bus_wait_left = z.bus_wait_next; z.bus_wait_next = 0; }
+    if (z.bus_logging) z.bus_log.push_back({z.t28, (uint64_t)kind, a, v});
+}
+inline bool bus_int_path(const ZXN& z) {                              // not expbus_disable_int (zxnext:1796)
+    return z.bus_eff_en && !z.bus_eff_dis_io && (z.nr[0xC4] & 0x80);
+}
+// nmi_assert_expbus (zxnext:2048), from top4's debounced pin, or the registered pin with NR 0x81 b5 (top4:1946)
+inline bool bus_nmi_on(const ZXN& z) {
+    return z.bus_eff_en && !z.bus_eff_dis_mem && ((z.nr[0x81] & 0x20) ? z.bus_nmi_q : z.bus_nmi_db);
+}
+// a read nobody inside answers: the bus's data with I/O on, else FFh; nothing attached floats high (1828-1838)
+uint8_t bus_read_unanswered(const ZXN& z, uint16_t port) {
+    if (!z.bus_eff_en || z.bus_eff_dis_io) return 0xFF;
+    const int a = bus_io_answer(z, port);
+    return a < 0 ? 0xFF : (uint8_t)a;
+}
 
 uint8_t io_read(ZXN& z, uint16_t port) {
     if (dma_port(z, port)) return dma_port_read(z, port);           // the DMA (next_dma_bus.inc)
@@ -1077,9 +1194,15 @@ uint8_t io_read(ZXN& z, uint16_t port) {
         return v;
     }
     if (!(port & 1)) {                                                // 0xFE: the half-rows selected by A8-A15 low
+        const int dev = (z.bus_eff_en && !z.bus_eff_dis_io) ? bus_io_answer(z, port) : -1;
+        if (dev >= 0) return (uint8_t)dev;                            // the device's IORQULA takes FE (zxnext:2183)
         uint8_t v = 0x1F;
         for (int r = 0; r < 8; r++) if (!(port & (0x100 << r))) v &= ~z.keys[r] & 0x1F;
-        return 0xE0 | v;                                              // (EAR in, bit 6: later)
+        v |= 0xE0;                                                    // (EAR in, bit 6: later)
+        if (z.bus_eff_en && (z.nr[0x8A] & 1)) {                       // FE propagated: the bus's data ANDed in, and
+            if ((z.nr[0x81] & 0x40) && !(port & 0xF0)) v = 0xFF;      // NR 0x81 b6's override on 00-0E (3411-3425)
+        }
+        return v;
     }
     if ((port & 0xFF) == 0xFF) return floating_bus(z);                // always answered (ref §5.1)
     if ((port & 0xFF) == 0xEB && port_en(z, 11)) {                    // the read register as the CPU latches it, an edge
@@ -1118,7 +1241,7 @@ uint8_t io_read(ZXN& z, uint16_t port) {
     if ((port & 0xFF) == 0xE3 && dm_en(z)) return z.porte3 & 0xCF;    // divMMC (zxnext:2567, 4131)
     if (port == 0x123B && port_en(z, 15))                             // Layer 2 (zxnext:2594, 2781; the offset: unread)
         return (z.l2_seg << 6) | (z.l2_shadow << 3) | (z.l2_rd << 2) | (z.l2_en << 1) | z.l2_wr;
-    return 0xFF;                                                      // nobody answers (ref §5.2)
+    return bus_read_unanswered(z, port);                              // nobody answers (ref §5.2): the bus, or FFh
 }
 
 void io_write(ZXN& z, uint16_t port, uint8_t v) {
@@ -1717,11 +1840,13 @@ void nmi_request(ZXN& z, bool mf) {
     }
     if (z.nmi_cause == 2 && z.nmi_state == 0 && dm_en(z) && !dm_automap_reset(z)) z.dm_button = true;
 }
-inline bool nmi_line(const ZXN& z) { return (z.nmi_state == 0 && z.nmi_cause) || z.nmi_state == 1; }   // (2128)
+inline bool nmi_line(const ZXN& z) {                                  // (2127-2128; NR 0x81 b5: the bus undebounced)
+    return (z.nmi_state == 0 && z.nmi_cause) || z.nmi_state == 1 || ((z.nr[0x81] & 0x20) && bus_nmi_on(z));
+}
 // the state machine, on a rising CPU edge with the pins before it (zxnext:2079-2121)
 void nmi_edge(ZXN& z, uint64_t before) {
     if (z.config_mode) { z.nmi_state = 0; z.nmi_cause = 0; return; }
-    const bool hold = z.nmi_cause == 1 ? z.mf_active : z.nmi_cause == 2 ? dm_nmi_hold(z) : false;
+    const bool hold = z.nmi_cause == 1 ? z.mf_active : z.nmi_cause == 2 ? dm_nmi_hold(z) : z.nmi_cause == 3 ? bus_nmi_on(z) : false;
     switch (z.nmi_state) {
         case 0: if (z.nmi_cause) z.nmi_state = 1; break;
         case 1:
@@ -2093,12 +2218,19 @@ bool cpu_edge(ZXN& z) {
     const DmaBus db_saved = z.db;
     uint64_t p = z.pins;
     const bool p3w = p3_wait_now(z);
-    if (z.wait_next || p3w) p |= Z80_WAIT; else p &= ~Z80_WAIT;
-    const bool dma_bus = dma_edge(z, bus_before, z.wait_next, p3w);     // the DMA's edge, and BUSRQ/BUSAK
+    const bool bus_w = z.bus_eff_en && (z.bus_wait || z.bus_wait_left > 0);   // the bus's WAIT (zxnext:1798)
+    if (z.bus_wait_left > 0) z.bus_wait_left--;
+    if (z.wait_next || p3w || bus_w) p |= Z80_WAIT; else p &= ~Z80_WAIT;
+    // the DMA's edge, and BUSRQ/BUSAK; dma_wait_n = z80_wait_n and spi_wait_n (zxnext:1803), and z80_wait_n holds the
+    // bus's WAIT too (1798), so it rides in with the 28 MHz wait
+    const bool dma_bus = dma_edge(z, bus_before, z.wait_next || bus_w, p3w);
     im2_edge(z, bus_before);
+    if (!z.config_mode && !z.nmi_cause && bus_nmi_on(z)) z.nmi_cause = 3;   // the bus's NMI, last in line (2068-2071)
     nmi_edge(z, bus_before);
     if (nmi_line(z)) p |= Z80_NMI; else p &= ~Z80_NMI;
-    if (z.int_low || im2_int(z)) p |= Z80_INT; else p &= ~Z80_INT;     // pulse_int_n and im2_int_n (zxnext:1799)
+    // pulse_int_n and im2_int_n; or, with the bus's INT path open, the bus line as top4 reads it back, carrying the
+    // Next's own INT through o_zxn_bus_inten and a device's (zxnext:1799; top4:752, 1967, 1988; ruling (19) b)
+    if (bus_int_path(z) ? z.bus_int_seen : (z.int_low || im2_int(z))) p |= Z80_INT; else p &= ~Z80_INT;
     if (dma_bus) p = dma_pins(z);                                     // the CPU frozen, the bus the DMA's
     else p = z80_tick(&z.cpu, p);
     if (!dma_bus && z.stop_on && !z.first_edge && z80_opdone(&z.cpu)) {
@@ -2160,12 +2292,14 @@ bool cpu_edge(ZXN& z) {
         if (p & Z80_RD) {
             Kind k;
             Z80_SET_DATA(p, mem_read(z, a, &k));
+            if (z.bus_eff_en && bus_mem_visible(z, a, false)) bus_cycle(z, 0, a, Z80_GET_DATA(p));
             if (z.speed_eff == 3 && (k == K_SRAM || k == K_BRAM5)) z.wait_next = true;   // ref §1.4
             if (fetch) snoop_fetch(z, Z80_GET_DATA(p));
             z.rd_open = !fetch && z.speed_eff < 3;                    // below 28 MHz the memory takes the address at T2
             z.rd_addr = a;
         } else if (p & Z80_WR) {
             z.rd_open = false;
+            if (z.bus_eff_en && bus_mem_visible(z, a, true)) bus_cycle(z, 1, a, Z80_GET_DATA(p));
             mem_write(z, a, Z80_GET_DATA(p));
         } else if (z.rd_open) {                                       // the read's T2 (or a refresh, which closes it)
             z.rd_open = false;
@@ -2184,11 +2318,13 @@ bool cpu_edge(ZXN& z) {
             z.in_latch_dt = (3 * per + 1) / 2 - 1;
             uint8_t v = io_read(z, port);
             z.in_latch_dt = -1;
+            if (bus_io_visible(z, port)) bus_cycle(z, 2, port, v);
             Z80_SET_DATA(p, v);
             if (z.io_logging) z.io_log.push_back({z.t28, z.cpu_clocks, port, v, 0});
         } else if (p & Z80_WR) {
             uint8_t v = Z80_GET_DATA(p);
             if (z.io_logging) z.io_log.push_back({z.t28, z.cpu_clocks, port, v, 1});
+            if (bus_io_visible(z, port)) bus_cycle(z, 3, port, v);
             io_write(z, port, v);
         }
     }
@@ -2222,13 +2358,19 @@ bool cpu_edge(ZXN& z) {
     // Speccy-Zone's review)
     if (!(bus_before & (Z80_MREQ | Z80_IORQ | Z80_M1)) && !db_saved.busak) {   // and the DMA not holding it (5714)
         z.speed_eff = z.speed_prog;
+        const bool ben = z.nr[0x80] & 0x80, bio = z.nr[0x80] & 0x20, bmem = z.nr[0x80] & 0x10;
+        if (ben != z.bus_eff_en || bio != z.bus_eff_dis_io || bmem != z.bus_eff_dis_mem) {
+            z.bus_eff_en = ben; z.bus_eff_dis_io = bio; z.bus_eff_dis_mem = bmem;
+            remap(z);                                                 // ROMCS and the port enables follow (5711-5720)
+        }
+        if (z.bus_eff_en) z.speed_eff = 0;                            // NR 0x81's speed, fixed 00 (5723-5727, 5433)
         if (hc_ula(z) & 0x100) z.eff_cd = z.nr[0x08] & 0x40;          // in the line's right half only (zxnext:5729-5731)
     }
     // the INT pulse is counted on rising CPU edges until 32 (48K, +3) or 36 (128K, Pentagon), then released on the
     // falling 28 MHz edge inside this same tick (zxnext:1993-2003): this edge still saw INT low, the next won't
     if (z.int_low && ++z.int_count >= T(z).int_len) {
         z.int_low = false;
-        z.int_log.back().end = z.t28 + 1;                             // the first tick that starts with INT high
+        z.int_log.back().end = z.t28 + 1 + (bus_int_path(z) ? 2 : 0);                             // the first tick that starts with INT high
     }
     if (!dma_bus) z.pins = p;
     z.bus_pins = p;
@@ -2238,6 +2380,22 @@ bool cpu_edge(ZXN& z) {
 // One 28 MHz master tick. Returns false if a stop was due before anything moved.
 void spr_swap(ZXN& z);
 bool master_tick(ZXN& z) {
+    // top4's INT loop, two CLK_28 registers clocked at this tick's edge; the CPU, sampling at the same edge, sees
+    // the read-back register as it was before it: so the Next's own INT arrives two ticks late round the bus
+    z.bus_int_seen = z.bus_int_q;
+    // the bus's NMI: registered (top4:753), then asymmetrical_debounce: a press passes at once, a release only after 8
+    // of CLK_28_DEBOUNCE_EN's pulses (the 18-bit divider's wrap, every 2^18 ticks: 65.5-74.9 ms; top4:1047-1053, 1931)
+    if (z.bus_nmi || z.bus_nmi_q || z.bus_nmi_db || z.bus_nmi_cnt < 8) {
+        const bool q = z.bus_nmi_q, en = (z.t28 & 0x3FFFF) == 0;
+        const int cnt = q ? 0 : (en && z.bus_nmi_cnt < 8) ? z.bus_nmi_cnt + 1 : z.bus_nmi_cnt;
+        z.bus_nmi_db = !z.bus_nmi_db ? q : z.bus_nmi_cnt < 8;
+        z.bus_nmi_cnt = cnt;
+        z.bus_nmi_q = z.bus_nmi;
+    }
+    if (z.bus_eff_en || z.bus_inten || z.bus_int_q) {
+        z.bus_int_q = z.bus_inten || z.bus_int;                       // the line, read back (752; the inverting input)
+        z.bus_inten = z.bus_eff_en && (z.int_low || im2_int(z));      // our driver (1967, 1988)
+    }
     if (z.serial_on) {                                                // stepped while busy, free when idle
         serial_tick(z);
         z.serial_on = z.uart[0].active() || z.uart[1].active();
@@ -2288,7 +2446,7 @@ bool master_tick(ZXN& z) {
                 // state of INT at the start of each master tick, which is what the CPU samples on its rising edges.
                 z.int_low = true;
                 z.int_count = 0;
-                z.int_log.push_back({z.t28 + 1, 0});
+                z.int_log.push_back({z.t28 + 1 + (bus_int_path(z) ? 2 : 0), 0});   // (+2: round the bus, §9.1 (19) b)
             }
         }
         const Timing& t = T(z);
@@ -2457,12 +2615,28 @@ void zxn_slot_desc(ZXN* z, int i, int write, int* out) {
     out[1] = write ? z->wr_val[i] : z->rd_val[i];
 }
 
-int zxn_nr_read(ZXN* z, int n) { return nr_read(*z, n & 0xFF); }
-void zxn_nr_write(ZXN* z, int n, int v) { nr_write(*z, n & 0xFF, v); }
+// as through ports 0x243B/0x253B (DESIGN.md §9.1's API table): the selection is left at n (Loam's bus foil)
+int zxn_nr_read(ZXN* z, int n) { z->nr_sel = n & 0xFF; return nr_read(*z, n & 0xFF); }
+void zxn_nr_write(ZXN* z, int n, int v) { z->nr_sel = n & 0xFF; nr_write(*z, n & 0xFF, v); }
 int zxn_io_in(ZXN* z, int port) { return io_read(*z, port & 0xFFFF); }
 void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
 uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
 int zxn_cvc(ZXN* z) { return cvc(*z); }                          // DESIGN.md §9
+void zxn_bus_rom(ZXN* z, const uint8_t* data, int len) {
+    z->bus_rom.clear();
+    if (len > 0) {
+        z->bus_rom.assign(16384, 0xFF);
+        for (int i = 0; i < 16384; i++) z->bus_rom[i] = data[i % (len < 16384 ? len : 16384)];
+    }
+    remap(*z);
+}
+void zxn_bus_io_clear(ZXN* z) { z->bus_io.clear(); }
+void zxn_bus_io_add(ZXN* z, int mask, int value, int byte) { z->bus_io.push_back({(uint16_t)mask, (uint16_t)value, (uint8_t)byte}); }
+void zxn_bus_lines(ZXN* z, int wait, int int_, int nmi) { z->bus_wait = wait; z->bus_int = int_; z->bus_nmi = nmi; }
+void zxn_bus_wait(ZXN* z, int n) { z->bus_wait_next = n; }
+void zxn_bus_logging(ZXN* z, int on) { z->bus_logging = on; if (!on) z->bus_log.clear(); }
+int zxn_bus_log_len(ZXN* z) { return (int)z->bus_log.size(); }
+void zxn_bus_log_get(ZXN* z, int i, uint64_t* out) { for (int k = 0; k < 4; k++) out[k] = z->bus_log[i][k]; }
 void zxn_set_joy(ZXN* z, int left, int right) {
     z->joy[0] = left & 0x7FF; z->joy[1] = right & 0x7FF;
     z->uart[0].wake = z->uart[1].wake = 4;                            // a joystick port may carry a UART

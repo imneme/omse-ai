@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_uart_feed': ([P, I, ctypes.c_char_p, I, U64, I, I, I], None), 'zxn_uart_sent_len': ([P, I], I), 'zxn_uart_sent_get': ([P, I, I, U64P], None), 'zxn_uart_sent_clear': ([P, I], None), 'zxn_uart_cts': ([P, I, I], None), 'zxn_uart_feed_levels': ([P, I, ctypes.c_char_p, U64P, I], None), 'zxn_uart_tx_logging': ([P, I, I], None), 'zxn_uart_tx_log_len': ([P, I], I), 'zxn_uart_tx_log_get': ([P, I, I, U64P], None), 'zxn_uart_rts': ([P, I], I), 'zxn_i2c_rtc': ([P, I, I, I, I, I, I, I, I], None), 'zxn_i2c_logging': ([P, I], None), 'zxn_i2c_log_len': ([P], I), 'zxn_i2c_log_get': ([P, I, U64P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_bus_rom': ([P, ctypes.c_char_p, I], None), 'zxn_bus_io_clear': ([P], None), 'zxn_bus_io_add': ([P, I, I, I], None), 'zxn_bus_lines': ([P, I, I, I], None), 'zxn_bus_wait': ([P, I], None), 'zxn_bus_logging': ([P, I], None), 'zxn_bus_log_len': ([P], I), 'zxn_bus_log_get': ([P, I, U64P], None), 'zxn_uart_feed': ([P, I, ctypes.c_char_p, I, U64, I, I, I], None), 'zxn_uart_sent_len': ([P, I], I), 'zxn_uart_sent_get': ([P, I, I, U64P], None), 'zxn_uart_sent_clear': ([P, I], None), 'zxn_uart_cts': ([P, I, I], None), 'zxn_uart_feed_levels': ([P, I, ctypes.c_char_p, U64P, I], None), 'zxn_uart_tx_logging': ([P, I, I], None), 'zxn_uart_tx_log_len': ([P, I], I), 'zxn_uart_tx_log_get': ([P, I, I, U64P], None), 'zxn_uart_rts': ([P, I], I), 'zxn_i2c_rtc': ([P, I, I, I, I, I, I, I, I], None), 'zxn_i2c_logging': ([P, I], None), 'zxn_i2c_log_len': ([P], I), 'zxn_i2c_log_get': ([P, I, U64P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
         'zxn_audio_capture': ([P, I], None), 'zxn_audio_take': ([P, U16P, I], I), 'zxn_audio_cap_len': ([P], I),
@@ -322,7 +322,7 @@ class Next:
         self.lib.zxn_slot_desc(self.z, i, 1 if write else 0, out)
         tag, val = out[0], out[1]
         return [val, ('rom', val), ('altrom', val), 'boot', ('config', val), 'divmmc-rom', ('divmmc', val),
-                'mf-rom', 'mf-ram', ('l2', val), None][tag]
+                'mf-rom', 'mf-ram', ('l2', val), 'bus-rom', None][tag]
 
     def mmu(self, i):
         """The MMU register for slot i (NR 0x50 + i), whatever overrides it."""
@@ -469,6 +469,45 @@ class Next:
         for i in range(self.lib.zxn_i2c_log_len(self.z)):
             self.lib.zxn_i2c_log_get(self.z, i, out)
             res.append((out[0], out[1], out[2]))
+        return res
+
+    # ---- the expansion bus (DESIGN.md §9.1 (19)): the host is whatever is plugged in; nothing by default
+    def bus_rom(self, data=None):
+        """A ROM cartridge on the bus asserting ROMCS (16K, or 8K mirrored), or None to remove it. With the bus on
+        (NR 0x80 b7) and memory cycles enabled, ROM-area reads come from it (or divMMC banks 14/15 with NR 0x80 b6)."""
+        data = bytes(data or b'')
+        self.lib.zxn_bus_rom(self.z, data, len(data))
+
+    def bus_io(self, answers=None):
+        """Static answers for reads the bus gets: {port: byte} for an exact port, {(mask, value): byte} for a decode.
+        An answer matching port FE asserts IORQULA, taking FE from the ULA. Replaces any earlier answers."""
+        self.lib.zxn_bus_io_clear(self.z)
+        for k, b in (answers or {}).items():
+            mask, value = k if isinstance(k, tuple) else (0xFFFF, k)
+            self.lib.zxn_bus_io_add(self.z, mask, value, b)
+
+    def bus_lines(self, wait=False, int_=False, nmi=False):
+        """The device's WAIT, INT and NMI, held (True asserted). INT reaches the CPU with the bus on, I/O enabled and
+        NR 0xC4 b7; NMI with the bus on and memory cycles enabled."""
+        self.lib.zxn_bus_lines(self.z, 1 if wait else 0, 1 if int_ else 0, 1 if nmi else 0)
+
+    def bus_wait(self, n):
+        """n wait states on the next cycle the connector carries."""
+        self.lib.zxn_bus_wait(self.z, n)
+
+    def bus_log(self, on=True):
+        """Log the cycles the connector carries while the bus is on (zx.bus_events). Turning it off clears it."""
+        self.lib.zxn_bus_logging(self.z, 1 if on else 0)
+
+    @property
+    def bus_events(self):
+        """[(t28, kind, addr, value)], kind 'mr', 'mw', 'ir' or 'iw' (refreshes left out), stamped like io_events."""
+        out = (ctypes.c_uint64 * 4)()
+        kinds = ('mr', 'mw', 'ir', 'iw')
+        res = []
+        for i in range(self.lib.zxn_bus_log_len(self.z)):
+            self.lib.zxn_bus_log_get(self.z, i, out)
+            res.append((out[0], kinds[out[1]], out[2], out[3]))
         return res
 
     def set_mouse(self, x=0, y=0, buttons=0, wheel=0):

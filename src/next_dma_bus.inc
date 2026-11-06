@@ -163,11 +163,21 @@ void dma_cycle(ZXN& z, uint64_t p) {
             // sram_wait_n follows cpu_rd_n, the DMA's while it has the bus (zxnext:3130-3137)
             if (z.speed_eff == 3 && (k == K_SRAM || k == K_BRAM5)) z.wait_next = true;
             dma_note(z, 0, a, d.data);
+            if (z.bus_eff_en && bus_mem_visible(z, a, false)) bus_cycle(z, 0, a, d.data);
             break;
         }
-        case NextDma::MEM_WRITE: mem_write(z, a, d.data); dma_note(z, 1, a, d.data); break;
-        case NextDma::IO_READ: d.data = io_read(z, a); dma_note(z, 2, a, d.data); break;
-        case NextDma::IO_WRITE: io_write(z, a, d.data); dma_note(z, 3, a, d.data); break;
+        // the expansion bus carries the DMA's cycles too: bus_mreq_n and bus_iorq_n follow the bus mux (zxnext:
+        // 2178-2179; Ratio, §9.1 (19), with Kelp's leave)
+        case NextDma::MEM_WRITE:
+            if (z.bus_eff_en && bus_mem_visible(z, a, true)) bus_cycle(z, 1, a, d.data);
+            mem_write(z, a, d.data); dma_note(z, 1, a, d.data); break;
+        case NextDma::IO_READ:
+            d.data = io_read(z, a); dma_note(z, 2, a, d.data);
+            if (bus_io_visible(z, a)) bus_cycle(z, 2, a, d.data);
+            break;
+        case NextDma::IO_WRITE:
+            if (bus_io_visible(z, a)) bus_cycle(z, 3, a, d.data);
+            io_write(z, a, d.data); dma_note(z, 3, a, d.data); break;
         default: break;
     }
 }
