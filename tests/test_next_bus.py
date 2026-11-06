@@ -71,6 +71,16 @@ class Registers(NextCase):
         zx.run_ticks(64)
         self.assertEqual(zx.nr_read(0x81) & 0x80, 0x80)
 
+    def test_nr81_reads_0_with_nothing_plugged_in(self):
+        """Ruling (19) c: /ROMCS has a 680R pull-down on the board (issue 4
+        schematic sheet 8, R93; machine/BUS-PINS.md), so with nothing attached
+        b7 reads 0, bus on or off: the read isn't gated (zxnext:6033)."""
+        zx = bare()
+        self.assertEqual(zx.nr_read(0x81), 0x00)
+        bus_on(zx)
+        zx.nr_write(0x81, 0x70)
+        self.assertEqual(zx.nr_read(0x81), 0x70, 'b7 still 0 beside the stored bits')
+
     def test_nr8a_is_six_bits(self):
         zx = bare()
         zx.nr_write(0x8A, 0xFF)
@@ -332,6 +342,41 @@ class Lines(NextCase):
         s, e = first(0x00)
         self.assertEqual(first(0x80), (s + 2, e + 2))
         self.assertEqual(first(0x80, c4=0x01), (s, e), 'C4h b7 clear: INT from inside, no loop')
+
+    def nmi_machine(self, nr81=0x00):
+        zx = bare()
+        zx.nr_write(0x03, 0x01)                         # out of config mode: a 48K, ROM 0
+        zx.sram[0x0066], zx.sram[0x0067] = 0xED, 0x45   # RETN in ROM 0 (ROM_SRAM[0])
+        zx.nr_write(0x81, nr81)
+        bus_on(zx)
+        zx.bus_lines(nmi=True)
+        self.assertTrue(reached(zx, 0x0066, 10**5), 'the first NMI')
+        zx.run_ticks(1000)
+        return zx
+
+    def test_a_bus_nmi_release_is_debounced(self):
+        """top4:1931-1946: misc/asymmetrical_debounce.vhd, COUNTER_SIZE 3, clocked
+        by CLK_28_DEBOUNCE_EN once every 2^18 master ticks (top4:1044-1053): a
+        fall passes at once, a release counts only after 8 enables of steady high,
+        7 to 8 x 2^18 ticks. Until then the NMI machine holds (zxnext:2093-2097),
+        so a new fall isn't a new NMI. (Rustyback's reading; mine of the same lines.)"""
+        zx = self.nmi_machine()
+        zx.bus_lines(nmi=False)
+        zx.run_ticks(1_000_000)                         # under 7 x 2^18
+        zx.bus_lines(nmi=True)
+        self.assertFalse(zx.run_until_pc(0x0066, max_ticks=50_000), 'still held: no second NMI')
+        zx.bus_lines(nmi=False)
+        zx.run_ticks(2_200_000)                         # over 8 x 2^18
+        zx.bus_lines(nmi=True)
+        self.assertTrue(reached(zx, 0x0066, 50_000), 'released, then a new fall')
+
+    def test_nr81_b5_bypasses_the_nmi_debounce(self):
+        """top4:1946: NR 81h b5 takes the registered pin straight in."""
+        zx = self.nmi_machine(nr81=0x20)
+        zx.bus_lines(nmi=False)
+        zx.run_ticks(10_000)
+        zx.bus_lines(nmi=True)
+        self.assertTrue(reached(zx, 0x0066, 50_000))
 
     def test_a_device_nmi(self):
         """nmi_assert_expbus: bus on, memory enabled, the line held (zxnext:2047),
