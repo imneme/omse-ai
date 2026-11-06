@@ -990,6 +990,66 @@ class Registers(VideoCase):
                 self.assertEqual(bad, {}, f'NR: (got, want) after writing {pat:02X}')
 
 
+def upload_half(s, start, salt):
+    """128 pattern bytes through port 0x5B from wherever its pointer is (none the transparent E3)."""
+    for i in range(128):
+        b = (i * 0x3B + salt) & 0xFF
+        s.io(0x5B, 0x00 if b == 0xE3 else b)
+    return s
+
+
+@needs_next
+class SpriteMirror(VideoCase):
+    """The nextreg route to the sprites: NR 0x34 picks the mirror's sprite, NR 0x35-0x39 write its bytes,
+    NR 0x75-0x79 write and then step; NR 0x09 b4 ties the mirror to the ports (zxnext:4794-4855, 5126,
+    5939; sprites:594-745)."""
+
+    def check(self, s):
+        v, zx = s.model(), s.machine()
+        self.assertEqual(zx.nr_read(0x34), v.nr_read(0x34), 'NR 0x34 (zxnext:5939-5940)')
+        self.assertFrameMatches(s)
+
+    def test_nextreg_writes_and_steps(self):
+        s = sprite_scene(0x01, [[20 + 24 * i, 150, 0x00, 0x00 | i] for i in range(24)])   # invisible ones
+        s.nr(0x34, 30).nr(0x35, 60).nr(0x36, 50).nr(0x37, 0x24).nr(0x38, 0xC0 | 3).nr(0x79, 0x0A)   # 30, steps
+        s.nr(0x35, 100).nr(0x36, 50).nr(0x37, 0x30).nr(0x78, 0x80 | 4)                               # 31, steps
+        s.nr(0x35, 140).nr(0x36, 52).nr(0x37, 0x4E).nr(0x38, 0x80 | 7)                               # 32, stays
+        s.nr(0x34, 8)
+        for i in range(8):                                  # make 8-15 visible, a step each
+            s.nr(0x78, 0x80 | (9 + i))
+        self.check(s)
+
+    def test_lockstep_moves_the_ports(self):
+        s = sprite_scene(0x01, []).nr(0x09, 0x10)
+        s.nr(0x34, 0x80 | 5)                                # sprite 5, pattern 5's second half
+        for b in (90, 70, 0x00, 0x80 | 5):
+            s.io(0x57, b)                                   # port 0x57 now writes sprite 5
+        upload_half(s, 0, 0x29)                             # port 0x5B, pattern 5 from byte 128
+        s.nr(0x34, 7).nr(0x75, 130).nr(0x35, 0)             # sprite 7's x, a step to 8 moves port 0x57 too
+        for b in (200, 70, 0x10, 0x80 | 5):
+            s.io(0x57, b)                                   # sprite 8 (the step reloaded the port's index)
+        self.check(s)
+
+    def test_port_advance_moves_the_mirror_but_not_the_pattern_pointer(self):
+        s = sprite_scene(0x01, []).nr(0x09, 0x10)
+        s.io(0x303B, 0x80 | 12)                             # mirror follows: sprite 12 (sprites:607-609)
+        for b in (40, 90, 0x00, 0x80 | 12, 40, 110, 0x00, 0x80 | 13):
+            s.io(0x57, b)                                   # sprites 12 and 13; the mirror is now 14
+        upload_half(s, 0, 0x45)                             # still pattern 12's second half
+        s.nr(0x37, 0x50).nr(0x38, 0x80 | 12).nr(0x36, 110).nr(0x35, 80)   # sprite 14 by nextreg
+        self.check(s)
+
+    def test_untied_nextreg_leaves_the_ports_alone(self):
+        s = sprite_scene(0x01, [])
+        s.io(0x303B, 20)
+        s.nr(0x34, 0x80 | 3)                                # untied: ports stay at sprite 20, pattern 20
+        for b in (60, 100, 0x00, 0x80 | 20):
+            s.io(0x57, b)
+        upload_half(s, 0, 0x17)
+        s.nr(0x35, 160).nr(0x36, 100).nr(0x37, 0x00).nr(0x38, 0x80 | 3)   # sprite 3 by nextreg
+        self.check(s)
+
+
 def ulap_scene(seed=8):
     s = ula_scene(seed)
     s.io(0xBF3B, 0x40).io(0xFF3B, 0x01)                     # ULA+ on (zxnext:4489-4490)

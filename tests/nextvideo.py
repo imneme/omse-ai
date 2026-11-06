@@ -99,6 +99,8 @@ class Video:
         self.spr_pat = bytearray(16384)
         self.spr_attr_index = 0
         self.spr_pat_index = 0
+        self.mirror_q = 0               # the nextreg mirror's sprite (b6:0) and half bit (b7) (sprites:594-612)
+        self.sprite_tie = 0             # NR 0x09 bit 4: nextreg mirror and ports in lockstep (zxnext:5126)
         self.nr4b = 0xE3
         # memory the layers read
         self.bram5 = bytearray(16384)
@@ -208,6 +210,18 @@ class Video:
             self.tm_scroll_x = (self.tm_scroll_x & 0x300) | v               # zxnext:5271-5272
         elif n == 0x31:
             self.nr31 = v                                   # zxnext:5274-5275
+        elif n == 0x09:
+            self.sprite_tie = (v >> 4) & 1                  # zxnext:5126
+        elif n == 0x34:                                     # the mirror's sprite (zxnext:4794; sprites:600-602)
+            self.mirror_q = v
+            self._mirror_changed()
+        elif n in (0x35, 0x36, 0x37, 0x38, 0x39, 0x75, 0x76, 0x77, 0x78, 0x79):
+            # attribute byte n - 0x35 of the mirror's sprite (zxnext:4796-4814; sprites:704-715), written on the
+            # inverted clock before 0x75-0x79's step lands on the next rising edge (zxnext:4855; sprites:603-606)
+            self.spr_attr[self.mirror_q & 0x7F][(n & 0x0F) - 5] = v
+            if n & 0x40:
+                self.mirror_q = (self.spr_pat_index & 0x80) | ((self.mirror_q + 1) & 0x7F)
+                self._mirror_changed()
         elif n == 0x32:
             self.nr32 = v
         elif n == 0x33:
@@ -226,6 +240,8 @@ class Video:
             return (((e >> 14) & 3) << 6) | (e & 1)
         if n == 0x28:
             return self.pal_stored                          # NR 0x44's first byte (zxnext:5337, 5910-5911)
+        if n == 0x34:
+            return self.mirror_q & 0x7F                     # zxnext:5939-5940; sprites:614
         if n in (0x18, 0x19, 0x1A, 0x1B):                   # the entry at the clip index (zxnext:5854-5885)
             return self.clip[n][self.clip_idx[n]]
         if n == 0x1C:                                       # the four clip indices (zxnext:5886-5887)
@@ -266,12 +282,14 @@ class Video:
         elif port & 0xFFFF == 0x303B:                       # sprite and pattern select (sprites:658-661, 728-730)
             self.spr_attr_index = (v & 0x7F) << 3
             self.spr_pat_index = ((v & 0x3F) << 8) | ((v >> 7) << 7)
+            self._mirror_follow()
         elif lo == 0x57:                                    # an attribute byte, then the index steps: past byte 4,
             sp, ib = self.spr_attr_index >> 3, self.spr_attr_index & 7   # or byte 3 without bit 6, to the next
             if ib <= 4:                                     # sprite's byte 0 (sprites:637-668, 704-708)
                 self.spr_attr[sp][ib] = v
             if (ib & 4) or (ib == 3 and not (v & 0x40)):
                 self.spr_attr_index = ((sp + 1) & 0x7F) << 3
+                self._mirror_follow()
             else:
                 self.spr_attr_index = (self.spr_attr_index + 1) & 0x3FF
         elif lo == 0x5B:                                    # a pattern byte, then the index steps (sprites:713-735)
@@ -280,6 +298,20 @@ class Video:
         elif port & 0xFFFF == 0x123B:
             if not (v & 0x10):                              # bit 4 = 0: bit 1 shows Layer 2 (zxnext:3855-3857)
                 self.l2_en = (v >> 1) & 1
+
+    def _mirror_follow(self):
+        """Lockstep: a change of port 0x57's sprite (a 0x303B write, or the advance to the next sprite) moves
+        the mirror's sprite too, its bit 7 from the pattern pointer; the pattern pointer stays (sprites:607-609)."""
+        if self.sprite_tie:
+            self.mirror_q = (self.spr_pat_index & 0x80) | (self.spr_attr_index >> 3)
+
+    def _mirror_changed(self):
+        """Lockstep: a change of the mirror's sprite (NR 0x34, or a 0x75-0x79 step) moves port 0x57's sprite
+        and port 0x5B's pattern slot, keeping bit 7 as the 128-byte half (sprites:653-654, 733-734)."""
+        if self.sprite_tie:
+            q = self.mirror_q
+            self.spr_attr_index = (q & 0x7F) << 3
+            self.spr_pat_index = ((q & 0x3F) << 8) | (q & 0x80)
 
     def load_loader_palette(self):
         """The writes vdp_init makes (vdp:58-127), through the write path above."""
