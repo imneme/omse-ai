@@ -297,6 +297,33 @@ class Timing(NextCase):
                                      [32 * pre + 3 * m] * 3,
                                      '32 t28 a prescaler unit at any speed, plus three clocks')
 
+    def test_port_timing_resets_keep_the_prescaler(self):
+        """C7h and CBh reset only their port's timing (dma:647-651); only C3h
+        clears the prescaler (dma:643). (The wiki says all three do: probe.)"""
+        zx = machine()
+        zx.dma_log(True)
+        program(zx, A, B, 4, a_t=T2, b_t=T2, pre=10, enable=False)
+        zx.io_out(ZXN, 0xC7)
+        zx.io_out(ZXN, 0xCB)
+        zx.io_out(ZXN, 0x87)
+        zx.run_ticks(4 * 32 * 10 + 20000)
+        ev = zx.dma_events
+        self.assertEqual(len(ev), 8)
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])][0::2], [3] * 4,
+                         'reads back to 3 clocks')
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev[0::2], ev[2::2])], [ref.dma_period(3, 3, 10, 8)] * 3,
+                         'and the prescaler still spaces the bytes')
+
+    def test_the_prescaler_works_in_z80_mode_too(self):
+        """dma:424 and 451 have no mode term. (The wiki says zxnDMA mode only: probe.)"""
+        zx = machine()
+        zx.dma_log(True)
+        program(zx, A, B, 3, pre=10, port=Z80)
+        zx.run_ticks(4 * 32 * 10 + 20000)
+        ev = [e for e in zx.dma_events if e[2] == 'mr']
+        self.assertEqual(len(ev), 4, 'Z80 mode: length + 1')
+        self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [ref.dma_period(3, 3, 10, 8)] * 3)
+
     def test_continuous_mode_keeps_the_bus(self):
         zx = machine()
         zx.dma_log(True)
