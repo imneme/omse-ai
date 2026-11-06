@@ -130,6 +130,12 @@ struct ZXN {
     uint16_t cop_data = 0;              // copper_data_o
     uint8_t cop_reg = 0, cop_val = 0;   // copper_nr_reg / copper_nr_dat
     uint8_t nmi_flags = 0;              // NR 0x02 b3 (multiface) and b2 (divMMC): software NMI requests
+    int nmi_cause = 0;                  // nmi_mf (1), nmi_divmmc (2): the NMI accepted, first come first served
+    int nmi_state = 0;                  // 0 idle, 1 waiting for the fetch from 0x0066, 2 held by its device, 3 end
+    bool nmi_pending_mf = false, nmi_pending_dm = false;   // a button or NR 0x02 request this cycle
+    bool mf_active = false, mf_invisible = true, mf_enable = false;   // multiface.vhd: nmi_active, invisible, mf_enable
+    bool mf_fetch66 = false;            // the fetch from 0x0066 that pages it in, while it lasts
+    bool dm_button = false;             // divmmc.vhd's button_nmi
     uint16_t joy[2] = {0, 0};           // the joysticks: X Z Y START A C B U D L R in bits 10:0 (zxnext:3398-3400)
     uint8_t ay_reg[3][16] = {{0}};      // the AYs' register files (ym2149.vhd), chip 0 = AY_ID 11, 1 = 10, 2 = 01
     uint8_t ay_addr[3] = {0, 0, 0};     // each chip's selected register (5 bits)
@@ -221,6 +227,7 @@ inline RomSel rom_select(const ZXN& z) {
     }
 }
 
+inline bool mf_mapped(const ZXN& z);
 // divMMC (ref §3.8; device/divmmc.vhd; zxnext:4043-4131). Port 0xE3's decode (NR 0x83 b0, port enable bit 8) gates
 // it all; automap also needs NR 0x0A b4 (divmmc_automap_reset, zxnext:4053).
 inline bool dm_en(const ZXN& z) { return z.nr[0x83] & 1; }
@@ -272,6 +279,21 @@ void remap(ZXN& z) {
                 z.wr_val[s] = 0;
             }
         }
+        // the multiface (ref §3.9; zxnext:2988-2995): its ROM (SRAM 0x014000, read-only) and RAM (0x016000) over
+        // slots 0-1, excluding divMMC, Layer 2, ROMCS and the alternate ROM (override "000")
+        if (s < 2 && mf_mapped(z)) {
+            uint8_t* p = z.sram + 0x14000 + s * 0x2000;
+            z.rd[s] = p;
+            z.rd_kind[s] = K_SRAM;
+            z.rd_tag[s] = s == 0 ? T_MFROM : T_MFRAM;
+            z.rd_val[s] = 0;
+            z.wr[s] = s == 0 ? nullptr : p;
+            z.wr_kind[s] = s == 0 ? K_NONE : K_SRAM;
+            z.wr_tag[s] = s == 0 ? T_NONE : T_MFRAM;
+            z.wr_val[s] = 0;
+            if (z.bootrom_en) { z.rd[s] = z.bootrom; z.rd_kind[s] = K_BOOT; z.rd_tag[s] = T_BOOT; }
+            continue;
+        }
         // Layer 2's map (ref §3.7; zxnext:2924-2930, 3024, 3036, 3059-3066): slots 0-1, or 0-5 in segment mode 3,
         // for writes (0x123B b0) and reads (b2) separately. The page is ((NR 0x12, or NR 0x13 with b3) + the segment
         // or A15:14 + the offset) x 2 + A13, low 8 bits, placed like an MMU page; 0xE0 and up is no memory. It always
@@ -298,7 +320,7 @@ void remap(ZXN& z) {
         // conmem or automap, 0x0000-0x1FFF is its ROM (SRAM 0x010000) or, with mapram, RAM bank 3, read-only either
         // way; 0x2000-0x3FFF is the bank from port 0xE3, read-only if mapram is set and it's bank 3 (divmmc:83-101;
         // "Issue #7": conmem with mapram also brings in bank 3). (The multiface, when it comes, excludes it.)
-        if (s < 2 && dm_en(z) && ((z.porte3 & 0x80) || dm_automap(z))) {
+        if (s < 2 && dm_en(z) && ((z.porte3 & 0x80) || dm_automap(z)) && !mf_mapped(z)) {
             const bool mapram = z.porte3 & 0x40;
             if (s == 0 && !mapram) {
                 z.rd[s] = z.sram + 0x10000;
@@ -387,6 +409,8 @@ void int_raise(ZXN& z, int i, bool unq);
 inline uint16_t int_status(const ZXN& z);
 void ctc_write(ZXN& z, int n, uint8_t v);
 void ay_reset(ZXN& z);
+bool mf_io(ZXN& z, uint16_t port, bool wr, uint8_t* out);
+void nmi_request(ZXN& z, bool mf);
 void ay_select(ZXN& z, uint8_t v);
 void ay_write(ZXN& z, uint8_t v);
 uint8_t ay_read(const ZXN& z, bool info);
@@ -553,8 +577,13 @@ void nr_write(ZXN& z, int n, int v) {
             return;
         case 0x02:                                                    // reset (ref §4.3)
             z.nr[0x02] = (z.nr[0x02] & 0x7F) | (v & 0x80);
-            z.nmi_flags = v & 0x0C;                                   // b3/b2 request an NMI; a 0 clears (zxnext:3781-3805;
-                                                                      // the NMI itself: with the multiface)
+            {                                                         // b3/b2 request an NMI (zxnext:3770-3805): the flags set
+                const bool accept = z.nmi_state <= 1;                 // only while one may be accepted, and a 0 clears them
+                if (v & 0x08) { if (accept) z.nmi_flags |= 0x08; } else z.nmi_flags &= ~0x08;
+                if (v & 0x04) { if (accept) z.nmi_flags |= 0x04; } else z.nmi_flags &= ~0x04;
+                if ((v & 0x08) && (z.nr[0x06] & 0x08)) nmi_request(z, true);    // with NR 0x06 b3 / b2 (2049-2050)
+                else if ((v & 0x04) && (z.nr[0x06] & 0x10)) nmi_request(z, false);
+            }
             if (v & 2) do_reset(z, true);
             else if (v & 1) do_reset(z, false);
             return;
@@ -674,6 +703,11 @@ void do_reset(ZXN& z, bool hard) {
     z.cop_data = 0;
     z.nmi_flags = 0;                                                  // (zxnext:3784-3785, 3797-3798)
     ay_reset(z);
+    z.nmi_cause = z.nmi_state = 0;                                    // (zxnext:2057-2060, 2113)
+    z.nmi_pending_mf = z.nmi_pending_dm = false;
+    z.mf_active = z.mf_enable = z.mf_fetch66 = false;                 // (multiface:63-120)
+    z.mf_invisible = true;
+    z.dm_button = false;
     z.ulap_mode = z.ulap_index = 0;                                   // (zxnext:4469-4471, 4487-4488)
     z.ulap_en = false;
     z.nr_sel = 0x24;
@@ -731,6 +765,7 @@ uint8_t io_read(ZXN& z, uint16_t port) {
     if ((port & 0xFF) == 0xEB && port_en(z, 11)) return z.spi_rx;     // the previous transfer's byte (ref §1.7)
     if ((port & 0xFF) == 0x1F && port_en(z, 6) && joy_port_on(z, 0x1F)) return joy_read(z, 0x1F);   // (zxnext:2633)
     if ((port & 0xFF) == 0x37 && port_en(z, 7) && joy_port_on(z, 0x37)) return joy_read(z, 0x37);   // (zxnext:2634)
+    { uint8_t v; if (mf_io(z, port, false, &v)) return v; }           // the multiface (zxnext:2569-2575, 4248-4263)
     if (fd(port) && (port & 4) && port_en(z, 16)) {                   // the AY: FFFD, BFFD (+3 timing), BFF5
         const int hi = port >> 14;                                    // (zxnext:2606-2608, 2730)
         if (hi == 2 && !(port & 8)) return ay_read(z, true);
@@ -756,6 +791,7 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
         else z.spi_cs = 0xFF;
     }
     if ((port & 0xF8FF) == 0x183B && port_en(z, 27) && ((port >> 8) & 7) < 4) ctc_write(z, (port >> 8) & 7, v);
+    mf_io(z, port, true, nullptr);
     if (fd(port) && (port & 4) && port_en(z, 16)) {                   // the AY (zxnext:2731-2732): FFFD loses to DFFD
         const bool dffd = (port >> 12) == 0xD && port_en(z, 2);
         if ((port >> 14) == 3 && !dffd) ay_select(z, v);
@@ -887,6 +923,83 @@ inline void draw_pixel(ZXN& z) {
 
 // One rising edge of the CPU clock. Returns false (and changes nothing) if a run_until_pc stop is due: the CPU is
 // about to begin T1 of an instruction's first opcode fetch at an address in the range (DESIGN.md §9.1 (5)).
+// ---- NMIs (zxnext:2046-2129) and the multiface (multiface.vhd). The multiface's ports by NR 0x0A b7:6: 00 MF+3
+// enable 3F / disable BF, 01 and 10 MF128 BF / 3F, 11 (and b7 set) MF1 9F / 1F (zxnext:2571-2572).
+inline int mf_type(const ZXN& z) { return z.nr[0x0A] >> 6; }
+inline bool mf_en(const ZXN& z) { return (z.nr[0x83] >> 1) & 1; }   // port enable bit 9: off holds it in reset
+inline bool mf_is_active(const ZXN& z) { return z.mf_enable || z.mf_fetch66 || z.mf_active; }
+inline bool mf_mapped(const ZXN& z) { return mf_en(z) && (z.mf_enable || z.mf_fetch66); }
+inline bool dm_nmi_hold(const ZXN& z) { return dm_automap(z) || z.dm_button; }   // divmmc o_disable_nmi
+// a request from a button or NR 0x02 (nmi_assert_*): taken when no NMI is active (zxnext:2049-2074). The multiface
+// needs divMMC's conmem off and divMMC not holding; divMMC needs the multiface inactive.
+void nmi_request(ZXN& z, bool mf) {
+    if (z.config_mode || z.nmi_cause) return;
+    if (mf && !(z.porte3 & 0x80) && !dm_nmi_hold(z)) z.nmi_cause = 1;
+    else if (!mf && !mf_is_active(z)) z.nmi_cause = 2;
+    if (z.nmi_cause == 1 && z.nmi_state == 0 && mf_en(z) && !z.mf_active) {   // the multiface's button (multiface:93-110)
+        z.mf_active = true;
+        z.mf_invisible = false;
+    }
+    if (z.nmi_cause == 2 && z.nmi_state == 0 && dm_en(z) && !dm_automap_reset(z)) z.dm_button = true;
+}
+inline bool nmi_line(const ZXN& z) { return (z.nmi_state == 0 && z.nmi_cause) || z.nmi_state == 1; }   // (2128)
+// the state machine, on a rising CPU edge with the pins before it (zxnext:2079-2121)
+void nmi_edge(ZXN& z, uint64_t before) {
+    if (z.config_mode) { z.nmi_state = 0; z.nmi_cause = 0; return; }
+    const bool hold = z.nmi_cause == 1 ? z.mf_active : z.nmi_cause == 2 ? dm_nmi_hold(z) : false;
+    switch (z.nmi_state) {
+        case 0: if (z.nmi_cause) z.nmi_state = 1; break;
+        case 1:
+            if ((before & Z80_M1) && (before & Z80_MREQ) && Z80_GET_ADDR(before) == 0x0066) z.nmi_state = 2;
+            break;
+        case 2: if (!hold) z.nmi_state = 3; break;
+        default:
+            if (!(before & Z80_WR)) { z.nmi_state = 0; z.nmi_cause = 0; }   // (nmi_mf etc. clear in S_NMI_END)
+    }
+}
+// RETN (ED 45, as the snooper sees it): the multiface pages out and its NMI ends (multiface:85-120)
+void mf_retn(ZXN& z) {
+    if (z.mf_active || z.mf_enable) { z.mf_active = false; z.mf_enable = false; remap(z); }
+}
+// the multiface's ports (multiface:69-120; zxnext:4248-4263). Returns true if it answered a read, with *out.
+bool mf_io(ZXN& z, uint16_t port, bool wr, uint8_t* out) {
+    if (!mf_en(z)) return false;
+    const int t = mf_type(z);
+    const uint8_t en_p = (t & 2) ? 0x9F : (t & 1) ? 0xBF : 0x3F, dis_p = (t & 2) ? 0x1F : (t & 1) ? 0x3F : 0xBF;
+    const uint8_t lo = port & 0xFF;
+    if (lo != en_p && lo != dis_p) return false;
+    const bool p3 = t == 0, m48 = t == 3, en = lo == en_p;
+    const bool was = mf_mapped(z);
+    if (wr) {
+        z.mf_active = false;                                          // a write to either port ends nmi_active
+        if ((!en && !p3) || (en && p3)) z.mf_invisible = true;
+        if (mf_mapped(z) != was) remap(z);
+        return false;
+    }
+    bool answered = false;
+    if (en) {                                                         // the enable port: reads page it in if visible
+        const bool inv = z.mf_invisible && !m48;
+        z.mf_enable = !inv;
+        if (!inv && !m48) {                                           // mf_port_en: 128 and +3 types read it back
+            answered = true;
+            if (p3) {
+                switch (port >> 12) {
+                    case 0x1: *out = z.port1ffd; break;
+                    case 0x7: *out = z.port7ffd; break;
+                    case 0xD: *out = z.portdffd & 0x5F; break;
+                    case 0xE: *out = z.porteff7 & 0x0C; break;
+                    default: *out = z.border & 7;
+                }
+            } else *out = (z.port7ffd & 8) << 4 | 0x7F;
+        }
+    } else {                                                          // the disable port: reads page it out
+        z.mf_enable = false;
+        if (p3) z.mf_active = false;
+    }
+    if (mf_mapped(z) != was) remap(z);
+    return answered;
+}
+
 // ---- the AYs (turbosound.vhd, ym2149.vhd): register files only, no sound yet. Reset leaves every register 0 but the
 // mixer (R7) at 0xFF, register 0 selected and AY 0 chosen (ym2149:166-187; turbosound:80-86).
 void ay_reset(ZXN& z) {
@@ -1126,6 +1239,10 @@ inline DmEntry dm_entry(const ZXN& z, uint16_t a) {
     }
     if ((a & 0xFFF8) == 0x1FF8 && (bb & 0x40)) e.off_delayed = true;
     if ((a & 0xFF00) == 0x3D00 && (bb & 0x80)) e.rom3_instant = true;
+    if (a == 0x0066 && z.dm_button) {                                 // 0x0066 with a DRIVE-button NMI (divmmc:120-121)
+        if (bb & 0x02) e.on_instant = true;
+        if (bb & 0x01) e.on_delayed = true;
+    }
     if ((a == 0x04C6 && (bb & 0x04)) || (a == 0x0562 && (bb & 0x08)) || (a == 0x04D7 && (bb & 0x10)) ||
         (a == 0x056A && (bb & 0x20))) e.rom3_delayed = true;
     return e;
@@ -1147,7 +1264,7 @@ inline bool dm_rom3_active(const ZXN& z, uint16_t a) {
 void dm_fetch(ZXN& z, uint16_t a) {
     if (dm_automap_reset(z)) return;
     const DmEntry e = dm_entry(z, a);
-    const bool active = a < 0x4000;                                   // sram_pre_override(2): slots 0-1 (the multiface: later)
+    const bool active = a < 0x4000 && !mf_mapped(z);                  // sram_pre_override(2): slots 0-1, not the multiface
     const bool rom3 = active && dm_rom3_active(z, a);
     z.dm_hold = (active && (e.on_instant || e.on_delayed)) || (rom3 && (e.rom3_instant || e.rom3_delayed)) ||
                 (z.dm_held && !(active && e.off_delayed));
@@ -1164,9 +1281,13 @@ void dm_fetch(ZXN& z, uint16_t a) {
 void snoop_fetch(ZXN& z, uint8_t op) {
     switch (z.snoop) {
         case 1:                                                       // after ED
-            if (op == 0x45 && !dm_automap_reset(z)) {
-                z.dm_hold = z.dm_held = z.dm_instant = z.dm_pending = false;
-                remap(z);
+            if (op == 0x45) {                                         // RETN: divMMC unless the multiface is active
+                if (!mf_is_active(z) && !dm_automap_reset(z)) {       // (zxnext:4052), and the multiface itself
+                    z.dm_hold = z.dm_held = z.dm_instant = z.dm_pending = false;
+                    z.dm_button = false;
+                    remap(z);
+                }
+                mf_retn(z);
             }
             if ((op & 0xC7) == 0x46) z.im_mode = ((op & 0x18) == 0x18) ? 2 : ((op & 0x18) == 0x10) ? 1 : 0;
             if (op == 0x4D) z.reti_seen = true;                       // RETI, ED 4D only (im2c:22-38, 233-234)
@@ -1190,6 +1311,8 @@ bool cpu_edge(ZXN& z) {
     const bool p3w = p3_wait_now(z);
     if (z.wait_next || p3w) p |= Z80_WAIT; else p &= ~Z80_WAIT;
     im2_edge(z, saved_pins);
+    nmi_edge(z, saved_pins);
+    if (nmi_line(z)) p |= Z80_NMI; else p &= ~Z80_NMI;
     if (z.int_low || im2_int(z)) p |= Z80_INT; else p &= ~Z80_INT;     // pulse_int_n and im2_int_n (zxnext:1799)
     p = z80_tick(&z.cpu, p);
     if (z.stop_on && !z.first_edge && z80_opdone(&z.cpu)) {
@@ -1227,10 +1350,17 @@ bool cpu_edge(ZXN& z) {
         z.dm_pending = false;
         const bool was = dm_automap(z);
         z.dm_held = z.dm_hold;
+        if (z.dm_held) z.dm_button = false;                           // (divmmc:113-114)
         z.dm_instant = false;
         if (dm_automap(z) != was) remap(z);
     }
     const bool fetch = (p & Z80_M1) && (p & Z80_MREQ) && (p & Z80_RD);
+    if (z.mf_fetch66 && !fetch) { z.mf_fetch66 = false; }             // fetch_66 lasts for its M1 (multiface:113-125)
+    if (fetch && Z80_GET_ADDR(p) == 0x0066 && z.mf_active && mf_en(z)) {
+        z.mf_fetch66 = true;                                          // the multiface pages in for this fetch, and stays
+        z.mf_enable = true;
+        remap(z);
+    }
     if (fetch) dm_fetch(z, Z80_GET_ADDR(p));
     classify(z, p);
     z.p3_waiting = p3w;
@@ -1480,6 +1610,10 @@ void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
 uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
 int zxn_cvc(ZXN* z) { return cvc(*z); }                          // DESIGN.md §9
 void zxn_set_joy(ZXN* z, int left, int right) { z->joy[0] = left & 0x7FF; z->joy[1] = right & 0x7FF; }
+void zxn_button(ZXN* z, int which) {                                  // 1 = M1 (multiface), 2 = DRIVE (divMMC): a press
+    if (which == 1 && (z->nr[0x06] & 0x08)) nmi_request(*z, true);    // needs NR 0x06 b3 (zxnext:2049)
+    if (which == 2 && (z->nr[0x06] & 0x10)) nmi_request(*z, false);   // b4 (2050)
+}
 int zxn_sd_insert(ZXN* z, const char* path, int writable, int kind) { return z->sd.insert(path, writable != 0, kind); }
 void zxn_sd_eject(ZXN* z) { z->sd.eject(); }
 void zxn_sd_timing(ZXN* z, int ncr, int nac, int busy, int init_tries) {   // as zxcore's zx_sd_timing
