@@ -20,7 +20,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 LIB_PATH = HERE / 'lib' / ('libzxcore.dylib' if sys.platform == 'darwin' else 'libzxcore.so')
 SOURCES = [HERE / 'src' / f for f in ('zxcore.cpp', 'nextcore.cpp', 'nextregs_reset.inc', 'z80.h',
-                                      'ay38910.h', 'sdcard.h')]
+                                      'ay38910.h', 'sdcard.h', 'next_dma.h', 'next_dma_bus.inc')]
 TIMINGS = {'48k': 1, '128k': 2, 'p3': 3, 'pentagon': 4}
 REG_NAMES = ['pc', 'sp', 'af', 'bc', 'de', 'hl', 'ix', 'iy', "af'", "bc'", "de'", "hl'", 'ir', 'im', 'iff1', 'iff2']
 
@@ -63,6 +63,8 @@ def _load_lib():
         'zxn_audio_out': ([P, ctypes.POINTER(ctypes.c_int16), I], I),
         'zxn_audio_level': ([P, ctypes.POINTER(ctypes.c_int)], None),
         'zxn_ay_chan': ([P, I, ctypes.POINTER(ctypes.c_int)], None), 'zxn_ay_env': ([P, I], I),
+        'zxn_busak': ([P], I), 'zxn_dma_logging': ([P, I], None), 'zxn_dma_log_len': ([P], I),
+        'zxn_dma_log_get': ([P, I, U64P], None),
     }
     for name, (args, res) in sigs.items():
         f = getattr(lib, name)
@@ -473,6 +475,24 @@ class Next:
 
     def io_log(self, on=True):
         self.lib.zxn_io_logging(self.z, 1 if on else 0)
+
+    # the DMA (DESIGN.md §9.1 (16))
+    busak = property(lambda self: bool(self.lib.zxn_busak(self.z)))   # the CPU has granted the bus to the DMA
+
+    def dma_log(self, on=True):
+        """Clear and start (or stop) the log of the DMA's bus cycles."""
+        self.lib.zxn_dma_logging(self.z, 1 if on else 0)
+
+    @property
+    def dma_events(self):
+        """[(t28, cpu_clocks, kind, addr, value)], one per DMA bus cycle, kind 'mr'/'mw'/'ir'/'iw', stamped just
+        before the rising CPU edge that enters TRANSFERING_READ_1 or TRANSFERING_WRITE_1."""
+        out = (ctypes.c_uint64 * 5)()
+        res = []
+        for i in range(self.lib.zxn_dma_log_len(self.z)):
+            self.lib.zxn_dma_log_get(self.z, i, out)
+            res.append((out[0], out[1], ('mr', 'mw', 'ir', 'iw')[out[2]], out[3], out[4]))
+        return res
 
     @property
     def io_events(self):
