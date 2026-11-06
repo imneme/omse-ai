@@ -379,6 +379,17 @@ class TestSPI(unittest.TestCase):
             z.out(0xEB, *cmd(1)).in_(3)
         self.assertEqual(z.run(zx)[-1], 0x01)              # still idle: SDHC needs ACMD41 with HCS
 
+    def test_the_nexts_spi_gap(self):
+        # OUT (EBh),A then IN A,(EBh) straight after: their I/O cycles are 11 T
+        # apart. A classic divMMC starts a transfer for each; the Next's SPI
+        # master (spi_gap 16) ignores the IN, which starts nothing.
+        for gap, early in ((0, 0), (16, 1)):
+            with self.subTest(gap=gap):
+                zx = machine(card=card_image())
+                zx.spi_gap(gap)
+                Z80().out(0xE7, 0xFE).raw([0x3E, 0xFF, 0xD3, 0xEB, 0xDB, 0xEB]).run(zx)
+                self.assertEqual(zx.spi_early, early)
+
     def test_an_unknown_command_is_illegal(self):
         zx = machine(card=card_image())
         got = init_card(Z80()).out(0xEB, *cmd(5)).in_(3).run(zx)

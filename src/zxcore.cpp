@@ -151,6 +151,16 @@ struct ZX {
     std::vector<std::array<uint8_t, 0x2000>> div_ram;
     uint8_t div_cs = 0xFF;        // port E7: card selects, active low
     uint8_t div_spi = 0xFF;       // what the last SPI transfer received
+    // The ZX Spectrum Next's SPI master (Alvin Albrecht and Fabio Belavenuto's spi_master.vhd), if
+    // spi_gap is set (16 on the Next): a transfer takes spi_gap clocks of the CPU's own clock (stretched,
+    // like the CPU, while the ULA holds it), and an access that comes sooner starts nothing (an OUT's byte
+    // is never sent) and reads the last *finished* transfer's byte. 0: every access starts one at once.
+    int spi_gap = 0;
+    uint64_t spi_early = 0;       // accesses that came too soon (and so started nothing)
+    uint16_t spi_early_pc[4096];  // the PC (just after the instruction) and gap of each, the first 4096
+    uint8_t spi_early_dt[4096];
+    uint64_t spi_begin = 0;       // when the transfer in flight began, in unstretched CPU clocks
+    uint8_t spi_done = 0xFF;      // the last finished transfer's byte (spi_master's miso_dat)
     SDCard sd;
 };
 
@@ -317,6 +327,27 @@ static uint8_t ay_read(ZX& z, uint16_t addr) {
     return AY38910_GET_DATA(pins);
 }
 
+// The Next's rule (spi_gap clocks a transfer). The byte in flight has landed by the time the CPU latches
+// an access's data if the access began at least spi_gap - 1 clocks after it; a new transfer starts only
+// at spi_gap or more (spi_master begins on its last state or when idle).
+static uint8_t spi_gap_access(ZX& z, uint8_t mosi, bool rd) {
+    uint64_t now = z.t - z.stalled;
+    uint64_t dt = now - z.spi_begin;
+    if (dt + 1 >= (uint64_t)z.spi_gap) z.spi_done = z.div_spi;
+    uint8_t v = z.spi_done;
+    if (dt >= (uint64_t)z.spi_gap) {
+        z.div_spi = z.sd.xfer(rd ? 0xFF : mosi, (z.div_cs & 3) == 2);
+        z.spi_begin = now;
+    } else {
+        if (z.spi_early < 4096) {
+            z.spi_early_pc[z.spi_early] = z.cpu.pc;
+            z.spi_early_dt[z.spi_early] = (uint8_t)dt;
+        }
+        z.spi_early++;
+    }
+    return v;
+}
+
 static uint8_t io_read(ZX& z, uint16_t addr) {
     if ((addr & 1) == 0) {  // ULA: keyboard (+ EAR on bit 6)
         uint8_t v = 0xBF;
@@ -327,6 +358,7 @@ static uint8_t io_read(ZX& z, uint16_t addr) {
         return v | (z.ear ? 0x40 : 0);
     }
     if (z.model == 128 && (addr & 0x8002) == 0x8000) return ay_read(z, addr);
+    if (z.div_fitted && (addr & 0xFF) == 0xEB && z.spi_gap) return spi_gap_access(z, 0xFF, true);
     if (z.div_fitted && (addr & 0xFF) == 0xEB) {
         // SPI: an IN returns what the *previous* transfer received, and starts
         // a new one sending FF (the Next's spi_master.vhd, the ZX-Uno's spi.v)
@@ -361,7 +393,8 @@ static void io_write(ZX& z, uint16_t addr, uint8_t v) {
             z.div_cs = v;
             break;
         case 0xEB:                          // SPI: send v, keep what comes back
-            z.div_spi = z.sd.xfer(v, (z.div_cs & 3) == 2);
+            if (z.spi_gap) spi_gap_access(z, v, false);
+            else z.div_spi = z.sd.xfer(v, (z.div_cs & 3) == 2);
             break;
         default:
             break;
@@ -1005,6 +1038,13 @@ void zx_sd_log_get(ZX* z, uint64_t* out) {
     memcpy(out, z->sd.log.data(), z->sd.log.size() * sizeof(uint64_t));
 }
 void zx_sd_log_clear(ZX* z) { z->sd.log.clear(); }
+
+// The Next's SPI rule (Tally's, from spi_master.vhd): clocks a transfer takes
+// (16 on a Spectrum Next; 0, the default, for a classic divMMC); how many
+// accesses came too soon; and the k-th of them, as (PC << 8) | the gap.
+void zx_spi_gap(ZX* z, int clocks) { z->spi_gap = clocks; z->spi_begin = 0; }
+uint64_t zx_spi_early(ZX* z) { return z->spi_early; }
+int zx_spi_early_at(ZX* z, int k) { return k < 4096 ? (z->spi_early_pc[k] << 8) | z->spi_early_dt[k] : -1; }
 
 // Contention: on (the default, as a real machine) or off; and how many T-states
 // the ULA has held the CPU since power-on.

@@ -165,6 +165,7 @@ def _load_lib():
         'zx_sd_sectors': ([P], ctypes.c_uint32), 'zx_sd_timing': ([P, I, I, I, I], None),
         'zx_sd_log_len': ([P], I), 'zx_sd_log_get': ([P, ctypes.POINTER(ctypes.c_uint64)], None),
         'zx_sd_log_clear': ([P], None),
+        'zx_spi_gap': ([P, I], None), 'zx_spi_early': ([P], U64), 'zx_spi_early_at': ([P, I], I),
         'zx_contention': ([P, I], None), 'zx_contention_on': ([P], I), 'zx_stalled': ([P], U64),
     }
     for name, (args, res) in sigs.items():
@@ -708,6 +709,18 @@ class Speccy:
         start = self.frame
         self.type(command if command.endswith('\n') else command + '\n')
         return None if self.wait_ready(max_frames=max_frames) is None else self.frame - start
+
+    def spi_gap(self, clocks=16):
+        """The Spectrum Next's SPI rule (found by Tally on a real Next): a
+        transfer takes `clocks` of the CPU's own clock (16 on the Next), and an
+        access to port EB that comes sooner starts nothing and reads the last
+        finished byte again. 0 (the default) is a classic divMMC, where every
+        access starts a transfer at once. `spi_early` counts the early ones."""
+        self.lib.zx_spi_gap(self.z, clocks)
+
+    @property
+    def spi_early(self):
+        return self.lib.zx_spi_early(self.z)
 
     def nmi(self):
         """The divMMC's NMI button (esxDOS's file browser), or any NMI: one pulse."""
