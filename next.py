@@ -52,6 +52,7 @@ def _load_lib():
         'zxn_slot_desc': ([P, I, I, ctypes.POINTER(ctypes.c_int)], None),
         'zxn_nr_read': ([P, I], I), 'zxn_nr_write': ([P, I, I], None),
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
+        'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
     }
@@ -164,6 +165,13 @@ class Next:
 
     def io_out(self, port, v):
         self.lib.zxn_io_out(self.z, port, v)
+
+    # the keyboard and the border
+    def set_keys(self, rows):
+        """The keyboard matrix: 8 half-row bytes (row r is read with A8+r low; bit set = key down)."""
+        self.lib.zxn_set_keys(self.z, bytes(rows))
+
+    border = property(lambda self: self.lib.zxn_border(self.z))
 
     # logs
     @property

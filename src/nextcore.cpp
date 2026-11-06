@@ -88,6 +88,7 @@ struct ZXN {
     uint8_t mmu[8];
     uint8_t port7ffd = 0, port1ffd = 0, portdffd = 0, porteff7 = 0, portff = 0;
     uint8_t border = 0;                 // port 0xFE bits 2:0 (ref §2.5)
+    uint8_t keys[8] = {0};              // the keyboard matrix: half-row r (A8+r low), bit set = key down
     uint8_t nr[256];
     int nr_sel = 0x24;                  // port 0x243B resets to 0x24 (ref §4.1)
     bool ula_int_disabled = false;      // port 0xFF bit 6 and its aliases (ref §2.3)
@@ -328,11 +329,34 @@ inline bool dec_7ffd(const ZXN& z, uint16_t port) {
 }
 inline bool locked(const ZXN& z) { return z.port7ffd & 0x20; }        // 7FFD bit 5 (Pentagon 1024: later)
 
+// The floating bus on port 0xFF (ref §2.5; 48K and 128K timing only): inside the 256 x 192 area, the ULA's latest
+// fetch: the bitmap byte from slot 9, the attribute from slot B, the next bitmap from slot D, the next attribute from
+// slot F of each 16-pixel group (each held to the next odd slot; slot 0 still holds the group's last attribute);
+// 0xFF in slots 1-8 and in the border. PROVISIONAL: which cell a group fetches is my reading of ref §2.5's slots
+// (group g fetches cells 2g and 2g+1 of line vc_ula); ula.vhd 218-345 and a probe settle it.
+uint8_t floating_bus(const ZXN& z) {
+    if (z.timing == 3 || z.timing == 4) return 0xFF;                  // +3 has its own port; Pentagon none (later)
+    int h = hc_ula(z), v = vc_ula(z);
+    int slot = h & 15;
+    if (slot == 0) h -= 1;                                            // slot 0: the previous group's attribute
+    if (h < 0 || h >= 256 || v >= 192 || (slot >= 1 && slot <= 8)) return 0xFF;
+    int col = (h >> 4) * 2 + ((slot >= 13 || slot == 0) ? 1 : 0);
+    const uint8_t* scr = (z.port7ffd & 8) ? z.bram7 : z.bram5;        // the shadow screen reads bank 7 (ref §2.5)
+    bool attr = slot == 11 || slot == 12 || slot == 15 || slot == 0;
+    if (attr) return scr[0x1800 + (v >> 3) * 32 + col];
+    return scr[((v & 0xC0) << 5) | ((v & 7) << 8) | ((v & 0x38) << 2) | col];
+}
+
 uint8_t io_read(ZXN& z, uint16_t port) {
     if (port == 0x243B) return z.nr_sel;                              // both decode all 16 bits (ref §4.1)
     if (port == 0x253B) return nr_read(z, z.nr_sel);
-    if (!(port & 1)) return 0xFF;                                     // 0xFE: no keys down (the keyboard: later)
-    return 0xFF;                                                      // nobody answers (ref §5.2); floating bus: later
+    if (!(port & 1)) {                                                // 0xFE: the half-rows selected by A8-A15 low
+        uint8_t v = 0x1F;
+        for (int r = 0; r < 8; r++) if (!(port & (0x100 << r))) v &= ~z.keys[r] & 0x1F;
+        return 0xE0 | v;                                              // (EAR in, bit 6: later)
+    }
+    if ((port & 0xFF) == 0xFF) return floating_bus(z);                // always answered (ref §5.1)
+    return 0xFF;                                                      // nobody answers (ref §5.2)
 }
 
 void io_write(ZXN& z, uint16_t port, uint8_t v) {
@@ -645,6 +669,8 @@ void zxn_slot_desc(ZXN* z, int i, int write, int* out) {
 int zxn_nr_read(ZXN* z, int n) { return nr_read(*z, n & 0xFF); }
 void zxn_nr_write(ZXN* z, int n, int v) { nr_write(*z, n & 0xFF, v); }
 int zxn_io_in(ZXN* z, int port) { return io_read(*z, port & 0xFFFF); }
+void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
+int zxn_border(ZXN* z) { return z->border; }
 void zxn_io_out(ZXN* z, int port, int v) { io_write(*z, port & 0xFFFF, v & 0xFF); }
 
 int zxn_int_log_len(ZXN* z) { return (int)z->int_log.size(); }
