@@ -1123,5 +1123,38 @@ class ProbeV2(VideoCase):
         self.assertEqual(zx.io_in(0x303B), 0x03, 'the strip runs out of time and overlaps (sprites:977, 991)')
 
 
+@needs_next
+class ProbeV3(VideoCase):
+    """P-V3's blend card (next-build/probes/pv3_scene.py, the scene defined once): the machine against the
+    model, band by band, and the read-backs the probe prints (NR 0x28, NR 0x34, the card's sprite status)."""
+
+    def test_pv3_blend_card(self):
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv3_scene.py').exists():
+            self.skipTest('needs next-build/probes/pv3_scene.py')
+        sys.path.insert(0, str(probes))
+        import pv3_model as pm
+        import pv3_scene as sc
+        s = Scene()
+        for kind, a, b in pm.writes():
+            (s.nr if kind == 'nr' else s.io)(a, b)
+        bm, at = sc.ula()
+        s.bram5(0, bm).bram5(0x1800, at)
+        s.sram(nv.L2_SRAM_BASE + sc.L2_BANK * 0x4000, sc.layer2())
+        s.nr(0x62, 0x00).nr(0x61, 0x00)
+        for w in sc.copper_words():
+            s.nr(0x63, w >> 8, w & 0xFF)
+        s.nr(0x62, 0xC0)
+        zx, v = s.machine(frames=3), s.model()
+        got = list(zx.frame9()[2])
+        want = nv.frame9_np(v, sc.schedule())[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('pv3_blend_card', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+        self.assertEqual((zx.nr_read(0x28), zx.nr_read(0x34), zx.io_in(0x303B)),
+                         (v.nr_read(0x28), v.nr_read(0x34), nv.sprite_status(v)), 'NR 0x28, NR 0x34, status')
+
+
 if __name__ == '__main__':
     unittest.main()
