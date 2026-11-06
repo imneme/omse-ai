@@ -1813,7 +1813,7 @@ bool cpu_edge(ZXN& z) {
     // the effective speed follows the programmed one only between bus cycles (ref §1.3)
     // (the VHDL samples MREQ, IORQ and M1 as they were before the edge: the previous T-state's pins, not this one's;
     // Speccy-Zone's review)
-    if (!(bus_before & (Z80_MREQ | Z80_IORQ | Z80_M1))) {
+    if (!(bus_before & (Z80_MREQ | Z80_IORQ | Z80_M1)) && !db_saved.busak) {   // and the DMA not holding it (5714)
         z.speed_eff = z.speed_prog;
         if (hc_ula(z) & 0x100) z.eff_cd = z.nr[0x08] & 0x40;          // in the line's right half only (zxnext:5729-5731)
     }

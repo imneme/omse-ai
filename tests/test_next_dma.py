@@ -601,3 +601,100 @@ class Contention(NextCase):
             t += 8 * (6 + k)
         self.assertEqual([(e[0], e[2], e[3]) for e in dma], want)
         self.assertTrue(any(e[0] - d[0] > 48 for d, e in zip(dma[0::2], dma[2::2])), 'no byte waited at all')
+
+
+@needs_next
+class SpeedRule(NextCase):
+    """The effective CPU speed follows NR 0x07 only on an edge where MREQ, IORQ and M1 are high and the DMA doesn't
+    hold the bus (zxnext:5714, dma_holds_bus = BUSAK, 1784). Between a DMA write's WRITE_4 and the next READ_1 no
+    strobe is low, so without the last term a speed change would land mid-transfer, and the DMA, clocked by the CPU
+    clock, would speed up (Speccy-Zone's review)."""
+
+    def test_a_speed_change_waits_for_the_dma_to_let_go(self):
+        # the DMA itself writes 3 to NR 0x07, four times, through port 0x253B: every byte stays at 3.5 MHz (8 t28
+        # a clock, 6 clocks a byte), and the change lands once the CPU has the bus again
+        n = 4
+        zx = bare()
+        zx.io_out(0x243B, 0x07)
+        io, dma, clocks, t28 = run_enabled(zx, regs(n, dst=0x253B, b_io=True, b_inc=2), bytes([3] * n))
+        stamps = [e[0] for e in dma]
+        self.assertEqual(len(stamps), 2 * n)
+        self.assertEqual([b - a for a, b in zip(stamps, stamps[1:])], [24] * (2 * n - 1))
+        self.assertEqual(zx.nr_read(0x07) >> 4 & 3, 3)
+
+
+@needs_next
+class Gaps(NextCase):
+    """Behaviour Speccy-Zone's mutants found no test for (dma-mutants-run1-18fad66.log)."""
+
+    def test_z80_mode_auto_restart_moves_one_more_every_block(self):
+        # FINISH reloads the counter with FFFF in Z80-DMA mode too (dma:482-486): n + 1 bytes a block, every block
+        n = 3
+        zx = bare()
+        data = bytes(range(50, 60))
+        program(zx, regs(n, wr5=0xA2), port=0x0B)
+        zx.load(SRC, data)
+        code, end = enabler(port=0x0B)
+        zx.load(CODE, code)
+        launch(zx, CODE)
+        assert zx.run_until_pc(CODE, max_ticks=10**6)
+        zx.io_log(True)
+        zx.dma_log(True)
+        zx.run_ticks(8 * 150)
+        tw, cw = zx.io_events[0][:2]
+        want = []
+        for b in range(4):
+            want += expected_copy(cw, tw, n + 1, data=data, first=7 + (6 * (n + 1) + 2) * b)
+        self.assertEqual(zx.dma_events[:len(want)], want)
+
+    def test_wr0_with_bits_1_0_equal_to_10_is_still_wr0(self):
+        # WR0 is any base byte with b7 = 0 and b1:0 not 00 (dma:514); 10 and 11 "behave like transfer"
+        n = 4
+        zx = bare()
+        w = regs(n)
+        w[1] = (w[1] & 0xFC) | 0x02
+        io, dma, clocks, t28 = run_enabled(zx, w, bytes(range(1, 9)))
+        tw, cw = io[0][:2]
+        self.assertEqual(dma, expected_copy(cw, tw, n, data=bytes(range(1, 9))))
+
+    def test_c3_puts_both_ports_back_to_three_clocks(self):
+        # WR6 C3 sets both timing bytes to 01 (dma:640-641): 2-clock timings written before it don't survive
+        n = 3
+        zx = bare()
+        io, dma, clocks, t28 = run_enabled(zx, [0x54, 0x02, 0x50, 0x02] + regs(n), bytes(range(1, 9)))
+        tw, cw = io[0][:2]
+        self.assertEqual(dma, expected_copy(cw, tw, n, 3, 3, data=bytes(range(1, 9))))
+
+    def test_48k_the_write_after_a_contended_port_read_is_checked_like_a_t1(self):
+        # keyboard port 00FE -> bank 5 (contended under 48K timing), in the paper. The read's address is in ROM's
+        # page and its port term never comes; by WRITE_1 the I/O strobe was cancelled at READ_4's falling edge, so
+        # ioreqtw3_n and mreq23_n are high and WRITE_1 gets the memory term: held as the ULA holds a T1 there
+        import nextref as ref
+        from test_next_timing import goto_line
+        n = 24
+        zx = bare(timing='48k')
+        program(zx, regs(n, src=0x4000, dst=0x00FE, atob=False, b_io=True, b_inc=2))
+        code, end = enabler(nops=300)
+        zx.load(CODE, code)
+        L, N = ref.TIMINGS[('48k', 50)][:2]
+        goto_line(zx, '48k', 50, 40)
+        launch(zx, CODE)
+        assert zx.run_until_pc(CODE, max_ticks=10**6)
+        t0, pos0 = zx.t28, zx.vc_ula * L + zx.hc_ula
+        zx.dma_log(True)
+        assert zx.run_until_pc(end, max_ticks=10**7)
+        dma = zx.dma_events
+        cont = ref.Contention('48k', [0, 0, 10, 11, 4, 5, 0, 1], L, N)
+
+        def held(t):                                    # a check in the T-state that begins at the edge after t28 t
+            pos = (pos0 + (t - t0) // 4) % (L * N)
+            return cont.holds(pos % L + 1, pos // L)
+
+        t, want = dma[0][0], []
+        for i in range(n):
+            want.append((t, 'ir', 0x00FE))
+            w = t + 24
+            want.append((w, 'mw', 0x4000 + i))
+            t = w + 8 * (3 + held(w))
+        self.assertEqual([(e[0], e[2], e[3]) for e in dma], want)
+        self.assertTrue(any(held(e[0]) for e in dma if e[2] == 'mw'), 'no write was held at all')
