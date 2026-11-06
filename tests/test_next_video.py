@@ -772,5 +772,36 @@ class Survivors(VideoCase):
         self.assertFrameMatches(s)
 
 
+@needs_next
+class ProbeV2(VideoCase):
+    """P-V2's sprite card (next-build/probes/pv2_scene.py, the scene defined once): the machine against the
+    model, with the per-line-limit strip's rows masked until the hardware says where it stops."""
+
+    def test_pv2_sprite_card(self):
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv2_scene.py').exists():
+            self.skipTest('needs next-build/probes/pv2_scene.py')
+        sys.path.insert(0, str(probes))
+        import pv2_model as pm
+        import pv2_scene as sc
+        s = Scene()
+        for kind, a, b in pm.writes():
+            (s.nr if kind == 'nr' else s.io)(a, b)
+        bm, at = pm.ula()
+        s.bram5(0, bm).bram5(0x1800, at)
+        s.sram(nv.L2_SRAM_BASE + pm.L2_BANK * 0x4000, pm.layer2())
+        s.nr(0x62, 0x00).nr(0x61, 0x00)
+        for w in sc.copper_words():
+            s.nr(0x63, w >> 8, w & 0xFF)
+        s.nr(0x62, 0xC0)
+        got = list(s.machine(frames=3).frame9()[2])
+        want = nv.frame9_np(s.model(), sc.schedule())[2]
+        strip = range((48 + 160) * nv.W, (48 + 178) * nv.W)
+        bad = [i for i in range(len(want)) if got[i] != want[i] and i not in strip]
+        if bad:
+            path = self._save_diff('pv2_sprite_card', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+
+
 if __name__ == '__main__':
     unittest.main()
