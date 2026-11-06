@@ -153,6 +153,9 @@ inline int vc_ula(const ZXN& z) {
     int v = z.vc - t.vactive - (z.hc < t.hactive - 11 ? 1 : 0);
     return (v % t.vc_len + t.vc_len) % t.vc_len;
 }
+// cvc, the line the copper, line interrupt and NR 0x1E/0x1F count: the ULA's line plus NR 0x64's offset (ref §2.4;
+// zxnext:5889-5893). (A change of NR 0x64 waits for row 0 on the hardware, ulat:455-472: here it's at once.)
+inline int cvc(const ZXN& z) { return (vc_ula(z) + z.nr[0x64]) % T(z).vc_len; }
 
 // ---- memory (ref §3)
 
@@ -300,6 +303,8 @@ int nr_read(ZXN& z, int n) {
         case 0x0F: return z.issue == 4 ? 0x02 : 0x00;
         case 0x08:                                                    // b7 reads "unlocked", b6 the copy in effect
             return (locked(z) ? 0 : 0x80) | (z.eff_cd ? 0x40 : 0) | (z.nr[0x08] & 0x3F);   // (zxnext:5812-5813)
+        case 0x1E: return (cvc(z) >> 8) & 1;                          // the active line (zxnext:5889-5893)
+        case 0x1F: return cvc(z) & 0xFF;
         case 0x10: return z.coreid << 2;                              // no buttons pressed (zxnext:5830-5831)
         case 0x22:                                                    // the pulse, port FF b6, the line interrupt's
             return (z.int_low ? 0x80 : 0) | ((z.portff >> 4) & 4) | (z.nr[0x22] & 3);       // (zxnext:5898-5899)
@@ -786,6 +791,13 @@ bool master_tick(ZXN& z) {
         }
         const Timing& t2 = T(z);
         if (z.hc == t2.int_h && z.vc == t2.int_v && !z.ula_int_disabled) z.int_req = true;
+        // the line interrupt for line N: at hc_ula 255 on cvc line N-1, the last line for N = 0, "before the line is
+        // drawn" (ulat:561-583); NR 0x22 b1 enables it, NR 0x22 b0 : NR 0x23 is N (zxnext:5233-5239). In pulse mode
+        // it makes the same pulse as the ULA's (zxnext:1900-1955).
+        if (z.nr[0x22] & 2) {
+            const int n = ((z.nr[0x22] & 1) << 8) | z.nr[0x23];
+            if (hc_ula(z) == 255 && cvc(z) == (n == 0 ? t2.vc_len - 1 : n - 1)) z.int_req = true;
+        }
         draw_pixel(z);
     }
     z.t28++;
