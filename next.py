@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_uart_feed': ([P, I, ctypes.c_char_p, I, U64, I, I, I], None), 'zxn_uart_sent_len': ([P, I], I), 'zxn_uart_sent_get': ([P, I, I, U64P], None), 'zxn_uart_sent_clear': ([P, I], None), 'zxn_uart_cts': ([P, I, I], None), 'zxn_uart_rts': ([P, I], I), 'zxn_i2c_rtc': ([P, I, I, I, I, I, I, I, I], None), 'zxn_i2c_logging': ([P, I], None), 'zxn_i2c_log_len': ([P], I), 'zxn_i2c_log_get': ([P, I, U64P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
         'zxn_audio_capture': ([P, I], None), 'zxn_audio_take': ([P, U16P, I], I), 'zxn_audio_cap_len': ([P], I),
@@ -395,6 +395,59 @@ class Next:
         """The two joysticks, a bit per control pressed: R L D U B C A START Y Z X in bits 0-10 (zxnext:3398-3400).
         Kempston reads bits 5:0 (fire, up, down, left, right), MD adds 7:6."""
         self.lib.zxn_set_joy(self.z, left, right)
+
+    # ---- the UARTs and I2C (DESIGN.md §9.1 (18)): the host is each UART's far end, and the DS1307 is optional
+    def uart_feed(self, n, data, bit_t28, frame='8N1'):
+        """Send data into UART n's Rx pin from now (after any earlier feed, back to back), each bit bit_t28 master
+        ticks: start bit, data LSB first, parity if any, stop bits. frame: data bits (5-8), parity N/O/E, stop bits (1-2).
+        UART 1's line reaches it only while NR 0xA0 b4 enables the Pi UART; under NR 0x0B's joystick mode neither."""
+        data = bytes(data)
+        self.lib.zxn_uart_feed(self.z, n, data, len(data), bit_t28, int(frame[0]), {'N': 0, 'O': 1, 'E': 2}[frame[1].upper()],
+                               int(frame[2]))
+
+    def uart_sent(self, n):
+        """Every byte UART n put on its Tx pin since the last call, as [(t28, byte)], t28 the tick its start bit's
+        falling edge began; then clears them. Nothing for UART 1 without the Pi UART, or for a UART on a joystick port."""
+        out = (ctypes.c_uint64 * 2)()
+        res = []
+        for i in range(self.lib.zxn_uart_sent_len(self.z, n)):
+            self.lib.zxn_uart_sent_get(self.z, n, i, out)
+            res.append((out[0], out[1]))
+        self.lib.zxn_uart_sent_clear(self.z, n)
+        return res
+
+    def uart_cts(self, n, level=True):
+        """The host's CTS into UART n: True is clear to send (the default)."""
+        self.lib.zxn_uart_cts(self.z, n, 1 if level else 0)
+
+    def uart_rts(self, n):
+        """UART n's RTS as the host sees it: True ready to receive, False not, None when the pin isn't driven toward
+        the host (UART 1 without the Pi UART and hardware flow control, or a UART on a joystick port)."""
+        v = self.lib.zxn_uart_rts(self.z, n)
+        return None if v < 0 else bool(v)
+
+    def i2c_rtc(self, datetime=None):
+        """Attach the DS1307 at 0x68 running from datetime (the host's now if None, 24-hour mode, day 1 = Sunday), or
+        detach it with False. None is attached by default. It keeps real seconds of the machine's time from then."""
+        if datetime is False:
+            self.lib.zxn_i2c_rtc(self.z, 0, 0, 0, 0, 0, 0, 0, 0)
+            return
+        import datetime as _dt
+        d = datetime or _dt.datetime.now()
+        self.lib.zxn_i2c_rtc(self.z, 1, d.second, d.minute, d.hour, d.isoweekday() % 7 + 1, d.day, d.month, d.year % 100)
+
+    def i2c_log(self, on=True):
+        """Log the I2C bus: [(t28, scl, sda)] at each change of either line as the bus sees it (zx.i2c_events)."""
+        self.lib.zxn_i2c_logging(self.z, 1 if on else 0)
+
+    @property
+    def i2c_events(self):
+        out = (ctypes.c_uint64 * 3)()
+        res = []
+        for i in range(self.lib.zxn_i2c_log_len(self.z)):
+            self.lib.zxn_i2c_log_get(self.z, i, out)
+            res.append((out[0], out[1], out[2]))
+        return res
 
     def set_mouse(self, x=0, y=0, buttons=0, wheel=0):
         """The Kempston mouse: X and Y counts (0-255, as the PS/2 side accumulates them), buttons b0 left, b1 right,
