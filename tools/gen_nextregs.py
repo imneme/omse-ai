@@ -1,13 +1,13 @@
 """Write src/nextregs_reset.inc from Hart's-tongue Fern's machine/nextregs.tsv (core 3.02.02): each Next register's
 hard- and soft-reset value as the table gives it, so nextcore.cpp's reset values are generated, not typed.
-Only plain values are taken ("0x0A", "0", "reads 0x90", "same" = the other column); anything descriptive is left
+Only plain values are taken ("0x0A", "0x00 (a note)", "0", "reads 0x90", "same" = the other column); anything descriptive is left
 for a handler in nextcore.cpp to compute from the machine's state, and listed in the .inc as such.
 Usage: python3 tools/gen_nextregs.py PATH/TO/nextregs.tsv > src/nextregs_reset.inc"""
 import csv, re, sys
 rows = list(csv.DictReader(open(sys.argv[1]), delimiter='\t'))
 def plain(s):
     s = s.strip()
-    m = re.fullmatch(r'(?:reads |out )?0x([0-9A-Fa-f]{1,2})', s)
+    m = re.fullmatch(r'(?:reads |out )?0x([0-9A-Fa-f]{1,2})(?: \([^()]*\))?', s)   # a value, maybe with a note
     if m:
         return int(m[1], 16)
     if s == '0':

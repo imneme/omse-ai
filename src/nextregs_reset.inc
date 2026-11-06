@@ -16,7 +16,7 @@ static const struct { int reg, hard, soft; } NR_RESET[] = {
     {0x0E, 2, -1},   // Core Version Sub-minor
     {0x0F, -1, -1},   // Board ID
     {0x10, -1, -1},   // Core Boot
-    {0x11, -1, -1},   // Video Timing
+    {0x11, 0, -1},   // Video Timing
     {0x12, 8, 8},   // Layer 2 Active RAM bank
     {0x13, 11, 11},   // Layer 2 Shadow RAM bank
     {0x14, 227, 227},   // Global Transparency Colour
@@ -40,9 +40,9 @@ static const struct { int reg, hard, soft; } NR_RESET[] = {
     {0x29, 0, -1},   // PS/2 Keymap Address LSB
     {0x2A, -1, -1},   // PS/2 Keymap Data MSB
     {0x2B, -1, -1},   // PS/2 Keymap Data LSB
-    {0x2C, 128, -1},   // DAC B Mirror (left)
-    {0x2D, 128, 128},   // DAC A+D Mirror (mono)
-    {0x2E, 128, 128},   // DAC C Mirror (right)
+    {0x2C, -1, -1},   // DAC B Mirror (left)
+    {0x2D, -1, -1},   // DAC A+D Mirror (mono)
+    {0x2E, -1, -1},   // DAC C Mirror (right)
     {0x2F, 0, 0},   // Tilemap X Scroll MSB
     {0x30, 0, 0},   // Tilemap X Scroll LSB
     {0x31, 0, 0},   // Tilemap Offset Y
@@ -76,7 +76,7 @@ static const struct { int reg, hard, soft; } NR_RESET[] = {
     {0x63, -1, -1},   // Copper Data 16-bit Write
     {0x64, 0, 0},   // Vertical Line Count Offset
     {0x68, 0, 0},   // ULA Control
-    {0x69, 0, -1},   // Display Control 1
+    {0x69, 0, 0},   // Display Control 1
     {0x6A, 0, 0},   // LoRes Control
     {0x6B, 0, 0},   // Tilemap Control
     {0x6C, 0, 0},   // Default Tilemap Attribute
@@ -113,7 +113,7 @@ static const struct { int reg, hard, soft; } NR_RESET[] = {
     {0x9A, 0, 0},   // PI GPIO 23:16
     {0x9B, 0, 0},   // PI GPIO 27:24
     {0xA0, 0, 0},   // PI Peripheral Enable
-    {0xA2, 0, -1},   // PI I2S Audio Control
+    {0xA2, 0, 0},   // PI I2S Audio Control
     {0xA8, 0, 0},   // ESP Wifi GPIO Output Enable
     {0xA9, -1, -1},   // ESP Wifi GPIO
     {0xB0, -1, -1},   // Extended Keys 0
@@ -138,7 +138,7 @@ static const struct { int reg, hard, soft; } NR_RESET[] = {
     {0xD8, 0, 0},   // I/O Traps
     {0xD9, 0, 0},   // I/O Trap Write
     {0xDA, 0, 0},   // I/O Trap Cause
-    {0xF0, 128, -1},   // XDEV CMD
+    {0xF0, 128, 128},   // XDEV CMD
     {0xF8, 0, -1},   // XADC REG
     {0xF9, 0, -1},   // XADC D0
     {0xFA, 0, -1},   // XADC D1
@@ -149,7 +149,6 @@ static const struct { int reg, hard, soft; } NR_RESET[] = {
 //   0x03 (Machine Type): hard 'timing 011, lock 0, type 011, config mode on: reads 0x33', soft 'unchanged'
 //   0x0F (Board ID): hard '0x02 (issue 4) / 0x00 (issue 2)', soft '-'
 //   0x10 (Core Boot): hard 'reads 0x04 + buttons', soft 'unchanged'
-//   0x11 (Video Timing): hard '0x00 (g_video_def)', soft 'unchanged'
 //   0x18 (Clip Window Layer 2): hard 'same', soft 'X1=0 X2=255 Y1=0 Y2=191, index 0'
 //   0x19 (Clip Window Sprites): hard 'same', soft '0,255,0,191, index 0'
 //   0x1A (Clip Window ULA/LoRes): hard 'same', soft '0,255,0,191, index 0'
@@ -161,6 +160,9 @@ static const struct { int reg, hard, soft; } NR_RESET[] = {
 //   0x24 (Reserved): hard '-', soft '-'
 //   0x2A (PS/2 Keymap Data MSB): hard '-', soft '-'
 //   0x2B (PS/2 Keymap Data LSB): hard '-', soft '-'
+//   0x2C (DAC B Mirror (left)): hard 'W: DAC 0x80; R: 0x80 with I2S off', soft 'W: DAC 0x80; R: Pi I2S input'
+//   0x2D (DAC A+D Mirror (mono)): hard 'W: DACs 0x80; R: 0x00 with I2S off', soft 'W: DACs 0x80; R: latched I2S LSBs'
+//   0x2E (DAC C Mirror (right)): hard 'W: DAC 0x80; R: 0x80 with I2S off', soft 'W: DAC 0x80; R: Pi I2S input'
 //   0x35 (Sprite Attribute 0): hard '-', soft '-'
 //   0x36 (Sprite Attribute 1): hard '-', soft '-'
 //   0x37 (Sprite Attribute 2): hard '-', soft '-'

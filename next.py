@@ -116,10 +116,15 @@ class Next:
     def regs(self):
         buf = (ctypes.c_uint16 * 16)()
         self.lib.zxn_regs(self.z, buf)
-        return dict(zip(REG_NAMES, list(buf)))
+        r = dict(zip(REG_NAMES, list(buf)))
+        r['i'], r['r'] = r['ir'] >> 8, r['ir'] & 0xFF
+        return r
 
     def set_regs(self, **kw):
         for k, v in kw.items():
+            if k in ('i', 'r'):                                       # halves of ir
+                ir = self.regs()['ir']
+                v, k = (v << 8 | ir & 0xFF) if k == 'i' else (ir & 0xFF00 | v & 0xFF), 'ir'
             name = {'af_': "af'", 'bc_': "bc'", 'de_': "de'", 'hl_': "hl'"}.get(k, k)
             self.lib.zxn_set_reg(self.z, REG_NAMES.index(name), v)
 
@@ -221,7 +226,7 @@ class Next:
         res = []
         for i in range(self.lib.zxn_int_log_len(self.z)):
             self.lib.zxn_int_log_get(self.z, i, out)
-            res.append((out[0], out[1]))
+            res.append((out[0], out[1] or None))           # None: still low (§9.1 (4))
         return res
 
     def io_log(self, on=True):

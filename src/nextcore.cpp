@@ -106,6 +106,9 @@ struct ZXN {
     uint8_t nr[256];
     int nr_sel = 0x24;                  // port 0x243B resets to 0x24 (ref §4.1)
     bool ula_int_disabled = false;      // port 0xFF bit 6 and its aliases (ref §2.3)
+    bool eff_cd = false;                // eff_nr_08_contention_disable: NR 0x08 b6 as in effect (zxnext:5703-5733)
+    int coreid = 1;                     // NR 0x10's core id (zxnext:1127)
+    bool l2_en = false;                 // port_123b_layer2_en (port 0x123B b1, NR 0x69 b7; Layer 2 itself: later)
 
     // time and the beam
     uint64_t t28 = 0, cpu_clocks = 0, frame = 0;
@@ -285,14 +288,30 @@ void port_memory_change(ZXN& z, bool was_allram, bool set_top = true) {
 
 void nr_write(ZXN& z, int n, int v);
 void do_reset(ZXN& z, bool hard);
+inline bool locked(const ZXN& z);
 
 int nr_read(ZXN& z, int n) {
     switch (n) {
         case 0x02: return (z.reset_type == 2 ? 2 : z.reset_type == 1 ? 1 : 0) | (z.nr[0x02] & 0x80);   // ref §4.3
-        case 0x03: return (z.timing << 4) | (z.lock << 3) | (z.config_mode ? 3 : z.mtype);   // reads 0x33 at power-on
+        case 0x03: return (z.pend_timing << 4) | (z.lock << 3) | z.mtype; // the registers, not the timing in effect
+                                                                      // (zxnext:5800-5801; palette sub-index b7: later)
         case 0x05: return z.nr[0x05];
         case 0x07: return (z.speed_eff << 4) | z.speed_prog;                                  // ref §1.3
         case 0x0F: return z.issue == 4 ? 0x02 : 0x00;
+        case 0x08:                                                    // b7 reads "unlocked", b6 the copy in effect
+            return (locked(z) ? 0 : 0x80) | (z.eff_cd ? 0x40 : 0) | (z.nr[0x08] & 0x3F);   // (zxnext:5812-5813)
+        case 0x10: return z.coreid << 2;                              // no buttons pressed (zxnext:5830-5831)
+        case 0x22:                                                    // the pulse, port FF b6, the line interrupt's
+            return (z.int_low ? 0x80 : 0) | ((z.portff >> 4) & 4) | (z.nr[0x22] & 3);       // (zxnext:5898-5899)
+        case 0x81: return 0x80 | (z.nr[0x81] & 0x70);                 // b7 the bus's ROMCS pin, high (zxnext:6032)
+        case 0x2C: case 0x2E: return 0x80;                            // the Pi's I2S audio, off: 0x200 >> 2 (zxnext:2316-2317,
+                                                                      // 5912-5913)
+        case 0x2D: return 0x00;                                       // the Pi's latched I2S sample: none (zxnext:5917-5918)
+        case 0x69:                                                    // aliases of 123B b1, 7FFD b3, FF b5:0 (zxnext:6002-6003)
+            return (z.l2_en ? 0x80 : 0) | (z.port7ffd & 0x08) << 3 | (z.portff & 0x3F);
+        case 0xA2: return (z.nr[0xA2] & 0xDD) | 0x02;                 // b5 reads 0, b1 reads 1 (zxnext:6098-6099)
+        case 0xC4:                                                    // (zxnext:6144-6145, 6618)
+            return (z.nr[0xC4] & 0x80) | (z.nr[0x22] & 2) | ((z.portff & 0x40) ? 0 : 1);
         case 0x8E:                                                    // the same layout, bit 3 = 1 (zxnext 6065-6066)
             return ((z.portdffd & 1) << 7) | ((z.port7ffd & 7) << 4) | 8 | ((z.port1ffd & 1) << 2) |
                    ((z.port1ffd & 1) ? ((z.port1ffd >> 1) & 3) : (((z.port1ffd >> 1) & 2) | ((z.port7ffd >> 4) & 1)));
@@ -305,6 +324,40 @@ int nr_read(ZXN& z, int n) {
 void nr_write(ZXN& z, int n, int v) {
     v &= 0xFF;
     switch (n) {
+        case 0x00: case 0x01: case 0x0E: case 0x0F: case 0x1E: case 0x1F: case 0xB0: case 0xB1: case 0xB2: case 0xDA:
+            return;                                                   // read-only (machine/nextregs.tsv)
+        case 0x08:
+            if (v & 0x80) z.port7ffd &= ~0x20;                        // b7 clears 7FFD's lock, unstored (zxnext:3612-3614)
+            z.nr[0x08] = v & 0x7F;
+            return;
+        case 0x10:                                                    // the core id, in config mode only (zxnext:5612-5640)
+            if (z.config_mode) {
+                if (z.issue != 4) z.coreid = v & 0x1F;
+                else if (!(v & 0x10) && (v & 0x0F) != 0x0F) z.coreid = v & 0x0F;
+            }
+            return;                                                   // (b7, flash boot, reloads another core: not modelled)
+        case 0x22:
+            z.portff = (z.portff & ~0x40) | ((v & 4) << 4);           // b2 is port FF b6 (zxnext:3577-3578)
+            z.ula_int_disabled = z.portff & 0x40;
+            z.nr[0x22] = v & 3;                                       // the line interrupt: enable, line b8 (zxnext:5233-5236)
+            return;
+        case 0xC5:                                                    // four CTC channels: b7:4 aren't there
+            z.nr[0xC5] = v & 0x0F;                                    // (zxnext:4030, 6148-6149; ref §9 D-5)
+            return;
+        case 0x69:                                                    // (zxnext:3866, 3616-3617, 3575-3576)
+            z.l2_en = v & 0x80;
+            z.port7ffd = (z.port7ffd & ~0x08) | ((v >> 3) & 0x08);
+            z.portff = (z.portff & 0xC0) | (v & 0x3F);
+            return;
+        case 0x81:
+            z.nr[0x81] = v & 0x70;                                    // the speed is forced to 00 (zxnext:5429-5433)
+            return;
+        case 0xC4:                                                    // (zxnext:5544-5547, 3579-3580)
+            z.nr[0xC4] = v & 0x80;
+            z.nr[0x22] = (z.nr[0x22] & ~2) | (v & 2);
+            z.portff = (z.portff & ~0x40) | ((v & 1) ? 0 : 0x40);
+            z.ula_int_disabled = z.portff & 0x40;
+            return;
         case 0x02:                                                    // reset (ref §4.3)
             z.nr[0x02] = (z.nr[0x02] & 0x7F) | (v & 0x80);
             if (v & 2) do_reset(z, true);
@@ -320,7 +373,7 @@ void nr_write(ZXN& z, int n, int v) {
             int type = v & 7;
             if (type == 7) z.config_mode = true;
             else if (type != 0) {
-                if (z.config_mode) z.mtype = type;                    // the type is accepted only in config mode
+                if (z.config_mode && type <= 4) z.mtype = type;       // types 1-4, only in config mode (zxnext:5076-5083)
                 z.config_mode = false;
             }
             remap(z);
@@ -333,6 +386,9 @@ void nr_write(ZXN& z, int n, int v) {
         case 0x05:
             z.nr[0x05] = v;
             z.pend_hz60 = (v >> 2) & 1;
+            return;
+        case 0x06:                                                    // PS/2 mode (bit 2) only in config mode
+            z.nr[0x06] = z.config_mode ? v : (v & ~0x04) | (z.nr[0x06] & 0x04);   // (zxnext:5100-5109)
             return;
         case 0x07:
             z.speed_prog = v & 3;                                     // takes effect between bus cycles (ref §1.3)
@@ -382,11 +438,17 @@ void do_reset(ZXN& z, bool hard) {
         z.mtype = 3;
         z.lock = 0;
         z.nr04 = 0;
+        z.coreid = 1;                                                 // the FPGA reloads: declared values (ref §7.1)
+        z.timing = z.pend_timing = 3;
+        z.hz60 = z.pend_hz60 = 0;
         z.issue = z.issue;
     } else {
         z.reset_type = z.reset_type == 4 ? 2 : 1;                     // the first soft reset reads "hard" (ref §4.3)
         for (auto& r : NR_RESET) if (r.soft >= 0) z.nr[r.reg] = r.soft;
         for (int r : {0x80, 0x8C}) z.nr[r] = (z.nr[r] & 0x0F) | ((z.nr[r] << 4) & 0xF0);   // zxnext:2141-2145, 2210-2214
+        z.nr[0x06] |= 0xA0;                                           // the speed and 50/60 hotkeys back on, contention
+        z.nr[0x08] &= ~0x40;                                          // back on, sprite tie off (zxnext:4871-4876)
+        z.nr[0x09] &= ~0x10;
         if (z.nr[0x85] & 0x80) {                                      // the port enables come back if NR 0x85 b7 = 1,
             z.nr[0x82] = z.nr[0x83] = z.nr[0x84] = 0xFF;              // and the bus's if NR 0x89 b7 = 0 (sic:
             z.nr[0x85] |= 0x0F;                                       // zxnext:4991-5007)
@@ -402,6 +464,8 @@ void do_reset(ZXN& z, bool hard) {
     z.port7ffd = z.port1ffd = z.portdffd = z.porteff7 = z.portff = 0;
     z.border = 0;
     z.speed_prog = z.speed_eff = 0;
+    z.eff_cd = false;                                                 // (zxnext:5706-5709)
+    z.l2_en = false;                                                  // (zxnext:3849)
     z.nr_sel = 0x24;
     z.ula_int_disabled = false;
     z.int_req = z.int_low = false;
@@ -522,7 +586,7 @@ inline void classify(ZXN& z, uint64_t p) {
 // wait_s (zxula.vhd 582-583): slots with hc_ula(3:0) in 3-14 (decided a slot early: hc_adj = hc + 1), in the
 // 256 x 192 area; only at 3.5 MHz, not with NR 0x08 bit 6, not in Pentagon timing (zxnext 4422).
 inline bool wait_s(const ZXN& z) {
-    if (z.speed_eff != 0 || (z.nr[0x08] & 0x40) || z.timing == 4) return false;
+    if (z.speed_eff != 0 || z.eff_cd || z.timing == 4) return false;
     int h = hc_ula(z), v = vc_ula(z);
     int adj = ((h & 15) + 1) & 15;
     return adj >= 4 && h < 256 && v < 192;
@@ -620,6 +684,9 @@ bool cpu_edge(ZXN& z) {
         } else if (p & Z80_WR) {
             mem_write(z, a, Z80_GET_DATA(p));
         }
+    } else if ((p & Z80_IORQ) && (p & Z80_M1)) {
+        Z80_SET_DATA(p, 0xFF);                                        // INTACK: 0xFF in pulse mode (zxnext:1827-1837;
+                                                                      // hardware IM2's vector: later)
     } else if ((p & Z80_IORQ) && !(p & Z80_M1)) {
         uint16_t port = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
@@ -652,7 +719,10 @@ bool cpu_edge(ZXN& z) {
     // the effective speed follows the programmed one only between bus cycles (ref §1.3)
     // (the VHDL samples MREQ, IORQ and M1 as they were before the edge: the previous T-state's pins, not this one's;
     // Speccy-Zone's review)
-    if (!(saved_pins & (Z80_MREQ | Z80_IORQ | Z80_M1))) z.speed_eff = z.speed_prog;
+    if (!(saved_pins & (Z80_MREQ | Z80_IORQ | Z80_M1))) {
+        z.speed_eff = z.speed_prog;
+        if (hc_ula(z) & 0x100) z.eff_cd = z.nr[0x08] & 0x40;          // in the line's right half only (zxnext:5729-5731)
+    }
     // the INT pulse is counted on rising CPU edges until 32 (48K, +3) or 36 (128K, Pentagon), then released on the
     // falling 28 MHz edge inside this same tick (zxnext:1993-2003): this edge still saw INT low, the next won't
     if (z.int_low && ++z.int_count >= T(z).int_len) {
