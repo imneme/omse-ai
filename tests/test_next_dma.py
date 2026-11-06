@@ -698,3 +698,20 @@ class Gaps(NextCase):
             t = w + 8 * (3 + held(w))
         self.assertEqual([(e[0], e[2], e[3]) for e in dma], want)
         self.assertTrue(any(held(e[0]) for e in dma if e[2] == 'mw'), 'no write was held at all')
+
+    def test_status_mid_block_shows_at_least_one(self):
+        # T is set at each WRITE_4 (dma:415) and cleared only in IDLE (dma:264): in a burst-mode wait, with the block
+        # under way, the status reads 00 1 1101 1 = 3B; after the block, 1A
+        n = 4
+        zx = bare()
+        program(zx, regs(n, presc=7, mode=2) + [0xBB, 0x01])
+        code = bytes([0x3E, 0x87, 0xD3, 0x6B, 0x00, 0x00, 0xDB, 0x6B, 0x32, 0x00, 0xA1] + [0x00] * 200 + [0x18, 0xFE])
+        zx.load(CODE, code)                             # OUT (6Bh),87h; NOP; NOP; IN A,(6Bh); LD (A100h),A; NOPs
+        launch(zx, CODE)
+        assert zx.run_until_pc(CODE, max_ticks=10**6)
+        zx.dma_log(True)
+        assert zx.run_until_pc(CODE + 11 + 200, max_ticks=10**6)
+        reads = [e[1] for e in zx.dma_events if e[2] == 'mr']
+        self.assertEqual(len(reads), n)
+        self.assertEqual(zx.peek(0xA100), 0x3B)
+        self.assertEqual(zx.io_in(0x6B), 0x1A)
