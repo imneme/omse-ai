@@ -166,6 +166,22 @@ class UlaInterrupt(NextCase):
             self.assertEqual(zx.vc_ula, v, f'{timing} {hz} Hz: ulat:548-556 (§2.3)')
             self.assertIn(zx.hc_ula, (h, h + 1), f'{timing} {hz} Hz: the pixel after the match')
 
+    def test_exact_slot(self):
+        """INT drops on the falling 28 MHz edge inside the first tick of the
+        registered pixel (ulat:548-556; im2p:100; zxnext:1977-1985), so its
+        first low tick (§9.1 (4)) is still that pixel: hc_ula is h exactly,
+        and two ticks before it is the pixel before. (Mutant survivor: h+1.)"""
+        for (timing, hz) in ref.TIMINGS:
+            zx = bare(timing=timing, hz=hz)
+            pulses(self, zx, 2, at_least=1)
+            nxt = next_start(zx, ref.frame_ticks(timing, hz))
+            h, v = ref.int_beam(timing, hz)
+            L = ref.TIMINGS[(timing, hz)][0]
+            run_to(zx, nxt - 2)
+            self.assertEqual(zx.hc_ula, (h - 1) % L, f'{timing} {hz} Hz: two ticks before')
+            run_to(zx, nxt)
+            self.assertEqual((zx.hc_ula, zx.vc_ula), (h, v), f'{timing} {hz} Hz: the slot itself')
+
     def test_disabled_ula_interrupt_makes_no_pulse(self):
         zx = bare()
         pulses(self, zx, 2, at_least=1)                 # enabled, it pulses
@@ -386,6 +402,30 @@ class Contention48(NextCase):
                    lambda pc: [(pc, 4), (0x4000, 3)], 'page 10h at 4000h: uncontended',
                    mmu=[0xFF, 0xFF, 0x10, 0x11, 0x04, 0x05, 0x00, 0x01], prefixes=[0, 3])
 
+    def test_rows_from_192_are_not_contended(self):
+        """Mutant survivor: contention past row 191. Start near row 186 so the
+        run crosses into the border (border_active_v, zxula.vhd:414)."""
+        self.check([0x21, 0x00, 0x40, 0x01, 0x00, 0x80], [0x7E],
+                   lambda pc: [(pc, 4), (0x4000, 3)], 'LD A,(HL) across row 191/192', line=186,
+                   prefixes=[0, 3])
+
+    def test_upper_half_of_bank_5(self):
+        """Mutant survivor: under 48K timing page 0Bh (6000h-7FFFh) is contended
+        like 0Ah (zxnext:4431, pages 0Ah-0Bh)."""
+        if self.TIMING != '48k':
+            self.skipTest('48K timing only')
+        self.check([0x21, 0x00, 0x60, 0x01, 0x00, 0x80], [0x7E],
+                   lambda pc: [(pc, 4), (0x6000, 3)], 'LD A,(HL) from 6000h', prefixes=[0, 5])
+
+    def test_t2_is_never_checked_from_32_starting_points(self):
+        """Mutant survivor: a check at a memory cycle's T2 shows from only a few
+        phases, so sweep 32 starts with a body (15 T) that walks the pattern:
+        LD A,(HL); NOP; NOP (zxula.vhd:589: the memory term needs MREQ high at
+        the last rising edge, i.e. T1 only)."""
+        self.check([0x21, 0x00, 0x40, 0x01, 0x00, 0x80], [0x7E, 0x00, 0x00],
+                   lambda pc: [(pc, 4), (0x4000, 3), (pc + 1, 4), (pc + 2, 4)],
+                   'LD A,(HL); NOP; NOP', prefixes=range(32), reps=40)
+
     def test_off_above_3_5_mhz(self):
         zx = bare(timing='48k', speed=1)
         code, s, e = program([0x21, 0x00, 0x40, 0x01, 0x00, 0x80], [0x7E], REPS)
@@ -419,6 +459,15 @@ class Contention128(Contention48):
             self.check([0x21, 0x00, 0xC0, 0x01, 0x00, 0x80], [0x7E],
                        lambda pc: [(pc, 4), (0xC000, 3)], f'LD A,(HL) from bank {bank}',
                        mmu=mmu, prefixes=[0, 5])
+
+    def test_pages_10h_and_up_are_never_contended(self):
+        """Mutant survivor: page 12h/13h has bit 1 set but only pages 00-0Fh can
+        be contended (zxnext:4430)."""
+        for page in (0x12, 0x13):
+            mmu = MMU0[:6] + [page, page + 1]
+            self.check([0x21, 0x00, 0xC0, 0x01, 0x00, 0x80], [0x7E],
+                       lambda pc: [(pc, 4), (0xC000, 3)], f'LD A,(HL) from page {page:02X}h',
+                       mmu=mmu, prefixes=[0, 3])
 
     def test_7ffd_is_contended_as_the_ula_port(self):  # OUT (C),A: pc:4, pc+1:4, I/O
         self.check([0x01, 0xFD, 0x7F, 0xAF], [0xED, 0x79],

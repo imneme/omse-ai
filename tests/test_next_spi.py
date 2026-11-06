@@ -34,8 +34,12 @@ R7 = [0x01, 0x00, 0x00, 0x01, 0xAA]
 def out_eb(b, mode):
     """LD A,b; OUT (EBh),A, once ('single'), twice back to back ('fast',
     11 T apart), or twice with two NOPs between ('slow', 19 T apart)."""
+    if mode == 'gap16':                                 # OUT (C),A; NOP; OUT (C),A: 16 apart
+        return [0x3E, b, 0xED, 0x79, 0x00, 0xED, 0x79]
     code = [0x3E, b, 0xD3, 0xEB]
-    if mode == 'fast':
+    if mode == 'gap15':                                 # OUT (n),A; NOP; OUT (n),A: 15 apart
+        code += [0x00, 0xD3, 0xEB]
+    elif mode == 'fast':
         code += [0xD3, 0xEB]
     elif mode == 'slow':
         code += [0x00, 0x00, 0xD3, 0xEB]
@@ -47,6 +51,10 @@ def reads(n, paired=False):
     paired, IN A,(EBh) and IN B,(C) back to back, both stored."""
     one = [0xDB, 0xEB, 0x77, 0x23]
     two = [0xDB, 0xEB, 0xED, 0x40, 0x77, 0x23, 0x70, 0x23]
+    if paired == 'gap15':                               # IN A,(n); LD E,A; IN A,(n): 15 apart
+        return [0xDB, 0xEB, 0x5F, 0xDB, 0xEB, 0x73, 0x23, 0x77, 0x23] * n
+    if paired == 'ini':                                 # INI; INI; ...: 16 apart
+        return [0xED, 0xA2] * (2 * n)
     return (two if paired else one) * n
 
 
@@ -95,7 +103,7 @@ class SpiGap(NextCase):
         zx.load(CODE, code)
         launch(zx, CODE)
         self.assertTrue(zx.run_until_pc(CODE + len(code) - 2, max_ticks=10**7), 'program ran')
-        per = NREADS * (2 if paired else 1)
+        per = NREADS * (2 if paired else 1)             # every reader stores 2 bytes a pair
         got = zx.read(RESULTS, per * len(commands))
         return [list(got[i * per:(i + 1) * per]) for i in range(len(commands))]
 
@@ -138,6 +146,35 @@ class SpiGap(NextCase):
             self.assertEqual(reply([a for a, b in pairs], 5), R7,
                              'and the stream advanced one byte a pair')
         self.check_speeds(t)
+
+
+@needs_next
+class SpiGapBoundary(SpiGap):
+    """Mutant survivors: the boundary itself, at 3.5 MHz where T-states are
+    CPU clocks (at 28 MHz each read's wait would widen these gaps)."""
+
+    test_well_spaced_commands = test_writes_too_soon_start_nothing = None
+    test_writes_far_enough_apart_all_go_out = test_a_read_too_soon_returns_the_same_byte = None
+
+    def test_writes_15_apart_start_nothing(self):
+        r0, r8 = self.run_cards([(CMD0, 'gap15'), (CMD8, 'gap15')])
+        self.assertEqual(reply(r0, 1), [0x01])
+        self.assertEqual(reply(r8, 5), R7, '15 clocks on, the copy started nothing (spi:82-100)')
+
+    def test_writes_16_apart_both_go_out(self):
+        r0, r8 = self.run_cards([(CMD0, 'single'), (CMD8, 'gap16')])
+        self.assertEqual(reply(r0, 1), [0x01])
+        self.assertNotEqual(reply(r8, 5), R7, '16 clocks on, the copy went out too')
+
+    def test_a_read_15_apart_rereads(self):
+        r0, r8 = self.run_cards([(CMD0, 'single'), (CMD8, 'single')], paired='gap15')
+        self.assertIn(0x01, r0, 'the card answered CMD0 (a live card, not all zeros)')
+        pairs = list(zip(r8[0::2], r8[1::2]))
+        self.assertTrue(all(a == b for a, b in pairs), f'15 apart: the same byte (spi:159-168) {pairs}')
+
+    def test_reads_16_apart_get_each_finished_byte(self):
+        r0, r8 = self.run_cards([(CMD0, 'single'), (CMD8, 'single')], paired='ini')
+        self.assertEqual(reply(r8, 5), R7, 'INI after INI, 16 apart: one fresh byte each')
 
 
 if __name__ == '__main__':

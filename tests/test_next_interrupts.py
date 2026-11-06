@@ -131,6 +131,9 @@ class HardwareIM2(NextCase):
 
     def setup(self, mode=2, tail=RETI, c0=0xA1, nr22=0x00, line=None):
         zx = bare(timing='48k')
+        zx.nr_write(0x03, 0x00)                         # boot ROM off: in bare mode it wins every
+                                                        # read at 0000-3FFF (zxnext:1809-1813, 5061;
+                                                        # Ratio's catch), and RST 38 needs RAM there
         zx.nr_write(0x22, nr22)
         if line is not None:
             zx.nr_write(0x23, line)
