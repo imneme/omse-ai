@@ -3,12 +3,15 @@
 // by nextcore.cpp just before cpu_edge, which calls dma_edge, dma_pins and dma_cycle. The DMA itself, as pure
 // logic, is next_dma.h. References: zxnext:N is zxnext.vhd's line N, t80n:N t80n.vhd's, im2c:N im2_control.vhd's.
 
-// the DMA's ports (zxnext:2602, 2364, 2399): 0x6B with NR 0x82 b5, 0x0B with NR 0x85 b1, by the low byte; never in
-// the DMA's own cycles (port_dma_rd/wr are gated by dma_holds_bus, zxnext:2727-2728)
-inline bool dma_port(const ZXN& z, uint16_t port) {
+// port_dma (zxnext:2602, 2364, 2399): 0x6B with NR 0x82 b5, 0x0B with NR 0x85 b1, by the low byte. This alone is
+// what port_internal_response counts (zxnext:2657), DMA cycles included: a DMA cycle to 6Bh stays inside.
+inline bool dma_port_decode(const ZXN& z, uint16_t port) {
     const int lo = port & 0xFF;
-    return !z.db.busak && ((lo == 0x6B && port_en(z, 5)) || (lo == 0x0B && port_en(z, 25)));
+    return (lo == 0x6B && port_en(z, 5)) || (lo == 0x0B && port_en(z, 25));
 }
+// the CPU's access to the DMA's registers: port_dma_rd/wr are also gated by dma_holds_bus (zxnext:2727-2728), so the
+// DMA can't program itself
+inline bool dma_port(const ZXN& z, uint16_t port) { return !z.db.busak && dma_port_decode(z, port); }
 // a CPU access to a DMA port: dma_mode latches which port on the falling edge inside the strobe (zxnext:1770-1779), so
 // before the DMA acts on it; a write lands at the next rising edge (or at once, from io_out: §9.1 (6))
 uint8_t dma_port_read(ZXN& z, uint16_t port) {

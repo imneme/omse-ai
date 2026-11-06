@@ -1061,6 +1061,7 @@ uint8_t floating_bus(const ZXN& z) {
     return scr[((v & 0xC0) << 5) | ((v & 7) << 8) | ((v & 0x38) << 2) | col];
 }
 
+inline bool dma_port_decode(const ZXN& z, uint16_t port);       // port_dma (next_dma_bus.inc)
 inline bool dma_port(const ZXN& z, uint16_t port);
 uint8_t dma_port_read(ZXN& z, uint16_t port);
 void dma_port_write(ZXN& z, uint16_t port, uint8_t v);
