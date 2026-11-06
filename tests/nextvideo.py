@@ -70,7 +70,14 @@ class Video:
         self.nr26 = 0x00                # ULA scroll x (zxnext:4926)
         self.nr27 = 0x00                # ULA scroll y (zxnext:4928)
         self.nr68 = 0x00                # ULA control: b7 ULA off, b6:5 blend, b3 ULA+, b2 fine x, b0 stencil
-        self.nr6b = 0x00                # tilemap control (b7 enable): not modelled yet
+        self.nr6b = 0x00                # tilemap: b7 on, b6 80 columns, b5 strip flags, b4 palette, b3 text,
+                                        # b1 512 tiles, b0 always on top (zxnext:4975-4976, 5399-5400)
+        self.nr6c = 0x00                # tilemap default attribute (zxnext:4978)
+        self.nr6e = 0x2C                # map base: b7 bank 7, b5:0 256-byte offset (zxnext:4980-4981)
+        self.nr6f = 0x0C                # tile definitions base, the same shape (zxnext:4983-4984)
+        self.nr4c = 0x0F                # tilemap transparent index, 4 bits (zxnext:4957)
+        self.tm_scroll_x = 0            # NR 0x2F bits 1:0 and NR 0x30, 10 bits (zxnext:4930, 5268-5272)
+        self.nr31 = 0x00                # tilemap scroll y (zxnext:4932)
         self.nr6a = 0x00                # LoRes: b5 Radastan, b4 display-file XOR, b3:0 palette offset (zxnext:4972)
         self.nr32 = 0x00                # LoRes scroll x, y (zxnext:4934-4936)
         self.nr33 = 0x00
@@ -177,6 +184,20 @@ class Video:
             self.nr6b = v
         elif n == 0x6A:
             self.nr6a = v                                   # zxnext:5392-5396
+        elif n == 0x6C:
+            self.nr6c = v                                   # zxnext:5403
+        elif n == 0x6E:
+            self.nr6e = v & 0xBF                            # zxnext:5406-5408
+        elif n == 0x6F:
+            self.nr6f = v & 0xBF                            # zxnext:5410-5412
+        elif n == 0x4C:
+            self.nr4c = v & 15                              # zxnext:5351
+        elif n == 0x2F:
+            self.tm_scroll_x = ((v & 3) << 8) | (self.tm_scroll_x & 0xFF)   # zxnext:5268-5269
+        elif n == 0x30:
+            self.tm_scroll_x = (self.tm_scroll_x & 0x300) | v               # zxnext:5271-5272
+        elif n == 0x31:
+            self.nr31 = v                                   # zxnext:5274-5275
         elif n == 0x32:
             self.nr32 = v
         elif n == 0x33:
@@ -328,6 +349,53 @@ class Video:
         byte = self.bram5[a]
         return ((((byte >> 4) + off) & 15) << 4) | (byte & 15)      # lores:100, 110
 
+    # ------------------------------------------------------------------ the tilemap
+    def _tm_mem(self, base, sub):
+        """A byte the tilemap reads: (sub(13:8) + base(5:0)) mod 64, then sub(7:0), in bank 5 or (base bit 7)
+        bank 7's 8K (tilemap:400-403; zxnext:4340-4349, 6567-6571)."""
+        a = ((((sub >> 8) + (base & 0x3F)) & 0x3F) << 8) | (sub & 0xFF)
+        return self.bram7[a & 0x1FFF] if base & 0x80 else self.bram5[a]
+
+    def _tilemap(self, phc, half, py):
+        """One sample of the tilemap: (index, pixel_en, below, textmode) (tilemap:183-446). The surface is
+        320 x 256 at whc = phc + 32, wvc = py + 32 (zxnext:4330-4331); the fetch runs a character ahead into a
+        double buffer, so the pixel shown at x is the map's pixel at (scroll + x) mod the width."""
+        c = self.nr6b
+        whc, wvc = phc + 32, py + 32
+        x1, x2, y1, y2 = self.clip[0x1B]
+        en = (0 <= whc < 320 and 0 <= wvc < 256 and x1 * 2 <= whc <= x2 * 2 + 1 and y1 <= wvc <= y2)  # tilemap:416-424
+        mode80 = (c >> 6) & 1                                       # tilemap:189, 228
+        width = 640 if mode80 else 320
+        tx = whc * 2 + half if mode80 else whc
+        abs_x = (self.tm_scroll_x + tx) % width                     # tilemap:309-318 (the corrections are mod W)
+        abs_y = (self.nr31 + wvc) & 0xFF                            # tilemap:326
+        idx = (abs_y >> 3) * (80 if mode80 else 40) + (abs_x >> 3)  # tilemap:327-328, 395
+        if c & 0x20:                                                # strip flags: one byte each (tilemap:396-398)
+            tile, attr = self._tm_mem(self.nr6e, idx), self.nr6c    # tilemap:363-367
+        else:
+            tile, attr = self._tm_mem(self.nr6e, idx * 2), self._tm_mem(self.nr6e, idx * 2 + 1)
+        mode512 = (c >> 1) & 1
+        tile9 = ((mode512 & attr & 1) << 8) | tile                  # tilemap:393
+        if c & 0x08:                                                # text mode: 1 bit, 8 bytes a tile
+            byte = self._tm_mem(self.nr6f, (tile9 << 3) | (abs_y & 7))  # tilemap:394
+            bit = ((byte << (abs_x & 7)) >> 7) & 1                  # tilemap:385-386
+            index, textmode = (attr & 0xFE) | bit, True
+            pix_en = en                                             # tilemap:429
+        else:
+            ex, ey = abs_x & 7, abs_y & 7
+            if ((attr >> 3) ^ (attr >> 1)) & 1:                     # rotation inverts the x mirror (tilemap:320-321)
+                ex ^= 7
+            if (attr >> 2) & 1:                                     # tilemap:322
+                ey ^= 7
+            if (attr >> 1) & 1:                                     # rotation swaps x and y (tilemap:323-324)
+                ex, ey = ey, ex
+            byte = self._tm_mem(self.nr6f, (tile9 << 5) | (ey << 2) | (ex >> 1))   # tilemap:394
+            nib = (byte >> 4) if not (ex & 1) else (byte & 15)      # tilemap:383
+            index, textmode = (attr & 0xF0) | nib, False
+            pix_en = en and nib != self.nr4c                        # tilemap:427, 429
+        below = bool((attr & 1) | mode512) and not (c & 1)          # tilemap:388
+        return index, pix_en, below, textmode
+
     # ------------------------------------------------------------------ Layer 2
     def _layer2(self, phc, half, py):
         """One sample of Layer 2: (index, enabled) where enabled is pixel_en (l2:175, 214)."""
@@ -382,7 +450,7 @@ class Video:
         return pix, True
 
     # ------------------------------------------------------------------ the mixer
-    def frame9(self, schedule=None):
+    def frame9(self, schedule=None, rows=None):
         """The 704 x 288 9-bit picture of a static frame, as the mixer makes it (zxnext:6843-7263).
 
         schedule: optional [(sy, register, value), ...]: next-register writes made in the horizontal
@@ -391,16 +459,16 @@ class Video:
         row is drawn wholly with the registers as they stand when it starts."""
         if self.nr15 & 0x01 or any(n == 0x15 and v & 0x01 for _, n, v in (schedule or [])):
             raise NotImplementedError('sprites are not in the model yet (NR 0x15 bit 0)')
-        if self.nr6b & 0x80:
-            raise NotImplementedError('the tilemap is not in the model yet (NR 0x6B bit 7)')
         pending = sorted(schedule or [])
-        tm_transparent = True                                       # the tilemap is off
         sprite_transparent = True                                   # sprites off (zxnext:6841, 7025)
         out = []
         for sy in range(H):
             while pending and pending[0][0] <= sy:
                 _, n, v = pending.pop(0)
                 self.nr_write(n, v)
+            if rows is not None and sy not in rows:
+                out.extend([None] * W)
+                continue
             ula_pal = ((self.nr43 >> 1) & 1) << 8                   # zxnext:6732, 6888
             l2_pal = ((self.nr43 >> 2) & 1) << 8                    # zxnext:6734, 6940
             fallback = (self.nr4a << 1) | (((self.nr4a >> 1) | self.nr4a) & 1)   # zxnext:6897, 7121
@@ -408,8 +476,9 @@ class Video:
             order = (self.nr15 >> 2) & 7
             ula_en = not (self.nr68 & 0x80)                         # zxnext:5383
             blend = (self.nr68 >> 5) & 3
-            # the tilemap is off: "below" = NOT NR 0x6B bit 0 (zxnext:6770, 7016)
-            tm_below = not (self.nr6b & 1)
+            tm_en = bool(self.nr6b & 0x80)                          # zxnext:6727
+            tm_pal = 0x200 | (((self.nr6b >> 4) & 1) << 8)          # zxnext:6733, 6888
+            stencil = self.nr68 & 1
             py = sy - 48
             for sx in range(W):
                 phc, half = sx // 2 - 48, sx & 1
@@ -419,9 +488,21 @@ class Video:
                 ula_mix_rgb = 0 if ula_mix_transparent else ula_rgb2
                 ula_transparent = ula_mix_transparent or not ula_en                   # zxnext:7010
                 ula_rgb = 0 if ula_transparent else ula_rgb2
-                tm_rgb = 0
-                # stencil mode needs the tilemap on (zxnext:7037), so with it off U = ULA (zxnext:7022-7023)
-                ula_final_rgb, ula_final_transparent = ula_rgb, ula_transparent and tm_transparent
+                if tm_en:
+                    tidx, ten, tbelow, ttext = self._tilemap(phc, half, py)
+                    tm_rgb2 = self.ulatm[tm_pal | tidx] & 0x1FF                       # zxnext:6909
+                    tm_below = tbelow                                                 # zxnext:6770
+                    tm_transparent = (not ten) or (ttext and (tm_rgb2 >> 1) == trans)  # zxnext:7016
+                else:
+                    tm_rgb2, tm_below, tm_transparent = 0, not (self.nr6b & 1), True  # zxnext:6770, 7016
+                tm_rgb = 0 if tm_transparent else tm_rgb2                             # zxnext:7017
+                ulatm_transparent = ula_transparent and tm_transparent                # zxnext:7022
+                ulatm_rgb = tm_rgb if (not tm_transparent and (not tm_below or ula_transparent)) else ula_rgb
+                if stencil and ula_en and tm_en:                                      # zxnext:7019-7020, 7037
+                    st_t = ula_transparent or tm_transparent
+                    ula_final_rgb, ula_final_transparent = (0 if st_t else (ula_rgb & tm_rgb)), st_t
+                else:
+                    ula_final_rgb, ula_final_transparent = ulatm_rgb, ulatm_transparent
                 if blend == 0:                                                        # zxnext:7048-7084
                     mix_rgb, mix_rgb_t = ula_mix_rgb, ula_mix_transparent
                     mix_top_t, mix_top = tm_transparent or tm_below, tm_rgb
@@ -515,3 +596,263 @@ class Video:
                         rgb = mixed
                 out.append(rgb)
         return W, H, out
+
+
+# ---------------------------------------------------------------------------- the same, in numpy
+
+def _np():
+    import numpy as np
+    return np
+
+
+def frame9_np(v, schedule=None):
+    """frame9 computed over the whole grid at once: the same rules as Video.frame9 (which is the cited
+    reading; test_next_video.ModelSense checks the two agree), about a hundred times faster. A schedule
+    splits the frame into row segments, each drawn with the registers as they stand."""
+    np = _np()
+    import copy
+    pending = sorted(schedule or [])
+    out = np.zeros((H, W), dtype=np.int32)
+    cur = copy.deepcopy(v)
+    start = 0
+    while True:
+        stop = pending[0][0] if pending else H
+        if stop > start:
+            out[start:stop] = _frame_np(cur)[start:stop]
+        if not pending:
+            break
+        while pending and pending[0][0] <= stop:
+            _, n, val = pending.pop(0)
+            cur.nr_write(n, val)
+        start = stop
+    return W, H, out.ravel().tolist()
+
+
+def _frame_np(v):
+    np = _np()
+    if v.nr15 & 0x01:
+        raise NotImplementedError('sprites are not in the model yet (NR 0x15 bit 0)')
+    sy, sx = np.mgrid[0:H, 0:W]
+    phc, half, py = sx // 2 - 48, sx & 1, sy - 48
+    ulatm = np.array(v.ulatm, dtype=np.int32)
+    l2s = np.array(v.l2s, dtype=np.int32)
+    b5 = np.frombuffer(bytes(v.bram5), dtype=np.uint8).astype(np.int32)
+    b7 = np.frombuffer(bytes(v.bram7), dtype=np.uint8).astype(np.int32)
+    # ---- the ULA (Video._ula)
+    border = (phc < 0) | (phc > 255) | (py < 0) | (py > 191)
+    shadow = (v.port_7ffd >> 3) & 1
+    mode = 0 if shadow else (v.port_ff & 7)
+    mem = b7 if shadow else b5
+    ulanext, ulap = v.nr43 & 1, v.ulap_en
+    tmx = 0x40 | (((~v.port_ff >> 3) & 7) << 3) | ((v.port_ff >> 3) & 7)
+    fine = (v.nr68 >> 2) & 1
+    t = (2 * phc + half + 2 * v.nr26 + fine) & 511
+    col, within = t >> 4, t & 15
+    yy = (np.clip(py, 0, 191) + v.nr27) % 192
+    addr_p = ((yy >> 6) << 11) | ((yy & 7) << 8) | (((yy >> 3) & 7) << 5) | col
+    base = 0x2000 if mode & 1 else 0
+    memx = np.concatenate([mem, np.zeros(0x4000, dtype=np.int32)])     # bank 7 is 8K; stay in range
+    pbyte = memx[base + addr_p]
+    abyte = memx[0x2000 + addr_p] if mode & 2 else memx[base + 0x1800 + (yy >> 3) * 32 + col]
+    if mode & 4:
+        byte = np.where(within < 8, pbyte, abyte)
+        pixel = (byte >> (7 - (within & 7))) & 1
+        attr = np.full_like(phc, tmx)
+    else:
+        pixel = (pbyte >> (7 - (within >> 1))) & 1
+        attr = np.where(border, (v.border << 3) | v.border, abyte)
+    pixel = np.where(border, 0, pixel)
+    flash = (attr >> 7) & v.flash & (1 - ulanext) & (1 - ulap)
+    ink = np.where(border, 0, pixel ^ flash)
+    bgnd = np.zeros_like(phc)
+    paper_c, ink_c = (attr >> 3) & 7, attr & 7
+    if ulanext:
+        fmt = v.nr42
+        shifts = {0x01: 1, 0x03: 2, 0x07: 3, 0x0F: 4, 0x1F: 5, 0x3F: 6, 0x7F: 7}
+        if fmt in shifts:
+            paper_i, paper_bg = 0x80 | (attr >> shifts[fmt]), 0
+        else:
+            paper_i, paper_bg = 0, 1
+        index = np.where(border, 0x80 | paper_c, np.where(ink == 1, attr & fmt, paper_i))
+        bgnd = np.where(border, 1 if fmt == 0xFF else 0, np.where(ink == 1, 0, paper_bg))
+    elif ulap:
+        hi = np.where((mode & 4) | (ink == 0), 1, 0)
+        index = 0xC0 | ((attr >> 6) << 4) | (hi << 3) | np.where(ink == 1, ink_c, paper_c)
+    else:
+        index = (np.where(ink == 1, 0, 1) << 4) | (((attr >> 6) & 1) << 3) | np.where(ink == 1, ink_c, paper_c)
+    x1, x2, y1, y2 = v.clip[0x1A]
+    if y2 >> 6 == 3:
+        y2 = 0xBF
+    win = (phc >= x1) & (phc <= x2) & (py >= y1) & (py <= y2)
+    inside = ~border & win
+    clipped = ~(inside | border)
+    if v.nr15 & 0x80:                                       # LoRes (Video._lores)
+        lon = (phc >= 0) & (py >= 0) & win
+        x = (np.clip(phc, 0, 255) + v.nr32) & 0xFF
+        y = np.clip(py, 0, 191) + v.nr33
+        y = np.where(y >= 192, (y - 192) & 0xFF, y)
+        off = v.nr6a & 15
+        if v.nr6a & 0x20:
+            dfile = (v.port_ff & 1) ^ ((v.nr6a >> 4) & 1)
+            byte = b5[(dfile << 13) | ((y >> 1) << 6) | (x >> 2)]
+            nib = np.where(x & 2, byte & 15, byte >> 4)
+            high = (0xC | (off & 3)) if (v.ulap_en and not (v.nr43 & 1)) else off
+            lidx = (high << 4) | nib
+        else:
+            a = ((y >> 1) << 7) | (x >> 1)
+            a = np.where(y >= 96, a + 0x800, a)
+            byte = b5[a]
+            lidx = ((((byte >> 4) + off) & 15) << 4) | (byte & 15)
+        index = np.where(lon, lidx, index)
+        bgnd = np.where(lon, 0, bgnd)
+        clipped = np.where(lon, False, clipped)
+    # ---- Layer 2 (Video._layer2)
+    l2idx = np.zeros_like(phc)
+    l2en = np.zeros(phc.shape, dtype=bool)
+    if v.l2_en:
+        res = (v.nr70 >> 4) & 3
+        wide = res != 0
+        hc, vc = (phc + 32, py + 32) if wide else (phc, py)
+        sxr = ((v.nr71 & 1) << 8) | v.nr16
+        if not wide:
+            ok = (hc >= 0) & (vc >= 0) & (hc <= 255) & (vc <= 191)
+            x = (hc + sxr) & 0xFF
+            y = vc + v.nr17
+            y = np.where(y >= 192, y - 192, y) & 0xFF
+            addr = (y << 8) | x
+            cx1, cx2 = v.clip[0x18][0], v.clip[0x18][1]
+        else:
+            ok = (hc >= 0) & (vc >= 0) & (hc <= 319) & (vc <= 255)
+            x = hc + sxr
+            x = np.where(x >= 320, (x + 192) & 0x1FF, x)
+            y = (vc + v.nr17) & 0xFF
+            addr = (x << 8) | y
+            cx1, cx2 = v.clip[0x18][0] * 2, v.clip[0x18][1] * 2 + 1
+        cy1, cy2 = v.clip[0x18][2], v.clip[0x18][3]
+        ok &= (hc >= cx1) & (hc <= cx2) & (vc >= cy1) & (vc <= cy2)
+        bank = v.nr12 & 0x7F
+        bank_eff = (((bank >> 4) + 1) << 4) | (bank & 15)
+        a = ((bank_eff + (np.clip(addr, 0, None) >> 14)) << 14) | (np.clip(addr, 0, None) & 0x3FFF)
+        ok &= a < (1 << 21)
+        sram = np.frombuffer(bytes(v.sram), dtype=np.uint8).astype(np.int32)
+        byte = sram[np.where(ok, a, 0)]
+        pix = np.where(half == 0, byte >> 4, byte & 15) if res & 2 else byte
+        off = v.nr70 & 15
+        pix = ((((pix >> 4) + off) & 15) << 4) | (pix & 15)
+        l2idx, l2en = np.where(ok, pix, 0), ok
+    # ---- the tilemap (Video._tilemap)
+    tm_en = bool(v.nr6b & 0x80)
+    trans = v.nr14
+    fallback = (v.nr4a << 1) | (((v.nr4a >> 1) | v.nr4a) & 1)
+    ula_rgb2 = np.where(bgnd == 1, fallback, ulatm[(((v.nr43 >> 1) & 1) << 8) | index] & 0x1FF)
+    ula_mix_t = ((ula_rgb2 >> 1) == trans) | clipped
+    ula_mix_rgb = np.where(ula_mix_t, 0, ula_rgb2)
+    ula_en = not (v.nr68 & 0x80)
+    ula_t = ula_mix_t | (not ula_en)
+    ula_rgb = np.where(ula_t, 0, ula_rgb2)
+    if tm_en:
+        c = v.nr6b
+        whc, wvc = phc + 32, py + 32
+        cx1, cx2, cy1, cy2 = v.clip[0x1B]
+        en = (whc >= 0) & (whc < 320) & (wvc >= 0) & (wvc < 256) & (whc >= cx1 * 2) & (whc <= cx2 * 2 + 1) & \
+             (wvc >= cy1) & (wvc <= cy2)
+        mode80 = (c >> 6) & 1
+        width = 640 if mode80 else 320
+        tx = whc * 2 + half if mode80 else whc
+        abs_x = np.mod(v.tm_scroll_x + tx, width)
+        abs_y = (v.nr31 + wvc) & 0xFF
+        idx = (abs_y >> 3) * (80 if mode80 else 40) + (abs_x >> 3)
+
+        def tmm(base, sub):
+            a = ((((sub >> 8) + (base & 0x3F)) & 0x3F) << 8) | (sub & 0xFF)
+            return b7[a & 0x1FFF] if base & 0x80 else b5[a]
+        if c & 0x20:
+            tile, tattr = tmm(v.nr6e, idx), np.full_like(idx, v.nr6c)
+        else:
+            tile, tattr = tmm(v.nr6e, idx * 2), tmm(v.nr6e, idx * 2 + 1)
+        mode512 = (c >> 1) & 1
+        tile9 = ((mode512 & tattr & 1) << 8) | tile
+        if c & 0x08:
+            byte = tmm(v.nr6f, (tile9 << 3) | (abs_y & 7))
+            bit = ((byte << (abs_x & 7)) >> 7) & 1
+            tidx, ttext, ten = (tattr & 0xFE) | bit, True, en
+        else:
+            ex, ey = abs_x & 7, abs_y & 7
+            ex = np.where(((tattr >> 3) ^ (tattr >> 1)) & 1, ex ^ 7, ex)
+            ey = np.where((tattr >> 2) & 1, ey ^ 7, ey)
+            rot = (tattr >> 1) & 1
+            ex, ey = np.where(rot == 1, ey, ex), np.where(rot == 1, ex, ey)
+            byte = tmm(v.nr6f, (tile9 << 5) | (ey << 2) | (ex >> 1))
+            nib = np.where(ex & 1, byte & 15, byte >> 4)
+            tidx, ttext, ten = (tattr & 0xF0) | nib, False, en & (nib != v.nr4c)
+        tm_below = (((tattr & 1) | mode512) != 0) & (not (c & 1))
+        tm_rgb2 = ulatm[0x200 | (((c >> 4) & 1) << 8) | tidx] & 0x1FF
+        tm_t = ~ten | (ttext & ((tm_rgb2 >> 1) == trans))
+    else:
+        tm_rgb2 = np.zeros_like(phc)
+        tm_below = np.full(phc.shape, not (v.nr6b & 1))
+        tm_t = np.ones(phc.shape, dtype=bool)
+    tm_rgb = np.where(tm_t, 0, tm_rgb2)
+    ulatm_t = ula_t & tm_t
+    ulatm_rgb = np.where(~tm_t & (~tm_below | ula_t), tm_rgb, ula_rgb)
+    if (v.nr68 & 1) and ula_en and tm_en:
+        st_t = ula_t | tm_t
+        U, U_t = np.where(st_t, 0, ula_rgb & tm_rgb), st_t
+    else:
+        U, U_t = ulatm_rgb, ulatm_t
+    blend = (v.nr68 >> 5) & 3
+    if blend == 0:
+        mix_rgb, mix_t = ula_mix_rgb, ula_mix_t
+        top_t, top, bot_t, bot = tm_t | tm_below, tm_rgb, tm_t | ~tm_below, tm_rgb
+    elif blend == 2:
+        mix_rgb, mix_t = U, U_t
+        top_t, top, bot_t, bot = np.ones_like(tm_t), tm_rgb, np.ones_like(tm_t), tm_rgb
+    elif blend == 3:
+        mix_rgb, mix_t = tm_rgb, tm_t
+        top_t, top, bot_t, bot = ula_t | ~tm_below, ula_rgb, ula_t | tm_below, ula_rgb
+    else:
+        mix_rgb, mix_t = np.zeros_like(phc), np.ones_like(tm_t)
+        top_t = np.where(tm_below, ula_t, tm_t)
+        top = np.where(tm_below, ula_rgb, tm_rgb)
+        bot_t = np.where(tm_below, tm_t, ula_t)
+        bot = np.where(tm_below, tm_rgb, ula_rgb)
+    l2e = l2s[(((v.nr43 >> 2) & 1) << 8) | l2idx]
+    l2_rgb2 = l2e & 0x1FF
+    L_t = ((l2_rgb2 >> 1) == trans) | ~l2en
+    L = np.where(L_t, 0, l2_rgb2)
+    prio = ~L_t & ((l2e & 0x8000) != 0)
+    S_t = np.ones_like(L_t)                                 # sprites off
+    S = np.zeros_like(phc)
+    U_wins = ~U_t & ~(border & tm_t & ~S_t)
+    order = (v.nr15 >> 2) & 7
+
+    def first(pairs):
+        conds = [~t_ for t_, _ in pairs]
+        return np.select(conds, [c_ for _, c_ in pairs], default=fallback)
+    if order == 0:
+        rgb = first([(~prio, L), (S_t, S), (L_t, L), (U_t, U)])
+    elif order == 1:
+        rgb = first([(L_t, L), (S_t, S), (U_t, U)])
+    elif order == 2:
+        rgb = first([(~prio, L), (S_t, S), (U_t, U), (L_t, L)])
+    elif order == 3:
+        rgb = first([(L_t, L), (~U_wins, U), (S_t, S)])
+    elif order == 4:
+        rgb = first([(~prio, L), (~U_wins, U), (S_t, S), (L_t, L)])
+    elif order == 5:
+        rgb = first([(~prio, L), (~U_wins, U), (L_t, L), (S_t, S)])
+    else:
+        r = (L >> 6) + (mix_rgb >> 6)
+        g = ((L >> 3) & 7) + ((mix_rgb >> 3) & 7)
+        b = (L & 7) + (mix_rgb & 7)
+        if order == 6:
+            r, g, b = np.minimum(r, 7), np.minimum(g, 7), np.minimum(b, 7)
+        else:
+            def adj(q):
+                return np.where(q <= 4, 0, np.where(q >= 12, 7, q - 5))
+            r = np.where(mix_t, r, adj(r))
+            g = np.where(mix_t, g, adj(g))
+            b = np.where(mix_t, b, adj(b))
+        mixed = ((r & 7) << 6) | ((g & 7) << 3) | (b & 7)
+        rgb = first([(~prio, mixed), (top_t, top), (S_t, S), (bot_t, bot), (L_t, mixed)])
+    return rgb

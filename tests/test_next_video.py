@@ -101,13 +101,10 @@ class Scene:
 
 
 def unique_palette(seed=0):
-    """256 distinct 9-bit colours, none whose bits 8:1 are the default transparent 0xE3."""
-    out, c = [], (seed * 97 + 5) & 0x1FF
-    while len(out) < 256:
-        c = (c * 5 + 1 + seed) & 0x1FF
-        if c not in out and (c >> 1) != 0xE3:
-            out.append(c)
-    return out
+    """256 distinct 9-bit colours, none whose bits 8:1 are the default transparent 0xE3: a permutation of
+    0-511 (an odd multiplier mod 512 visits every value), the two transparent colours left out."""
+    perm = [(i * 167 + seed * 61 + 13) % 512 for i in range(512)]
+    return [c for c in perm if (c >> 1) != 0xE3][:256]
 
 
 def write_palette(scene, select, colours, start=0):
@@ -137,7 +134,7 @@ class VideoCase(unittest.TestCase):
     def assertFrameMatches(self, scene, frames=2, name=None):
         zx = scene.machine(frames)
         got_w, got_h, got = zx.frame9()
-        want_w, want_h, want = scene.model().frame9()
+        want_w, want_h, want = nv.frame9_np(scene.model())
         self.assertEqual((got_w, got_h), (want_w, want_h), 'frame9 size (§9.1 (12))')
         got = list(got)
         bad = [i for i in range(len(want)) if got[i] != want[i]]
@@ -182,6 +179,25 @@ def ula_scene(palette_seed=1, salt=0, border=5):
 
 class ModelSense(unittest.TestCase):
     """The model against facts read straight off the VHDL, without the machine."""
+
+    def test_numpy_path_matches_the_reading(self):
+        """frame9_np (fast, used by the scenes) against Video.frame9 (the cited reading) on sampled rows."""
+        import random
+        scenes = {'ula': ula_scene(), 'ula+': None, 'l2': l2_scene(0), 'l2-320': l2_scene(1),
+                  'l2-640': l2_scene(2).nr(0x70, 0x25), 'tm': tm_scene(0x80), 'tm80': tm_scene(0xC0),
+                  'tmtext': tm_scene(0x88), 'lores': ula_scene(12).nr(0x15, 0x80).nr(0x6A, 0x03)}
+        s = ula_scene(8).io(0xBF3B, 0x40).io(0xFF3B, 0x01)
+        scenes['ula+'] = s
+        for order in range(8):
+            scenes[f'order{order}'] = l2_scene(0).nr(0x15, order << 2).nr(0x68, (order % 4) << 5)
+        rows = set(random.Random(5).sample(range(288), 4)) | {20, 60, 140}
+        for name, sc in scenes.items():
+            with self.subTest(scene=name):
+                v = sc.model()
+                fast = nv.frame9_np(v)[2]
+                slow = v.frame9(rows=rows)[2]
+                bad = [i for i, x in enumerate(slow) if x is not None and x != fast[i]]
+                self.assertEqual(bad[:5], [], f'{len(bad)} samples differ between the two paths')
 
     def test_power_on_picture_is_black(self):
         self.assertEqual(set(nv.Video().frame9()[2]), {0}, '§9.1 (13): palette RAMs start all zero')
@@ -513,7 +529,7 @@ class Probes(VideoCase):
         s, schedule = pv1_scene()
         zx = s.machine(frames=3)
         w, h, got = zx.frame9()
-        want = s.model().frame9(schedule)[2]
+        want = nv.frame9_np(s.model(), schedule)[2]
         got = list(got)
         bad = [i for i in range(len(want)) if got[i] != want[i]]
         if bad:
@@ -541,6 +557,74 @@ class LoRes(VideoCase):
 
     def test_radastan(self):
         self.assertFrameMatches(self.lores_scene(radastan=True))
+
+
+def tm_scene(control=0x80, seed=31, ula_seed=1):
+    """The tilemap over the ULA scene: map in bank 5 at +0x2000 (NR 0x6E = 0x20), tile definitions in bank 7
+    (NR 0x6F = 0x80), so the ULA's screen stays the known picture beneath. Map entries cover every attribute
+    (palette offsets, mirrors, rotation, the ULA-over bit); definitions encode their own address, and some
+    nibbles are the transparent index F, so the ULA shows through."""
+    s = ula_scene(ula_seed)
+    write_palette(s, 0b011, unique_palette(seed))           # tilemap first palette (zxnext:6859-6864)
+    defs = bytes(((a * 0x5B) ^ (a >> 5) ^ (a >> 9)) & 0xFF for a in range(8192))
+    s.bram7(0, defs)
+    cols = 80 if control & 0x40 else 40
+    entries = 32 * cols
+    if control & 0x20:                                      # strip flags: one byte per entry
+        m = bytes((i * 7 + 3) & 0xFF for i in range(entries))
+    else:
+        m = bytes(b for i in range(entries) for b in ((i * 7 + 3) & 0xFF, (i * 13 + 5) & 0xFF))
+    s.bram5(0x2000, m)
+    s.nr(0x6E, 0x20).nr(0x6F, 0x80).nr(0x6B, control)
+    return s
+
+
+@needs_next
+class Tilemap(VideoCase):
+    """tilemap.vhd and its place in the mixer (zxnext:7016-7085)."""
+
+    def test_40x32(self):
+        self.assertFrameMatches(tm_scene(0x80))
+
+    def test_80x32(self):
+        self.assertFrameMatches(tm_scene(0xC0))
+
+    def test_strip_flags_with_default_attribute(self):
+        self.assertFrameMatches(tm_scene(0xA0).nr(0x6C, 0x56))
+
+    def test_512_tiles(self):
+        self.assertFrameMatches(tm_scene(0x82))
+
+    def test_text_mode(self):
+        self.assertFrameMatches(tm_scene(0x88))
+
+    def test_always_on_top(self):
+        self.assertFrameMatches(tm_scene(0x81))
+
+    def test_second_tilemap_palette(self):
+        s = tm_scene(0x90)
+        write_palette(s, 0b111, unique_palette(37))
+        self.assertFrameMatches(s)
+
+    def test_scroll_and_clip(self):
+        s = tm_scene(0x80).nr(0x2F, 0x01).nr(0x30, 0x17).nr(0x31, 201)
+        s.nr(0x1C, 0x08).nr(0x1B, 6, 141, 11, 243)
+        self.assertFrameMatches(s)
+
+    def test_transparent_index(self):
+        self.assertFrameMatches(tm_scene(0x80).nr(0x4C, 0x03))
+
+    def test_stencil(self):
+        self.assertFrameMatches(tm_scene(0x80).nr(0x68, 0x01))
+
+    def test_blends_with_the_tilemap(self):
+        for order in (6, 7):
+            for blend in (0, 2, 3):
+                with self.subTest(order=order, blend=blend):
+                    s = tm_scene(0x80)
+                    s.ops += l2_scene(0).ops[len(ula_scene(1).ops):]     # Layer 2 over the same ULA
+                    s.nr(0x15, order << 2).nr(0x68, blend << 5)
+                    self.assertFrameMatches(s, name=f'tm_blend_{order}_{blend}')
 
 
 if __name__ == '__main__':
