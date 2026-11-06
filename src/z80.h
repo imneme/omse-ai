@@ -224,7 +224,12 @@
     MODIFICATION NOTICE:
 
     This code has been modified from the original version to add items to the
-    address bus following the timings of the original Z80 CPU. 
+    address bus following the timings of the original Z80 CPU.
+
+    It has also been modified (for omse-ai, 2026) to add the ZX Spectrum
+    Next's Z80N extra instructions, and their side-band signals on the pins,
+    behind the z80_t.z80n flag, which is off by default; with it off, the
+    CPU behaves as before.
 
 */
 #include <stdint.h>
@@ -321,6 +326,31 @@ extern "C" {
 #define Z80_CTRL_PIN_MASK (Z80_M1|Z80_MREQ|Z80_IORQ|Z80_RD|Z80_WR|Z80_RFSH)
 #define Z80_PIN_MASK ((1ULL<<40)-1)
 
+// The ZX Spectrum Next's Z80N (set z80_t.z80n): a NEXTREG instruction writes a Next register through a
+// side band, so the read the Next's CPU runs in the same machine cycle keeps the address and data buses.
+// Z80N_NEXTREG is set for one tick, the T1 of that machine cycle (M4 of NEXTREG r,v; M3 of NEXTREG r,A):
+// there the Next's T80N raises Z80N_dout with its NEXTREGW command, and zxnext.vhd writes the register on
+// that signal's rising edge (cpu_requester_0). The register is in bits 40-47 of the pins, the value in
+// bits 48-55. A machine acts on it in that tick, before any contention stall of the tick: on a real Next the
+// write lands as the T1 begins. The pins carry the read too (MREQ|RD at the operand's address).
+#define Z80N_PIN_NEXTREG    (39)
+#define Z80N_NEXTREG        (1ULL<<Z80N_PIN_NEXTREG)
+#define Z80N_NR_REG_SHIFT   (40)
+#define Z80N_NR_VAL_SHIFT   (48)
+// The NMI's two pushes and RETN's two pops carry the T80N's NMIACK and RETN commands, for one tick each, on the
+// T1 of the machine cycle (with MREQ|WR or MREQ|RD on the pins as usual). The Next always keeps the NMI's return
+// address in nextregs C2h (low) and C3h (high), written from the data bus during NMIACK; with its stackless
+// NMI (nextreg C0h bit 3) it also keeps those writes out of memory (MREQ hidden from the machine), and the first
+// RETN after the acknowledge reads C2h and C3h instead of memory (zxnext.vhd, z80_stackless_nmi). RETN here is
+// ED 45, 55, 5D, 65, 6D, 75 and 7D, as the T80N decodes them; RETI (ED 4D) carries none.
+#define Z80N_NMIACK_MSB     (1ULL<<56)  // the NMI's push of PC's high byte (its M2)
+#define Z80N_NMIACK_LSB     (1ULL<<57)  // ... of its low byte (M3)
+#define Z80N_RETN_LSB       (1ULL<<58)  // RETN's pop of PC's low byte (its M2)
+#define Z80N_RETN_MSB       (1ULL<<59)  // ... of its high byte (M3)
+#define Z80N_SIDEBAND_MASK  (Z80N_NEXTREG|(0xFFFFULL<<Z80N_NR_REG_SHIFT)|(0xFULL<<56))
+#define Z80N_GET_NR_REG(p)  ((uint8_t)((p)>>Z80N_NR_REG_SHIFT))
+#define Z80N_GET_NR_VAL(p)  ((uint8_t)((p)>>Z80N_NR_VAL_SHIFT))
+
 // pin access helper macros
 #define Z80_MAKE_PINS(ctrl, addr, data) ((ctrl)|((data&0xFF)<<16)|((addr)&0xFFFFULL))
 #define Z80_GET_ADDR(p) ((uint16_t)(p))
@@ -369,6 +399,7 @@ typedef struct {
     uint16_t af2, bc2, de2, hl2; // shadow register bank
     uint8_t im;
     bool iff1, iff2;
+    bool z80n;          // the ZX Spectrum Next's Z80N: its extra ED instructions (off: a Zilog Z80)
 } z80_t;
 
 // initialize a new Z80 instance and return initial pin mask
@@ -437,6 +468,36 @@ bool z80_opdone(z80_t* cpu);
 #define Z80_NMI_STEP 1674
 // %>
 
+// the Z80N's instructions (the ZX Spectrum Next's ED extensions): the first step of each, after the
+// existing ones. z80_t.z80n turns them on; without it the ED ones are a Zilog's 8 T no-ops, and RETN and the
+// NMI response run z80.h's own steps.
+#define Z80N_SWAPNIB_STEP   1709
+#define Z80N_MIRROR_STEP    1710
+#define Z80N_BSLA_STEP      1711
+#define Z80N_BSRA_STEP      1712
+#define Z80N_BSRL_STEP      1713
+#define Z80N_BSRF_STEP      1714
+#define Z80N_BRLC_STEP      1715
+#define Z80N_MUL_STEP       1716
+#define Z80N_ADDHLA_STEP    1717
+#define Z80N_ADDDEA_STEP    1718
+#define Z80N_ADDBCA_STEP    1719
+#define Z80N_PIXELDN_STEP   1720
+#define Z80N_PIXELAD_STEP   1721
+#define Z80N_SETAE_STEP     1722
+#define Z80N_TEST_STEP      1723    // .. 1726
+#define Z80N_ADDNN_STEP     1727    // .. 1735 (ADD HL,nn / DE,nn / BC,nn)
+#define Z80N_PUSHNN_STEP    1736    // .. 1751
+#define Z80N_OUTINB_STEP    1752    // .. 1760
+#define Z80N_NEXTREG_STEP   1761    // .. 1773 (NEXTREG r,v)
+#define Z80N_NEXTREGA_STEP  1774    // .. 1783 (NEXTREG r,A)
+#define Z80N_JPC_STEP       1784    // .. 1789
+#define Z80N_LDX_STEP       1790    // .. 1803 (LDIX LDDX LDIRX LDDRX, ED B6; LDPIRX from its +2)
+#define Z80N_LDPIRX_STEP    1804    // .. 1805
+#define Z80N_LDWS_STEP      1806    // .. 1812
+#define Z80N_RETN_STEP      1813    // .. 1819 (RETN, with the T80N's RETN commands)
+#define Z80N_NMI_STEP       1820    // .. 1830 (the NMI response, with its NMIACK commands)
+
 uint64_t z80_init(z80_t* cpu) {
     CHIPS_ASSERT(cpu);
     // initial state as described in 'The Undocumented Z80 Documented'
@@ -449,7 +510,9 @@ uint64_t z80_init(z80_t* cpu) {
 
 uint64_t z80_reset(z80_t* cpu) {
     // reset state as described in 'The Undocumented Z80 Documented'
+    const bool z80n = cpu->z80n;    // a Next's CPU is still a Z80N after a reset
     memset(cpu, 0, sizeof(z80_t));
+    cpu->z80n = z80n;
     cpu->af = cpu->bc = cpu->de = cpu->hl = 0xFFFF;
     cpu->wz = cpu->sp = cpu->ix = cpu->iy = 0xFFFF;
     cpu->af2 = cpu->bc2 = cpu->de2 = cpu->hl2 = 0xFFFF;
@@ -845,6 +908,62 @@ static inline uint8_t _z80_srl(z80_t* cpu, uint8_t val) {
     return res;
 }
 
+// -- the Z80N --------------------------------------------------------------------------------------------
+// The ZX Spectrum Next's extra ED instructions, as its CPU runs them: the T80N of the Next's core (3.02.02,
+// the same in 3.02.05), Daniel Wallner's T80 with the Next's changes by Fabio Belavenuto, Victor Trucco,
+// Charlie Ingley, Garry Lancaster and ACX (cores/zxnext/src/cpu/: t80n_mcode.vhd for each instruction's
+// machine cycles, t80n.vhd for what its commands do, t80n_alu.vhd for flags, t80na.vhd for the bus). Written
+// from reading it; tests/test_z80n.py holds every instruction to a reference written from the same source,
+// tick by tick. Where the VHDL and the documentation disagree this follows the VHDL (marked "VHDL:"); a probe
+// on a real Next decides. The Z80N instructions leave WZ (MEMPTR) alone: the T80N has none to copy.
+
+// the first step of each Z80N instruction, by its opcode after ED (0: not one)
+static inline uint16_t _z80n_first_step(uint8_t op) {
+    switch (op) {
+        case 0x23: return Z80N_SWAPNIB_STEP;    case 0x24: return Z80N_MIRROR_STEP;
+        case 0x27: return Z80N_TEST_STEP;       case 0x28: return Z80N_BSLA_STEP;
+        case 0x29: return Z80N_BSRA_STEP;       case 0x2A: return Z80N_BSRL_STEP;
+        case 0x2B: return Z80N_BSRF_STEP;       case 0x2C: return Z80N_BRLC_STEP;
+        case 0x30: return Z80N_MUL_STEP;        case 0x31: return Z80N_ADDHLA_STEP;
+        case 0x32: return Z80N_ADDDEA_STEP;     case 0x33: return Z80N_ADDBCA_STEP;
+        case 0x34: case 0x35: case 0x36: return Z80N_ADDNN_STEP;
+        case 0x8A: return Z80N_PUSHNN_STEP;     case 0x90: return Z80N_OUTINB_STEP;
+        case 0x91: return Z80N_NEXTREG_STEP;    case 0x92: return Z80N_NEXTREGA_STEP;
+        case 0x93: return Z80N_PIXELDN_STEP;    case 0x94: return Z80N_PIXELAD_STEP;
+        case 0x95: return Z80N_SETAE_STEP;      case 0x98: return Z80N_JPC_STEP;
+        case 0xA4: case 0xAC: case 0xB4: case 0xB6: case 0xBC: return Z80N_LDX_STEP;
+        case 0xA5: return Z80N_LDWS_STEP;       case 0xB7: return Z80N_LDPIRX_STEP;
+        case 0x45: case 0x55: case 0x5D: case 0x65: case 0x6D: case 0x75: case 0x7D: return Z80N_RETN_STEP;
+        default: return 0;
+    }
+}
+
+static inline uint8_t _z80n_mirror(uint8_t v) {
+    v = (uint8_t)((v & 0xF0) >> 4 | (v & 0x0F) << 4);
+    v = (uint8_t)((v & 0xCC) >> 2 | (v & 0x33) << 2);
+    return (uint8_t)((v & 0xAA) >> 1 | (v & 0x55) << 1);
+}
+
+// PIXELDN, the T80N's way: H4 H3 L7 L6 L5 H2 H1 H0 counts up as one 8-bit number. The same as the documented
+// three cases on the whole screen; where it wraps (H&1F = 1F, L&E0 = E0) it keeps H's top three bits
+// (VHDL: 5FE0 -> 4000; the three-case rule usually documented gives 6000).
+static inline uint16_t _z80n_pixeldn(uint16_t hl) {
+    const uint8_t h = (uint8_t)(hl >> 8), l = (uint8_t)hl;
+    const uint8_t c = (uint8_t)(((h & 0x18) << 3 | (l & 0xE0) >> 2 | (h & 0x07)) + 1);
+    return (uint16_t)(((h & 0xE0) | (c & 0xC0) >> 3 | (c & 0x07)) << 8 | (c & 0x38) << 2 | (l & 0x1F));
+}
+
+// The flags the LDxX family leaves (VHDL: they keep LDI's I_BT, so they set flags as LDI does, though they're
+// usually documented as leaving flags alone): X and Y from bits 3 and 1 of n, H = N = 0, P/V = BC != 0.
+static inline void _z80n_bt_flags(z80_t* cpu, uint8_t n) {
+    cpu->f = (cpu->f & (Z80_SF|Z80_ZF|Z80_CF)) | (n & Z80_XF) | ((n & 2) ? Z80_YF : 0) | (cpu->bc ? Z80_VF : 0);
+}
+
+// a NEXTREG write on the pins' side band (Z80N_NEXTREG, above)
+static inline uint64_t _z80n_nextreg(uint8_t reg, uint8_t val) {
+    return Z80N_NEXTREG | (uint64_t)reg << Z80N_NR_REG_SHIFT | (uint64_t)val << Z80N_NR_VAL_SHIFT;
+}
+
 static inline uint64_t _z80_set_ab(uint64_t pins, uint16_t ab) {
     return (pins & ~0xFFFF) | ab;
 }
@@ -966,7 +1085,7 @@ static inline uint64_t _z80_fetch(z80_t* cpu, uint64_t pins) {
         return _z80_set_ab_x(pins, cpu->pc++, Z80_M1|Z80_MREQ|Z80_RD);
     } else if (cpu->int_bits & Z80_NMI) {
         // non-maskable interrupt starts with a regular M1 machine cycle
-        cpu->step = Z80_NMI_STEP;
+        cpu->step = cpu->z80n ? Z80N_NMI_STEP : Z80_NMI_STEP;
         cpu->int_bits = 0;
         if (pins & Z80_HALT) {
             pins &= ~Z80_HALT;
@@ -1092,7 +1211,7 @@ uint64_t z80_prefetch(z80_t* cpu, uint16_t new_pc) {
 #define _cc_m           (cpu->f&Z80_SF)
 
 uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
-    pins &= ~(Z80_CTRL_PIN_MASK|Z80_RETI);
+    pins &= ~(Z80_CTRL_PIN_MASK|Z80_RETI|Z80N_SIDEBAND_MASK);
     switch (cpu->step) {
         // <% decoder
         case    0: _fetch(); // NOP (0)
@@ -2817,11 +2936,197 @@ uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
         //=== special opcode fetch machine cycle for ED-prefixed instructions
         case Z80_ED_M1_T2: _mread2(); _wait(); cpu->opcode = _gd(); _goto(Z80_ED_M1_T3);
         case Z80_ED_M1_T3: pins = _z80_refresh(cpu, pins); _goto(Z80_ED_M1_T4);
-        case Z80_ED_M1_T4: _goto(cpu->opcode + 256);
+        case Z80_ED_M1_T4:
+            if (cpu->z80n && _z80n_first_step(cpu->opcode)) {
+                _goto(_z80n_first_step(cpu->opcode));
+            }
+            _goto(cpu->opcode + 256);
         //=== shared fetch machine cycle for non-DD/FD-prefixed ops
         case Z80_M1_T2: _mread2(); _wait(); cpu->opcode = _gd(); _goto(Z80_M1_T3);
         case Z80_M1_T3: pins = _z80_refresh(cpu, pins); _goto(Z80_M1_T4);
         case Z80_M1_T4: cpu->addr = cpu->hl; _goto(cpu->opcode);
+        //=== the Z80N's instructions (the ZX Spectrum Next), from the tick after the opcode's fetch. Comments
+        //    name the T80N's machine cycles (t80n_mcode.vhd); "internal": no MREQ, the bus where it was.
+        //--- one machine cycle (8 T): the T80N's commands act in the opcode fetch's T3/T4
+        case Z80N_SWAPNIB_STEP: cpu->a = (uint8_t)(cpu->a << 4 | cpu->a >> 4); _fetch();
+        case Z80N_MIRROR_STEP: cpu->a = _z80n_mirror(cpu->a); _fetch();
+        case Z80N_BSLA_STEP: cpu->de = (uint16_t)((uint32_t)cpu->de << (cpu->b & 31)); _fetch();
+        case Z80N_BSRA_STEP: cpu->de = (uint16_t)((int32_t)(int16_t)cpu->de >> (cpu->b & 31)); _fetch();
+        case Z80N_BSRL_STEP: cpu->de = (uint16_t)((uint32_t)cpu->de >> (cpu->b & 31)); _fetch();
+        case Z80N_BSRF_STEP: cpu->de = (uint16_t)((int32_t)(cpu->de | 0xFFFF0000u) >> (cpu->b & 31)); _fetch();
+        case Z80N_BRLC_STEP: {
+            const uint32_t k = cpu->b & 15;
+            cpu->de = (uint16_t)((uint32_t)cpu->de << k | (uint32_t)cpu->de >> (16 - k));
+            _fetch();
+        }
+        case Z80N_MUL_STEP: cpu->de = (uint16_t)(cpu->d * cpu->e); _fetch();
+        // VHDL: ADD rr,A clears carry (F(Flag_C) <= reg_temp_t(16), and the 16-bit sum never reaches bit 16)
+        case Z80N_ADDHLA_STEP: cpu->hl += cpu->a; cpu->f &= ~Z80_CF; _fetch();
+        case Z80N_ADDDEA_STEP: cpu->de += cpu->a; cpu->f &= ~Z80_CF; _fetch();
+        case Z80N_ADDBCA_STEP: cpu->bc += cpu->a; cpu->f &= ~Z80_CF; _fetch();
+        case Z80N_PIXELDN_STEP: cpu->hl = _z80n_pixeldn(cpu->hl); _fetch();
+        case Z80N_PIXELAD_STEP:
+            cpu->h = (uint8_t)(0x40 | (cpu->d & 0xC0) >> 3 | (cpu->d & 0x07));
+            cpu->l = (uint8_t)((cpu->d & 0x38) << 2 | cpu->e >> 3);
+            _fetch();
+        case Z80N_SETAE_STEP: cpu->a = (uint8_t)(0x80 >> (cpu->e & 7)); _fetch();
+        //--- TEST n: M2 reads n; AND's flags, A kept (11 T)
+        case Z80N_TEST_STEP:    _mread1(cpu->pc++); _goto(Z80N_TEST_STEP+1);
+        case Z80N_TEST_STEP+1:  _wait(); _mread2(); _goto(Z80N_TEST_STEP+2);
+        case Z80N_TEST_STEP+2:  cpu->f = _z80_szp_flags[cpu->a & _gd()] | Z80_HF; _goto(Z80N_TEST_STEP+3);
+        case Z80N_TEST_STEP+3:  _fetch();
+        //--- ADD HL,nn / DE,nn / BC,nn: M2 and M3 read nn, 4 T each (the T4 internal); flags kept (16 T)
+        case Z80N_ADDNN_STEP:   _mread1(cpu->pc++); _goto(Z80N_ADDNN_STEP+1);
+        case Z80N_ADDNN_STEP+1: _wait(); _mread2(); _goto(Z80N_ADDNN_STEP+2);
+        case Z80N_ADDNN_STEP+2: cpu->addr = _gd(); _goto(Z80N_ADDNN_STEP+3);
+        case Z80N_ADDNN_STEP+3: _goto(Z80N_ADDNN_STEP+4);
+        case Z80N_ADDNN_STEP+4: _mread1(cpu->pc++); _goto(Z80N_ADDNN_STEP+5);
+        case Z80N_ADDNN_STEP+5: _wait(); _mread2(); _goto(Z80N_ADDNN_STEP+6);
+        case Z80N_ADDNN_STEP+6: cpu->addr |= (uint16_t)(_gd() << 8); _goto(Z80N_ADDNN_STEP+7);
+        case Z80N_ADDNN_STEP+7:
+            switch (cpu->opcode) {
+                case 0x34: cpu->hl += cpu->addr; break;
+                case 0x35: cpu->de += cpu->addr; break;
+                default:   cpu->bc += cpu->addr; break;
+            }
+            _goto(Z80N_ADDNN_STEP+8);
+        case Z80N_ADDNN_STEP+8: _fetch();
+        //--- PUSH nn (its high byte first): M2 reads it, M3 writes it at SP-1, M4 reads the low byte, M5 writes
+        //    it at SP-2, and M6 reads the low byte's address again (23 T)
+        case Z80N_PUSHNN_STEP:    _mread1(cpu->pc++); _goto(Z80N_PUSHNN_STEP+1);
+        case Z80N_PUSHNN_STEP+1:  _wait(); _mread2(); _goto(Z80N_PUSHNN_STEP+2);
+        case Z80N_PUSHNN_STEP+2:  cpu->dlatch = _gd(); _goto(Z80N_PUSHNN_STEP+3);
+        case Z80N_PUSHNN_STEP+3:  _mwrite1(--cpu->sp, cpu->dlatch); _goto(Z80N_PUSHNN_STEP+4);
+        case Z80N_PUSHNN_STEP+4:  _wait(); _mwrite2(); _goto(Z80N_PUSHNN_STEP+5);
+        case Z80N_PUSHNN_STEP+5:  _goto(Z80N_PUSHNN_STEP+6);
+        case Z80N_PUSHNN_STEP+6:  _mread1(cpu->pc); _goto(Z80N_PUSHNN_STEP+7);
+        case Z80N_PUSHNN_STEP+7:  _wait(); _mread2(); _goto(Z80N_PUSHNN_STEP+8);
+        case Z80N_PUSHNN_STEP+8:  cpu->dlatch = _gd(); _goto(Z80N_PUSHNN_STEP+9);
+        case Z80N_PUSHNN_STEP+9:  _mwrite1(--cpu->sp, cpu->dlatch); _goto(Z80N_PUSHNN_STEP+10);
+        case Z80N_PUSHNN_STEP+10: _wait(); _mwrite2(); _goto(Z80N_PUSHNN_STEP+11);
+        case Z80N_PUSHNN_STEP+11: _goto(Z80N_PUSHNN_STEP+12);
+        case Z80N_PUSHNN_STEP+12: _mread1(cpu->pc++); _goto(Z80N_PUSHNN_STEP+13);
+        case Z80N_PUSHNN_STEP+13: _wait(); _mread2(); _goto(Z80N_PUSHNN_STEP+14);
+        case Z80N_PUSHNN_STEP+14: _goto(Z80N_PUSHNN_STEP+15);
+        case Z80N_PUSHNN_STEP+15: _fetch();
+        //--- OUTINB: the opcode fetch is 5 T (the last internal, the bus on IR), M2 reads (HL), M3 sends it to
+        //    port BC; HL+1, B and flags kept (16 T)
+        case Z80N_OUTINB_STEP:   _goto(Z80N_OUTINB_STEP+1);
+        case Z80N_OUTINB_STEP+1: _mread1(cpu->hl++); _goto(Z80N_OUTINB_STEP+2);
+        case Z80N_OUTINB_STEP+2: _wait(); _mread2(); _goto(Z80N_OUTINB_STEP+3);
+        case Z80N_OUTINB_STEP+3: cpu->dlatch = _gd(); _goto(Z80N_OUTINB_STEP+4);
+        case Z80N_OUTINB_STEP+4: _ioaddr(cpu->bc); _goto(Z80N_OUTINB_STEP+5);
+        case Z80N_OUTINB_STEP+5: _iowrite1(cpu->dlatch); _goto(Z80N_OUTINB_STEP+6);
+        case Z80N_OUTINB_STEP+6: _wait(); _iowrite2(); _goto(Z80N_OUTINB_STEP+7);
+        case Z80N_OUTINB_STEP+7: _iowrite2(); _goto(Z80N_OUTINB_STEP+8);
+        case Z80N_OUTINB_STEP+8: _fetch();
+        //--- NEXTREG r,v: M2 reads r, M3 reads v, M4 writes the register (Z80N_NEXTREG on its T1) while it reads
+        //    v's address again, and M5 reads it once more (20 T)
+        case Z80N_NEXTREG_STEP:    _mread1(cpu->pc++); _goto(Z80N_NEXTREG_STEP+1);
+        case Z80N_NEXTREG_STEP+1:  _wait(); _mread2(); _goto(Z80N_NEXTREG_STEP+2);
+        case Z80N_NEXTREG_STEP+2:  cpu->addr = _gd(); _goto(Z80N_NEXTREG_STEP+3);
+        case Z80N_NEXTREG_STEP+3:  _mread1(cpu->pc); _goto(Z80N_NEXTREG_STEP+4);
+        case Z80N_NEXTREG_STEP+4:  _wait(); _mread2(); _goto(Z80N_NEXTREG_STEP+5);
+        case Z80N_NEXTREG_STEP+5:  cpu->dlatch = _gd(); _goto(Z80N_NEXTREG_STEP+6);
+        case Z80N_NEXTREG_STEP+6:
+            _mread1(cpu->pc); pins |= _z80n_nextreg((uint8_t)cpu->addr, cpu->dlatch); _goto(Z80N_NEXTREG_STEP+7);
+        case Z80N_NEXTREG_STEP+7:  _wait(); _mread2(); _goto(Z80N_NEXTREG_STEP+8);
+        case Z80N_NEXTREG_STEP+8:  _goto(Z80N_NEXTREG_STEP+9);
+        case Z80N_NEXTREG_STEP+9:  _mread1(cpu->pc++); _goto(Z80N_NEXTREG_STEP+10);
+        case Z80N_NEXTREG_STEP+10: _wait(); _mread2(); _goto(Z80N_NEXTREG_STEP+11);
+        case Z80N_NEXTREG_STEP+11: _goto(Z80N_NEXTREG_STEP+12);
+        case Z80N_NEXTREG_STEP+12: _fetch();
+        //--- NEXTREG r,A: M2 reads r, M3 writes the register (Z80N_NEXTREG on its T1) while it reads r's address
+        //    again, and M4 reads it once more (17 T)
+        case Z80N_NEXTREGA_STEP:   _mread1(cpu->pc); _goto(Z80N_NEXTREGA_STEP+1);
+        case Z80N_NEXTREGA_STEP+1: _wait(); _mread2(); _goto(Z80N_NEXTREGA_STEP+2);
+        case Z80N_NEXTREGA_STEP+2: cpu->addr = _gd(); _goto(Z80N_NEXTREGA_STEP+3);
+        case Z80N_NEXTREGA_STEP+3:
+            _mread1(cpu->pc); pins |= _z80n_nextreg((uint8_t)cpu->addr, cpu->a); _goto(Z80N_NEXTREGA_STEP+4);
+        case Z80N_NEXTREGA_STEP+4: _wait(); _mread2(); _goto(Z80N_NEXTREGA_STEP+5);
+        case Z80N_NEXTREGA_STEP+5: _goto(Z80N_NEXTREGA_STEP+6);
+        case Z80N_NEXTREGA_STEP+6: _mread1(cpu->pc++); _goto(Z80N_NEXTREGA_STEP+7);
+        case Z80N_NEXTREGA_STEP+7: _wait(); _mread2(); _goto(Z80N_NEXTREGA_STEP+8);
+        case Z80N_NEXTREGA_STEP+8: _goto(Z80N_NEXTREGA_STEP+9);
+        case Z80N_NEXTREGA_STEP+9: _fetch();
+        //--- JP (C): M2 is an input from port BC with a fifth T (internal, the bus still on BC); PC's bits 13-6
+        //    from the byte, the top two of the address after the instruction kept (13 T)
+        case Z80N_JPC_STEP:   _ioaddr(cpu->bc); _goto(Z80N_JPC_STEP+1);
+        case Z80N_JPC_STEP+1: _wait(); _ioread1(); _goto(Z80N_JPC_STEP+2);
+        case Z80N_JPC_STEP+2: _wait(); _ioread2(); _goto(Z80N_JPC_STEP+3);
+        case Z80N_JPC_STEP+3: _ioread2(); cpu->dlatch = _gd(); _goto(Z80N_JPC_STEP+4);
+        case Z80N_JPC_STEP+4: cpu->pc = (uint16_t)((cpu->pc & 0xC000) | cpu->dlatch << 6); _goto(Z80N_JPC_STEP+5);
+        case Z80N_JPC_STEP+5: _fetch();
+        //--- LDIX, LDDX, LDIRX, LDDRX, ED B6 (the source's unfinished LDIRSCALE, which runs as LDIRX), and LDPIRX
+        //    from +2. M2 reads the byte; M3 writes it to DE, or if it equals A *reads* DE (VHDL: Write drops and
+        //    RD follows it), and is 5 T (two internal, the bus on DE); a repeat adds M4, 5 T internal, the bus on
+        //    DE for LDIRX (its M3 sets No_PC) and on the address after the instruction for the rest (16 T, 21 T)
+        case Z80N_LDX_STEP:   _mread1(cpu->hl); _goto(Z80N_LDX_STEP+1);
+        case Z80N_LDX_STEP+1: _wait(); _mread2(); _goto(Z80N_LDX_STEP+2);
+        case Z80N_LDX_STEP+2: cpu->dlatch = _gd(); _goto(Z80N_LDX_STEP+3);
+        case Z80N_LDX_STEP+3:
+            if (cpu->dlatch != cpu->a) { _mwrite1(cpu->de, cpu->dlatch); } else { _mread1(cpu->de); }
+            _goto(Z80N_LDX_STEP+4);
+        case Z80N_LDX_STEP+4: _wait(); _mread2(); _goto(Z80N_LDX_STEP+5);
+        case Z80N_LDX_STEP+5: _goto(Z80N_LDX_STEP+6);
+        case Z80N_LDX_STEP+6: _goto(Z80N_LDX_STEP+7);
+        case Z80N_LDX_STEP+7: {
+            uint8_t n;
+            cpu->bc--;
+            if (cpu->opcode == 0xB7) {
+                n = cpu->b | cpu->dlatch;           // VHDL: LDPIRX leaves its ALU on OR, with B
+            } else {
+                n = (uint8_t)(cpu->a + cpu->dlatch);
+                if (cpu->opcode & 0x08) { cpu->hl--; } else { cpu->hl++; }
+            }
+            cpu->de++;                              // DE counts up for LDDX and LDDRX too
+            _z80n_bt_flags(cpu, n);
+            if ((cpu->opcode & 0x10) && cpu->bc) { _goto(Z80N_LDX_STEP+8); }
+            _goto(Z80N_LDX_STEP+13);
+        }
+        case Z80N_LDX_STEP+8:
+            if (cpu->opcode != 0xB4) { _sa(cpu->pc); }
+            cpu->pc -= 2;
+            _goto(Z80N_LDX_STEP+9);
+        case Z80N_LDX_STEP+9:  _goto(Z80N_LDX_STEP+10);
+        case Z80N_LDX_STEP+10: _goto(Z80N_LDX_STEP+11);
+        case Z80N_LDX_STEP+11: _goto(Z80N_LDX_STEP+12);
+        case Z80N_LDX_STEP+12: _goto(Z80N_LDX_STEP+13);
+        case Z80N_LDX_STEP+13: _fetch();
+        //--- LDPIRX's M2: the pattern byte at (HL & FFF8) + (E & 7); the T80N moves the bus to DE after its T1
+        case Z80N_LDPIRX_STEP:   _mread1((cpu->hl & 0xFFF8) | (cpu->e & 7)); _goto(Z80N_LDPIRX_STEP+1);
+        case Z80N_LDPIRX_STEP+1: _sa(cpu->de); _wait(); _mread2(); _goto(Z80N_LDX_STEP+2);
+        //--- LDWS: M2 reads (HL), M3 writes it to (DE); L+1, D+1 (8 bits each). VHDL: the INC D is an ALU ADD
+        //    without PreserveC and its flags land last: ADD D,1's, carry too (14 T)
+        case Z80N_LDWS_STEP:   _mread1(cpu->hl); _goto(Z80N_LDWS_STEP+1);
+        case Z80N_LDWS_STEP+1: _wait(); _mread2(); _goto(Z80N_LDWS_STEP+2);
+        case Z80N_LDWS_STEP+2: cpu->dlatch = _gd(); _goto(Z80N_LDWS_STEP+3);
+        case Z80N_LDWS_STEP+3: _mwrite1(cpu->de, cpu->dlatch); _goto(Z80N_LDWS_STEP+4);
+        case Z80N_LDWS_STEP+4: _wait(); _mwrite2(); _goto(Z80N_LDWS_STEP+5);
+        case Z80N_LDWS_STEP+5:
+            cpu->l++; cpu->f = _z80_add_flags(cpu->d, 1, (uint32_t)cpu->d + 1); cpu->d++;
+            _goto(Z80N_LDWS_STEP+6);
+        case Z80N_LDWS_STEP+6: _fetch();
+        //--- RETN (ED 45 55 5D 65 6D 75 7D), as z80.h's own but for the T80N's RETN_LSB and RETN_MSB on the pops
+        case Z80N_RETN_STEP:   _mread1(cpu->sp++); pins |= Z80N_RETN_LSB; _goto(Z80N_RETN_STEP+1);
+        case Z80N_RETN_STEP+1: _wait(); _mread2(); _goto(Z80N_RETN_STEP+2);
+        case Z80N_RETN_STEP+2: cpu->wzl = _gd(); _goto(Z80N_RETN_STEP+3);
+        case Z80N_RETN_STEP+3: _mread1(cpu->sp++); pins |= Z80N_RETN_MSB; _goto(Z80N_RETN_STEP+4);
+        case Z80N_RETN_STEP+4: _wait(); _mread2(); _goto(Z80N_RETN_STEP+5);
+        case Z80N_RETN_STEP+5: cpu->wzh = _gd(); cpu->pc = cpu->wz; _goto(Z80N_RETN_STEP+6);
+        case Z80N_RETN_STEP+6: pins = _z80_fetch(cpu, pins); cpu->iff1 = cpu->iff2; goto step_to;
+        //--- the NMI response, as z80.h's own but for the T80N's NMIACK_MSB and NMIACK_LSB on the pushes
+        case Z80N_NMI_STEP:    _wait(); cpu->iff1 = false; _goto(Z80N_NMI_STEP+1);
+        case Z80N_NMI_STEP+1:  pins = _z80_refresh(cpu, pins); _goto(Z80N_NMI_STEP+2);
+        case Z80N_NMI_STEP+2:  _goto(Z80N_NMI_STEP+3);
+        case Z80N_NMI_STEP+3:  _goto(Z80N_NMI_STEP+4);
+        case Z80N_NMI_STEP+4:  _mwrite1(--cpu->sp, cpu->pch); pins |= Z80N_NMIACK_MSB; _goto(Z80N_NMI_STEP+5);
+        case Z80N_NMI_STEP+5:  _wait(); _mwrite2(); _goto(Z80N_NMI_STEP+6);
+        case Z80N_NMI_STEP+6:  _goto(Z80N_NMI_STEP+7);
+        case Z80N_NMI_STEP+7:  _mwrite1(--cpu->sp, cpu->pcl); pins |= Z80N_NMIACK_LSB; _goto(Z80N_NMI_STEP+8);
+        case Z80N_NMI_STEP+8:  _wait(); _mwrite2(); cpu->wz = cpu->pc = 0x0066; _goto(Z80N_NMI_STEP+9);
+        case Z80N_NMI_STEP+9:  _goto(Z80N_NMI_STEP+10);
+        case Z80N_NMI_STEP+10: _fetch();
         default: _Z80_UNREACHABLE;
     }
 fetch_next:
