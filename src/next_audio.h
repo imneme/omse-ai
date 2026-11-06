@@ -42,7 +42,8 @@ struct Ym {
 
     // One ENA tick. Every process in the VHDL sees the others' values from before the edge; here each part updates
     // in turn but reads only what it may (the envelope step uses env_ena as it stood before this tick), and the
-    // levels take the new tone, noise and envelope values: one uniform tick later than the VHDL's registers.
+    // levels take the new tone, noise and envelope values. Net effect, as Speccy-Zone measured in review: the output
+    // comes about two chip ticks (2/1.75 MHz, ~1.1 us) earlier than the VHDL's, the same everywhere. Inaudible.
     void tick(const uint8_t* r) {
         bool ena_div = false, ena_noise = false;
         if (div == 0) {
