@@ -23,6 +23,7 @@
 // SPI master and the fast boot are the next layers (machine-build-notes.md).
 
 #include "next_audio.h"                // the sound (Slide Fern): generators, DACs, beeper, mixer
+#include "next_dma.h"                  // the zxnDMA (Kelp Fern)
 #include "next_serial.h"               // the UARTs, the I2C bus and its optional DS1307 (Ratio Fern)
 #include <array>
 #include "z80.h"
@@ -60,6 +61,7 @@ enum Kind : uint8_t { K_NONE, K_SRAM, K_BRAM5, K_BRAM7, K_BOOT };
 enum Tag : uint8_t { T_PAGE, T_ROM, T_ALTROM, T_BOOT, T_CONFIG, T_DIVROM, T_DIV, T_MFROM, T_MFRAM, T_L2, T_BUS, T_NONE };
 
 struct IoEvent { uint64_t t28, cpu_clocks; uint16_t port; uint8_t value, write; };
+struct DmaEvent { uint64_t t28, cpu_clocks; uint16_t addr; uint8_t value, kind; };   // §9.1 (16)
 struct IntEvent { uint64_t start, end; };
 
 }  // namespace
@@ -191,6 +193,12 @@ struct ZXN {
     int bus_nmi_cnt = 0;                // asymmetrical_debounce's counter, to 8 enable pulses (9.362 ms each)
     uint8_t ay_reg[3][16] = {{0}};      // the AYs' register files (ym2149.vhd), chip 0 = AY_ID 11, 1 = 10, 2 = 01
     nextaudio::Audio audio;             // what makes the sound (next_audio.h)
+    DmaBus db;                          // the zxnDMA and the bus request (next_dma.h, next_dma_bus.inc)
+    uint64_t bus_pins = 0;              // the bus in the last T-state: the CPU's pins, or the DMA's while it has it
+    bool io_now = false;                // io_out/io_in: no time passes (§9.1 (6))
+    bool spi_last_d = false;            // spi_master's state_last_d (spi:154-160), for the DMA's SPI wait
+    bool dma_logging = false;
+    std::vector<DmaEvent> dma_log;
     uint8_t ay_addr[3] = {0, 0, 0};     // each chip's selected register (5 bits)
     int ay_sel = 0;                     // turbosound.vhd's ay_select, as a chip number
     uint8_t ulap_mode = 0, ulap_index = 0;   // port 0xBF3B (zxnext:4466-4478)
@@ -1029,6 +1037,7 @@ void do_reset(ZXN& z, bool hard) {
     z.cop_data = 0;
     z.nmi_flags = 0;                                                  // (zxnext:3784-3785, 3797-3798)
     ay_reset(z);
+    z.db.reset();                                                     // (dma:211-245; t80n:1690)
     z.nmi_cause = z.nmi_state = 0;                                    // (zxnext:2057-2060, 2113)
     z.nmi_pending_mf = z.nmi_pending_dm = false;
     z.mf_active = z.mf_enable = z.mf_fetch66 = false;                 // (multiface:63-120)
@@ -1093,6 +1102,10 @@ uint8_t floating_bus(const ZXN& z) {
     return scr[((v & 0xC0) << 5) | ((v & 7) << 8) | ((v & 0x38) << 2) | col];
 }
 
+inline bool dma_port_decode(const ZXN& z, uint16_t port);       // port_dma (next_dma_bus.inc)
+inline bool dma_port(const ZXN& z, uint16_t port);
+uint8_t dma_port_read(ZXN& z, uint16_t port);
+void dma_port_write(ZXN& z, uint16_t port, uint8_t v);
 // ---- the expansion bus's I/O (zxnext:1828-1838, 2170-2183, 2650-2656)
 int bus_io_answer(const ZXN& z, uint16_t port) {                      // a device's answer, or -1
     for (const auto& e : z.bus_io) if ((port & e.mask) == e.value) return e.byte;
@@ -1100,8 +1113,8 @@ int bus_io_answer(const ZXN& z, uint16_t port) {                      // a devic
 }
 inline int mf_type(const ZXN& z);
 inline bool mf_en(const ZXN& z);
-// port_internal_response: every decode the core has, with its enable (the DMA's ports, the +3 floating bus and FDC
-// decodes aren't here yet)
+// port_internal_response: every decode the core has, with its enable (the +3 floating bus and FDC decodes aren't here
+// yet)
 inline bool port_internal(const ZXN& z, uint16_t port) {
     const int lo = port & 0xFF;
     if (!(port & 1) || lo == 0xFF) return true;                       // FE, FF (no enable, zxnext:2541)
@@ -1131,6 +1144,7 @@ inline bool port_internal(const ZXN& z, uint16_t port) {
     if ((lo == 0x57 || lo == 0x5B || port == 0x303B) && port_en(z, 14)) return true;
     if ((port == 0xBF3B || port == 0xFF3B) && port_en(z, 24)) return true;
     if ((port & 0xF8FF) == 0x183B && port_en(z, 27)) return true;
+    if (dma_port_decode(z, port)) return true;                        // port_dma, ungated by busak (2602, 2657)
     return false;
 }
 // NR 0x8A: internal port cycles that go out on the bus as well (zxnext:2170-2176)
@@ -1170,6 +1184,7 @@ uint8_t bus_read_unanswered(const ZXN& z, uint16_t port) {
 }
 
 uint8_t io_read(ZXN& z, uint16_t port) {
+    if (dma_port(z, port)) return dma_port_read(z, port);           // the DMA (next_dma_bus.inc)
     if (port == 0x243B) return z.nr_sel;                              // both decode all 16 bits (ref §4.1)
     if (port == 0x253B) return nr_read(z, z.nr_sel);
     if (port == 0x303B && port_en(z, 14)) {                           // sprite status, cleared by the read (979-995)
@@ -1230,6 +1245,7 @@ uint8_t io_read(ZXN& z, uint16_t port) {
 }
 
 void io_write(ZXN& z, uint16_t port, uint8_t v) {
+    if (dma_port(z, port)) dma_port_write(z, port, v);              // the DMA (next_dma_bus.inc)
     if (port == 0x243B) { z.nr_sel = v; return; }
     if (port == 0x253B) { nr_write(z, z.nr_sel, v); return; }
     if ((port & 0xFF) == 0x3B && (port >> 11) == 2 && (((port >> 10) ^ ((port >> 9) & (port >> 8))) & 1) && port_en(z, 12))
@@ -2193,32 +2209,42 @@ void snoop_fetch(ZXN& z, uint8_t op) {
     }
 }
 
+#include "next_dma_bus.inc"
+
 bool cpu_edge(ZXN& z) {
     z80_t saved = z.cpu;
     uint64_t saved_pins = z.pins;
+    const uint64_t bus_before = z.bus_pins;                           // the CPU's pins, or the DMA's
+    const DmaBus db_saved = z.db;
     uint64_t p = z.pins;
     const bool p3w = p3_wait_now(z);
     const bool bus_w = z.bus_eff_en && (z.bus_wait || z.bus_wait_left > 0);   // the bus's WAIT (zxnext:1798)
     if (z.bus_wait_left > 0) z.bus_wait_left--;
     if (z.wait_next || p3w || bus_w) p |= Z80_WAIT; else p &= ~Z80_WAIT;
-    im2_edge(z, saved_pins);
+    // the DMA's edge, and BUSRQ/BUSAK; dma_wait_n = z80_wait_n and spi_wait_n (zxnext:1803), and z80_wait_n holds the
+    // bus's WAIT too (1798), so it rides in with the 28 MHz wait
+    const bool dma_bus = dma_edge(z, bus_before, z.wait_next || bus_w, p3w);
+    im2_edge(z, bus_before);
     if (!z.config_mode && !z.nmi_cause && bus_nmi_on(z)) z.nmi_cause = 3;   // the bus's NMI, last in line (2068-2071)
-    nmi_edge(z, saved_pins);
+    nmi_edge(z, bus_before);
     if (nmi_line(z)) p |= Z80_NMI; else p &= ~Z80_NMI;
     // pulse_int_n and im2_int_n; or, with the bus's INT path open, the bus line as top4 reads it back, carrying the
     // Next's own INT through o_zxn_bus_inten and a device's (zxnext:1799; top4:752, 1967, 1988; ruling (19) b)
     if (bus_int_path(z) ? z.bus_int_seen : (z.int_low || im2_int(z))) p |= Z80_INT; else p &= ~Z80_INT;
-    p = z80_tick(&z.cpu, p);
-    if (z.stop_on && !z.first_edge && z80_opdone(&z.cpu)) {
+    if (dma_bus) p = dma_pins(z);                                     // the CPU frozen, the bus the DMA's
+    else p = z80_tick(&z.cpu, p);
+    if (!dma_bus && z.stop_on && !z.first_edge && z80_opdone(&z.cpu)) {
         uint16_t a = Z80_GET_ADDR(p);
         if (a >= z.stop_lo && a <= z.stop_hi) {
             z.cpu = saved;
             z.pins = saved_pins;
+            z.db = db_saved;
             z.hit = true;
             z.hit_pc = a;
             return false;
         }
     }
+    if (!dma_bus) z.db.mc_end = z80_mcycle_end(&z.cpu);
     z.first_edge = false;
     z.wait_next = false;
     z.cpu_clocks++;
@@ -2256,10 +2282,12 @@ bool cpu_edge(ZXN& z) {
         remap(z);
     }
     if (fetch) dm_fetch(z, Z80_GET_ADDR(p));
-    classify(z, p);
+    if (dma_bus) dma_classify(z, p); else classify(z, p);            // (the DMA's: next_dma_bus.inc)
     z.p3_waiting = p3w;
     if (!p3w) z.p3_mem = (p & Z80_MREQ) && (p & (Z80_RD | Z80_WR)) && !(p & Z80_RFSH) && contended_page(z, Z80_GET_ADDR(p));
-    if (p & Z80_MREQ) {
+    if (dma_bus) z.p3_mem = z.p3_waiting = false;                    // the DMA's +3 WAIT is its own
+    if (dma_bus) dma_cycle(z, p);                                     // the DMA's bus cycle (next_dma_bus.inc)
+    else if (p & Z80_MREQ) {
         uint16_t a = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
             Kind k;
@@ -2314,6 +2342,7 @@ bool cpu_edge(ZXN& z) {
             z.spi_npend--;
         }
         if (old_state < 16) z.spi_state = old_state + 1;
+        z.spi_last_d = old_state == 15;
         const uint16_t port = Z80_GET_ADDR(p);
         if ((p & Z80_IORQ) && !(p & Z80_M1) && (p & (Z80_RD | Z80_WR)) && (port & 0xFF) == 0xEB && port_en(z, 11) &&
             (old_state == 16 || old_state == 15)) {
@@ -2327,7 +2356,7 @@ bool cpu_edge(ZXN& z) {
     // the effective speed follows the programmed one only between bus cycles (ref §1.3)
     // (the VHDL samples MREQ, IORQ and M1 as they were before the edge: the previous T-state's pins, not this one's;
     // Speccy-Zone's review)
-    if (!(saved_pins & (Z80_MREQ | Z80_IORQ | Z80_M1))) {
+    if (!(bus_before & (Z80_MREQ | Z80_IORQ | Z80_M1)) && !db_saved.busak) {   // and the DMA not holding it (5714)
         z.speed_eff = z.speed_prog;
         const bool ben = z.nr[0x80] & 0x80, bio = z.nr[0x80] & 0x20, bmem = z.nr[0x80] & 0x10;
         if (ben != z.bus_eff_en || bio != z.bus_eff_dis_io || bmem != z.bus_eff_dis_mem) {
@@ -2343,7 +2372,8 @@ bool cpu_edge(ZXN& z) {
         z.int_low = false;
         z.int_log.back().end = z.t28 + 1 + (bus_int_path(z) ? 2 : 0);                             // the first tick that starts with INT high
     }
-    z.pins = p;
+    if (!dma_bus) z.pins = p;
+    z.bus_pins = p;
     return true;
 }
 
@@ -2675,7 +2705,14 @@ int zxn_f9_width() { return F9_W; }
 int zxn_fb_width() { return FB_W; }
 int zxn_fb_height() { return FB_H; }
 int zxn_border(ZXN* z) { return z->border; }
-void zxn_io_out(ZXN* z, int port, int v) { io_write(*z, port & 0xFFFF, v & 0xFF); }
+void zxn_io_out(ZXN* z, int port, int v) { z->io_now = true; io_write(*z, port & 0xFFFF, v & 0xFF); z->io_now = false; }
+int zxn_busak(ZXN* z) { return z->db.busak; }
+void zxn_dma_logging(ZXN* z, int on) { if (on) z->dma_log.clear(); z->dma_logging = on != 0; }
+int zxn_dma_log_len(ZXN* z) { return (int)z->dma_log.size(); }
+void zxn_dma_log_get(ZXN* z, int i, uint64_t* out) {
+    const DmaEvent& e = z->dma_log[i];
+    out[0] = e.t28; out[1] = e.cpu_clocks; out[2] = e.kind; out[3] = e.addr; out[4] = e.value;
+}
 
 int zxn_int_log_len(ZXN* z) { return (int)z->int_log.size(); }
 void zxn_int_log_get(ZXN* z, int i, uint64_t* out) { out[0] = z->int_log[i].start; out[1] = z->int_log[i].end; }
