@@ -109,6 +109,12 @@ struct ZXN {
     bool eff_cd = false;                // eff_nr_08_contention_disable: NR 0x08 b6 as in effect (zxnext:5703-5733)
     int coreid = 1;                     // NR 0x10's core id (zxnext:1127)
     bool l2_en = false;                 // port_123b_layer2_en (port 0x123B b1, NR 0x69 b7; Layer 2 itself: later)
+    uint8_t porte3 = 0;                 // divMMC's port 0xE3: conmem b7, mapram b6 (set only), bank b3:0 (zxnext:4114-4129)
+    bool dm_hold = false, dm_held = false;   // divmmc.vhd's automap_hold and automap_held
+    bool dm_instant = false;            // an instant entry, during the fetch that met it
+    bool dm_pending = false;            // automap_held follows automap_hold once the fetch's MREQ has risen
+    int snoop = 0;                      // im2_control.vhd's state: 0, 1 after ED, 2 after CB, 3 after DD/FD
+    int im_mode = 0;                    // the IM mode it has seen (NR 0xC0 b2:1)
 
     // time and the beam
     uint64_t t28 = 0, cpu_clocks = 0, frame = 0;
@@ -187,6 +193,12 @@ inline RomSel rom_select(const ZXN& z) {
     }
 }
 
+// divMMC (ref §3.8; device/divmmc.vhd; zxnext:4043-4131). Port 0xE3's decode (NR 0x83 b0, port enable bit 8) gates
+// it all; automap also needs NR 0x0A b4 (divmmc_automap_reset, zxnext:4053).
+inline bool dm_en(const ZXN& z) { return z.nr[0x83] & 1; }
+inline bool dm_automap_reset(const ZXN& z) { return !dm_en(z) || !(z.nr[0x0A] & 0x10); }
+inline bool dm_automap(const ZXN& z) { return !dm_automap_reset(z) && (z.dm_held || z.dm_instant); }
+
 // Rebuild the page table (ref §3.4's decode order, the parts this layer has: boot ROM, MMU page, config mode, ROM).
 void remap(ZXN& z) {
     for (int s = 0; s < 8; s++) {
@@ -230,6 +242,35 @@ void remap(ZXN& z) {
                 z.wr_kind[s] = K_NONE;
                 z.wr_tag[s] = T_NONE;
                 z.wr_val[s] = 0;
+            }
+        }
+        // divMMC over slots 0-1, ahead of Layer 2, ROMCS, the alternate ROM and the rest (zxnext:3049-3066): with
+        // conmem or automap, 0x0000-0x1FFF is its ROM (SRAM 0x010000) or, with mapram, RAM bank 3, read-only either
+        // way; 0x2000-0x3FFF is the bank from port 0xE3, read-only if mapram is set and it's bank 3 (divmmc:83-101;
+        // "Issue #7": conmem with mapram also brings in bank 3). (The multiface, when it comes, excludes it.)
+        if (s < 2 && dm_en(z) && ((z.porte3 & 0x80) || dm_automap(z))) {
+            const bool mapram = z.porte3 & 0x40;
+            if (s == 0 && !mapram) {
+                z.rd[s] = z.sram + 0x10000;
+                z.rd_kind[s] = K_SRAM;
+                z.rd_tag[s] = T_DIVROM;
+                z.rd_val[s] = 0;
+                z.wr[s] = nullptr;
+                z.wr_kind[s] = K_NONE;
+                z.wr_tag[s] = T_NONE;
+                z.wr_val[s] = 0;
+            } else {
+                const int bank = s == 0 ? 3 : (z.porte3 & 15);
+                const bool ro = s == 0 || (mapram && bank == 3);
+                uint8_t* p = z.sram + 0x20000 + bank * 0x2000;
+                z.rd[s] = p;
+                z.rd_kind[s] = K_SRAM;
+                z.rd_tag[s] = T_DIV;
+                z.rd_val[s] = bank;
+                z.wr[s] = ro ? nullptr : p;
+                z.wr_kind[s] = ro ? K_NONE : K_SRAM;
+                z.wr_tag[s] = ro ? T_NONE : T_DIV;
+                z.wr_val[s] = ro ? 0 : bank;
             }
         }
         if (s < 2 && z.bootrom_en) {                                  // the boot ROM wins on reads (ref §3.10)
@@ -315,6 +356,7 @@ int nr_read(ZXN& z, int n) {
         case 0x69:                                                    // aliases of 123B b1, 7FFD b3, FF b5:0 (zxnext:6002-6003)
             return (z.l2_en ? 0x80 : 0) | (z.port7ffd & 0x08) << 3 | (z.portff & 0x3F);
         case 0xA2: return (z.nr[0xA2] & 0xDD) | 0x02;                 // b5 reads 0, b1 reads 1 (zxnext:6098-6099)
+        case 0xC0: return (z.nr[0xC0] & 0xE9) | (z.im_mode << 1);     // the snooped IM mode in b2:1 (zxnext:6136-6137)
         case 0xC4:                                                    // (zxnext:6144-6145, 6618)
             return (z.nr[0xC4] & 0x80) | (z.nr[0x22] & 2) | ((z.portff & 0x40) ? 0 : 1);
         case 0x8E:                                                    // the same layout, bit 3 = 1 (zxnext 6065-6066)
@@ -348,6 +390,19 @@ void nr_write(ZXN& z, int n, int v) {
             return;
         case 0xC5:                                                    // four CTC channels: b7:4 aren't there
             z.nr[0xC5] = v & 0x0F;                                    // (zxnext:4030, 6148-6149; ref §9 D-5)
+            return;
+        case 0x09:                                                    // b3 clears divMMC's mapram, reads 0 (zxnext:4125-4126,
+            if (v & 0x08) z.porte3 &= ~0x40;                          // 5820)
+            z.nr[0x09] = v & ~0x08;
+            remap(z);
+            return;
+        case 0x0A: case 0x83:                                         // divMMC's automap and port enables
+            z.nr[n] = v;
+            if (dm_automap_reset(z)) z.dm_hold = z.dm_held = z.dm_instant = z.dm_pending = false;
+            remap(z);
+            return;
+        case 0xC0:
+            z.nr[0xC0] = v & 0xE9;                                    // (zxnext:5533-5536)
             return;
         case 0x69:                                                    // (zxnext:3866, 3616-3617, 3575-3576)
             z.l2_en = v & 0x80;
@@ -471,6 +526,10 @@ void do_reset(ZXN& z, bool hard) {
     z.speed_prog = z.speed_eff = 0;
     z.eff_cd = false;                                                 // (zxnext:5706-5709)
     z.l2_en = false;                                                  // (zxnext:3849)
+    z.porte3 = 0;                                                     // (zxnext:4114-4117; divmmc:107-140)
+    z.dm_hold = z.dm_held = z.dm_instant = z.dm_pending = false;
+    z.snoop = 0;
+    z.im_mode = 0;
     z.nr_sel = 0x24;
     z.ula_int_disabled = false;
     z.int_req = z.int_low = false;
@@ -524,6 +583,7 @@ uint8_t io_read(ZXN& z, uint16_t port) {
     }
     if ((port & 0xFF) == 0xFF) return floating_bus(z);                // always answered (ref §5.1)
     if ((port & 0xFF) == 0xEB && port_en(z, 11)) return z.spi_rx;     // the previous transfer's byte (ref §1.7)
+    if ((port & 0xFF) == 0xE3 && dm_en(z)) return z.porte3 & 0xCF;    // divMMC (zxnext:2567, 4131)
     return 0xFF;                                                      // nobody answers (ref §5.2)
 }
 
@@ -535,6 +595,10 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
         bool flash_ok = z.config_mode || z.reset_type == 4;           // the flash: config mode or before the first soft reset
         if ((v & 3) == 1 || (v & 3) == 2 || (flash_ok && (v == 0xFB || v == 0xF7 || v == 0x7F))) z.spi_cs = v;
         else z.spi_cs = 0xFF;
+    }
+    if ((port & 0xFF) == 0xE3 && dm_en(z)) {                          // conmem, mapram (set only), bank (zxnext:4119-4122)
+        z.porte3 = (v & 0x8F) | ((v | z.porte3) & 0x40);
+        remap(z);
     }
     if ((port & 0xFF) == 0xFF && port_en(z, 0)) {                     // Timex port: bit 6 disables the ULA INT
         z.portff = v;
@@ -638,6 +702,80 @@ inline void draw_pixel(ZXN& z) {
 
 // One rising edge of the CPU clock. Returns false (and changes nothing) if a run_until_pc stop is due: the CPU is
 // about to begin T1 of an instruction's first opcode fetch at an address in the range (DESIGN.md §9.1 (5)).
+// divMMC's entry points for a fetch from address a (zxnext:2805-2867). RST n (0x0000-0x0038): NR 0xB8 bit n enables
+// it, NR 0xB9 bit n makes it always (1) or ROM 3 only (0), NR 0xBA bit n instant (1) or delayed (0). NR 0xBB: b7
+// 0x3Dxx (instant, ROM 3), b6 the 0x1FF8-0x1FFF exit (delayed), b5:2 the tape traps 0x056A, 0x04D7, 0x0562, 0x04C6
+// (delayed, ROM 3), b1/b0 0x0066 instant/delayed (only with a DRIVE-button NMI pending: no button yet).
+struct DmEntry { bool on_instant, on_delayed, off_delayed, rom3_instant, rom3_delayed; };
+inline DmEntry dm_entry(const ZXN& z, uint16_t a) {
+    DmEntry e = {false, false, false, false, false};
+    const uint8_t bb = z.nr[0xBB];
+    if ((a & 0xFFC7) == 0x0000) {                                     // RST 00-38
+        const int n = (a >> 3) & 7;
+        const bool ep = (z.nr[0xB8] >> n) & 1, valid = (z.nr[0xB9] >> n) & 1, instant = (z.nr[0xBA] >> n) & 1;
+        e.on_instant = ep && valid && instant;
+        e.on_delayed = ep && valid && !instant;
+        e.rom3_instant = ep && !valid && instant;
+        e.rom3_delayed = ep && !valid && !instant;
+    }
+    if ((a & 0xFFF8) == 0x1FF8 && (bb & 0x40)) e.off_delayed = true;
+    if ((a & 0xFF00) == 0x3D00 && (bb & 0x80)) e.rom3_instant = true;
+    if ((a == 0x04C6 && (bb & 0x04)) || (a == 0x0562 && (bb & 0x08)) || (a == 0x04D7 && (bb & 0x10)) ||
+        (a == 0x056A && (bb & 0x20))) e.rom3_delayed = true;
+    return e;
+}
+
+// sram_divmmc_automap_rom3_en (zxnext:3097): the fetch is from the ROM branch (slots 0-1 showing neither an MMU page
+// nor config mode), and what it reads is ROM 3, the 48K BASIC, or the alternate ROM's 48K half. (Layer 2's read
+// map and the expansion bus's ROMCS would exclude it: later.)
+inline bool dm_rom3_active(const ZXN& z, uint16_t a) {
+    const int s = a >> 13;
+    if (s >= 2 || z.mmu[s] < 0xE0 || z.config_mode) return false;
+    const RomSel r = rom_select(z);
+    return (z.nr[0x8C] & 0xC0) == 0x80 ? r.alt48 : r.rom3;
+}
+
+// An opcode fetch from address a: divMMC's automap decision (divmmc.vhd:107-145). An instant entry maps divMMC in for
+// this fetch itself; automap_hold, set during the fetch, becomes automap_held when its MREQ rises, so a delayed
+// entry (or exit) takes effect from the next memory cycle.
+void dm_fetch(ZXN& z, uint16_t a) {
+    if (dm_automap_reset(z)) return;
+    const DmEntry e = dm_entry(z, a);
+    const bool active = a < 0x4000;                                   // sram_pre_override(2): slots 0-1 (the multiface: later)
+    const bool rom3 = active && dm_rom3_active(z, a);
+    z.dm_hold = (active && (e.on_instant || e.on_delayed)) || (rom3 && (e.rom3_instant || e.rom3_delayed)) ||
+                (z.dm_held && !(active && e.off_delayed));
+    z.dm_pending = true;
+    const bool instant = (active && e.on_instant) || (rom3 && e.rom3_instant);
+    if (instant != z.dm_instant) {
+        z.dm_instant = instant;
+        remap(z);
+    }
+}
+
+// im2_control.vhd's snooper, at each opcode fetch with the byte fetched: RETN (ED 45 only) unmaps divMMC
+// (divmmc_retn_seen, zxnext:4052; the multiface's exception: later); IM n is remembered for NR 0xC0 (im2c:212-229).
+void snoop_fetch(ZXN& z, uint8_t op) {
+    switch (z.snoop) {
+        case 1:                                                       // after ED
+            if (op == 0x45 && !dm_automap_reset(z)) {
+                z.dm_hold = z.dm_held = z.dm_instant = z.dm_pending = false;
+                remap(z);
+            }
+            if ((op & 0xC7) == 0x46) z.im_mode = ((op & 0x18) == 0x18) ? 2 : ((op & 0x18) == 0x10) ? 1 : 0;
+            z.snoop = 0;
+            return;
+        case 2:                                                       // after CB: this is its opcode
+            z.snoop = 0;
+            return;
+        case 3:                                                       // after DD/FD
+            z.snoop = (op == 0xDD || op == 0xFD) ? 3 : 0;
+            return;
+        default:
+            z.snoop = op == 0xED ? 1 : op == 0xCB ? 2 : (op == 0xDD || op == 0xFD) ? 3 : 0;
+    }
+}
+
 bool cpu_edge(ZXN& z) {
     z80_t saved = z.cpu;
     uint64_t saved_pins = z.pins;
@@ -677,6 +815,15 @@ bool cpu_edge(ZXN& z) {
     else if (p & Z80N_NMIACK_LSB) z.stackless_retn = true;
     else if (p & Z80N_RETN_MSB) z.stackless_retn = false;
     if (hide) p &= ~Z80_MREQ;                                         // MREQ hidden from the machine
+    if (z.dm_pending) {                                               // the fetch's MREQ has risen: held follows hold
+        z.dm_pending = false;
+        const bool was = dm_automap(z);
+        z.dm_held = z.dm_hold;
+        z.dm_instant = false;
+        if (dm_automap(z) != was) remap(z);
+    }
+    const bool fetch = (p & Z80_M1) && (p & Z80_MREQ) && (p & Z80_RD);
+    if (fetch) dm_fetch(z, Z80_GET_ADDR(p));
     classify(z, p);
     z.p3_waiting = p3w;
     if (!p3w) z.p3_mem = (p & Z80_MREQ) && (p & (Z80_RD | Z80_WR)) && !(p & Z80_RFSH) && contended_page(z, Z80_GET_ADDR(p));
@@ -686,6 +833,7 @@ bool cpu_edge(ZXN& z) {
             Kind k;
             Z80_SET_DATA(p, mem_read(z, a, &k));
             if (z.speed_eff == 3 && (k == K_SRAM || k == K_BRAM5)) z.wait_next = true;   // ref §1.4
+            if (fetch) snoop_fetch(z, Z80_GET_DATA(p));
         } else if (p & Z80_WR) {
             mem_write(z, a, Z80_GET_DATA(p));
         }
