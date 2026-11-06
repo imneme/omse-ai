@@ -178,6 +178,20 @@ class Tone(NextCase):
             self.assertTrue(len(runs) >= 3 and set(runs) == {8 * max(p, 1)},
                             f'period {p}: the output flips every {8 * max(p, 1)} enables (ym2149:305-320)')
 
+    def test_periods_use_all_twelve_bits(self):
+        """Speccy-Zone's mutant 1: a period with R1 bit 3 set (800h and up) is that long; R1's top nibble is
+        ignored (ym2149:301, freq(11:0))."""
+        zx = self.zx
+        for hi, want in ((0x08, 0x8A5), (0xF9, 0x9A5)):
+            ay(zx, 0, 0xA5)
+            ay(zx, 1, hi)
+            ay(zx, 7, 0xFE)
+            ay(zx, 8, 15)
+            s = capture(zx, 8 * want * 4)[:, 0]
+            runs = np.diff(np.nonzero(np.diff(s))[0])
+            self.assertTrue(len(runs) >= 2 and set(runs) == {8 * want},
+                            f'R1 = {hi:02X}h: period {want:03X}h, a flip every {8 * want} enables')
+
     def test_periods_zero_and_one_are_the_same(self):
         zx = self.zx
         ay(zx, 7, 0xFE)
@@ -279,6 +293,26 @@ class Envelope(NextCase):
             self.assertEqual(got, str(then) if then in (0, 1) else then, f'shape {shape}: after the first cycle')
 
 
+    def test_r13_restarts_the_selected_chip(self):
+        """Speccy-Zone's mutant 2: under TurboSound, writing R13 restarts the envelope of the chip that's selected
+        and no other (turbosound:103-120, each chip's own ym2149:205-207)."""
+        zx = bare()
+        zx.nr_write(0x08, zx.nr_read(0x08) | 2)
+        for n in range(3):
+            chip(zx, n)
+            ay(zx, 11, 0)
+            ay(zx, 12, 1)                                  # period 256: a step every 2048 enables
+            ay(zx, 13, 0x0D)                               # up, then hold high
+        zx.run_ticks(16 * 2048 * 10)
+        before = [zx.ay_env(n) for n in range(3)]
+        self.assertTrue(all(8 <= e <= 12 for e in before), f'all three climbing: {before}')
+        chip(zx, 1)
+        ay(zx, 13, 0x0D)
+        after = [zx.ay_env(n) for n in range(3)]
+        self.assertEqual(after[1], 0, 'chip 1 (selected) starts again from the bottom')
+        self.assertEqual([after[0], after[2]], [before[0], before[2]], 'chips 0 and 2 carry on')
+
+
 @needs_next
 class Noise(NextCase):
 
@@ -337,6 +371,9 @@ class Dacs(NextCase):
         zx.nr_write(0x2E, 0xF0)                            # NR 0x2E: C (right)
         s = capture(zx, 8)[-1]
         self.assertEqual(list(s), [4 * (0x20 + 0x10), 4 * (0xF0 + 0x20)], 'NR 0x2C is B, 0x2E is C (soundrive:66-90)')
+        zx.nr_write(0x2D, 0x40)                            # NR 0x2D: A and D, the mono pair (mutant 4)
+        s = capture(zx, 8)[-1]
+        self.assertEqual(list(s), [4 * (0x40 + 0x10), 4 * (0xF0 + 0x40)], 'NR 0x2D moves both sides (soundrive:78-84)')
 
 
 @needs_next
@@ -351,6 +388,26 @@ class Beeper(NextCase):
         zx.nr_write(0x08, zx.nr_read(0x08) | 0x10)          # ...when it's enabled (zxnext:6411)
         s = capture(zx, 8)[-1]
         self.assertEqual(list(s), [DAC_IDLE] * 2, 'exc: the beeper leaves the mix (audio_mixer:54-55)')
+
+
+    def test_mic_and_issue_2(self):
+        """Speccy-Zone's mutant 3: port FE b3 adds 128 while NR 0x08 b0 is clear and nothing while it's set; the
+        gate is combinational, so changing NR 0x08 afterwards changes the sound (zxnext:6410, with no tape in:
+        ear_in xor (mic and issue2) xor mic)."""
+        zx = bare()
+        zx.io_out(0x00FE, 0x08)
+        s = capture(zx, 8)[-1]
+        self.assertEqual(list(s), [DAC_IDLE + 128] * 2, 'mic adds 128 to each side (audio_mixer:54)')
+        zx.nr_write(0x08, zx.nr_read(0x08) | 1)
+        s = capture(zx, 8)[-1]
+        self.assertEqual(list(s), [DAC_IDLE] * 2, 'NR 0x08 b0 set after the write: mic leaves the mix')
+        zx.nr_write(0x08, zx.nr_read(0x08) & ~1)
+        s = capture(zx, 8)[-1]
+        self.assertEqual(list(s), [DAC_IDLE + 128] * 2, 'and comes back when it clears, with no new FE write')
+        zx.nr_write(0x08, zx.nr_read(0x08) | 1)
+        zx.io_out(0x00FE, 0x08)
+        s = capture(zx, 8)[-1]
+        self.assertEqual(list(s), [DAC_IDLE] * 2, 'written while set: nothing')
 
 
 @needs_next

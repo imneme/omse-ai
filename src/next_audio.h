@@ -118,7 +118,7 @@ struct Audio {
     Ym ym[3];
     uint8_t pan[3] = {3, 3, 3};                 // TurboSound's psgN_pan, bit 1 L, bit 0 R (turbosound:80-92)
     uint8_t dac[4] = {0x80, 0x80, 0x80, 0x80};  // SounDrive's channels A-D (soundrive:56-64)
-    uint8_t ear = 0, mic = 0;                   // port 0xFE's b4 and the mic line (zxnext:6410)
+    uint8_t ear = 0, mic = 0;                   // port 0xFE's b4 and b3 as written (zxnext:3557, 6410)
     uint16_t L = 0, R = 0;                      // the mixer's output (audio_mixer:73-86)
     bool capturing = false;                     // every enable's (L, R), for tests
     std::vector<uint16_t> cap;
@@ -155,7 +155,10 @@ struct Audio {
         const int a = dac_on ? dac[0] : 0x80, b = dac_on ? dac[1] : 0x80;
         const int cc = dac_on ? dac[2] : 0x80, d = dac_on ? dac[3] : 0x80;
         const bool exc = (nr06 & 0x40) && (nr08 & 0x10);           // beep_spkr_excl (zxnext:6411)
-        const int beep = (ear && !exc ? 512 : 0) + (mic && !exc ? 128 : 0);
+        // beep_mic_final = ear_in xor (mic and issue2) xor mic (zxnext:6410): no tape input, so mic unless NR 0x08 b0,
+        // gated here as the mixer runs, not when port 0xFE was written (Speccy-Zone's mutant 3)
+        const bool micf = mic && !(nr08 & 1);
+        const int beep = (ear && !exc ? 512 : 0) + (micf && !exc ? 128 : 0);
         L = (uint16_t)(beep + ayL + 4 * (a + b));                  // (audio_mixer:73-86)
         R = (uint16_t)(beep + ayR + 4 * (cc + d));
         if (capturing) { cap.push_back(L); cap.push_back(R); }

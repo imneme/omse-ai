@@ -882,7 +882,7 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
     if (!(port & 1)) {                                                // 0xFE, A0 = 0 (ref §5.1)
         z.border = v & 7;
         z.audio.ear = (v >> 4) & 1;                                   // the beeper (zxnext:6410, audio_mixer:54-55)
-        z.audio.mic = ((v >> 3) & 1) && !(z.nr[0x08] & 1);
+        z.audio.mic = (v >> 3) & 1;                                   // NR 0x08 b0 gates it in the mixer
     }
     if ((port & 0xFF) == 0xE7 && port_en(z, 11)) {                    // slave select: one device only (zxnext 3258-3290)
         bool flash_ok = z.config_mode || z.reset_type == 4;           // the flash: config mode or before the first soft reset
