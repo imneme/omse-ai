@@ -12,6 +12,7 @@ Layer 1 so far: the clock, the counters, the ULA interrupt (pulse mode), memory 
 ports 0x243B/0x253B, the logs. boot='fast' comes with a later layer.
 """
 import ctypes
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -66,22 +67,157 @@ def _load_lib():
     return lib
 
 
+# ---- boot='fast': what the Next's firmware does between its menu and the soft reset (NEXT-MACHINE.md §7.2 steps 4-7),
+# from the distribution's own files, read at run time and never shipped: MENU.DEF's line for the machine, CONFIG.INI's
+# settings, and the ROM images. The arithmetic is the firmware's (tbblue/src/firmware/app/src/boot.c: load_roms 86-176,
+# init_registers 279-407, the handover 548-598; settings and defaults config.c 25-124).
+
+# CONFIG.INI's keys, in the firmware's order, with its defaults (config.c 93-124)
+NEXT_SETTINGS = dict(scandoubler=1, **{'50_60hz': 0}, timex=1, psgmode=1, intsnd=1, stereomode=0, turbosound=1,
+                     divmmc=0, mf=0, joystick1=1, joystick2=3, ps2=1, dma=0, scanlines=0, turbokey=1, default=0,
+                     timing=8, keyb_issue=0, divports=1, dac=1, ay48=0, uart_i2c=1, kmouse=1, ulaplus=1, hdmisound=1,
+                     beepmode=0, buttonswap=0, mousedpi=1, espreset=0)
+# Each timing's personality: MENU.DEF's first line of that mode (mode 0 48K, 1 128K, 2 +3, 3 Pentagon)
+NEXT_MENU = {'p3': 'ZX Spectrum Next (standard)', '48k': 'ZX Spectrum 48K', '128k': 'ZX Spectrum 128k',
+             'pentagon': 'Pentagon 128K'}
+
+
+def next_roms_dir(roms=None):
+    """The distribution's machines/next folder: roms=, else $OMSE_AI_NEXT_ROMS."""
+    d = roms or os.environ.get('OMSE_AI_NEXT_ROMS')
+    if not d or not os.path.isfile(_ci(d, 'MENU.DEF') or ''):
+        raise FileNotFoundError("boot='fast' needs the Next's distribution: pass roms= or set OMSE_AI_NEXT_ROMS to its "
+                                "machines/next folder (with MENU.DEF, CONFIG.INI and the ROMs)")
+    return d
+
+
+def _ci(d, name):
+    """A file in d, matched without regard to case (the SD card's FAT doesn't care; MENU.DEF says enNextMF.rom)."""
+    if not os.path.isdir(d):
+        return None
+    for f in os.listdir(d):
+        if f.lower() == name.lower():
+            return os.path.join(d, f)
+    return None
+
+
+def next_settings(d, **override):
+    """CONFIG.INI's settings over the firmware's defaults, then any overrides."""
+    st = dict(NEXT_SETTINGS)
+    path = _ci(d, 'CONFIG.INI')
+    if path:
+        for line in open(path, encoding='latin-1'):
+            k, eq, v = line.strip().partition('=')
+            if eq and k in st and v.strip().isdigit():
+                st[k] = int(v)
+    st.update(override)
+    return st
+
+
+def next_menu(d, title):
+    """MENU.DEF's line by title: (mode, rom, divmmc_rom, mf_rom); '' for a ROM not named, None for <none>."""
+    for line in open(_ci(d, 'MENU.DEF'), encoding='latin-1'):
+        if line.startswith('menu='):
+            f = [x.strip() for x in line[5:].strip().split(',')]
+            if f[0] == title:
+                f += [''] * 6
+                none = lambda x: None if x.startswith('<none>') else x
+                return int(f[1]), f[3], none(f[4]), none(f[5])
+    raise ValueError(f'MENU.DEF has no line {title!r}')
+
+
+def next_firmware_state(mode, st, divmmc_rom, mf_rom):
+    """The registers the firmware writes, as (reg, value) in its order, and the multiface type (boot.c 86-176, 279-407,
+    548-573: a ROM named on the menu line forces divMMC or the multiface on; <none> forces it off)."""
+    st = dict(st)
+    if mf_rom is None: st['mf'] = 0
+    elif mf_rom: st['mf'] = 1
+    if divmmc_rom is None: st['divmmc'] = 0
+    elif divmmc_rom: st['divmmc'] = 1
+    mftype = 0
+    if st['mf']:
+        mftype = {0: 3, 1: 1, 2: 0, 3: 1}[mode]
+        if mf_rom and mf_rom.lower().startswith(('mf128v1', 'mf128v12')): mftype = 2   # MF128 87.1 / 87.12
+    j1, j2 = st['joystick1'], st['joystick2']
+    nr05 = (j1 & 3) << 6 | (j2 & 3) << 4 | (8 if j1 & 4 else 0) | (4 if st['50_60hz'] else 0) | \
+        (2 if j2 & 4 else 0) | (1 if st['scandoubler'] else 0)
+    nr06 = (st['psgmode'] & 3) | (0x80 if st['turbokey'] else 0) | (0x40 if st['beepmode'] else 0) | \
+        (0x10 if st['divmmc'] else 0) | (0x08 if st['mf'] else 0) | (0x04 if st['ps2'] else 0)
+    nr08 = (0x20 if st['stereomode'] else 0) | (0x10 if st['intsnd'] else 0) | (0x08 if st['dac'] else 0) | \
+        (0x04 if st['timex'] else 0) | (0x02 if st['turbosound'] else 0) | (0x01 if st['keyb_issue'] else 0)
+    nr09 = (st['scanlines'] & 3) | (0 if st['hdmisound'] else 0x04)
+    nr0a = (st['mousedpi'] & 3) | (0x08 if st['buttonswap'] else 0) | (0x10 if st['divmmc'] else 0) | mftype << 6
+    hw3 = (1 if st['ulaplus'] else 0) | (2 if st['dma'] else 0)          # bit 7 = 0: kept through soft resets
+    hw2 = 0xFF if st['dac'] else 0x01
+    hw1 = (0x09 if st['divports'] else 0) | (0x02 if st['mf'] else 0) | (0x14 if st['uart_i2c'] else 0) | \
+        (0x20 if st['kmouse'] else 0)
+    hw0 = {0: 0xC0, 1: 0xC2, 2: 0xDA, 3: 0xC6}[mode]
+    if mode == 0 and not st['ay48']: hw2 &= 0xFE
+    if mode == 3: hw2 &= 0xFB
+    regs = [(0x05, nr05), (0x06, nr06), (0x08, nr08), (0x09, nr09), (0x0A, nr0a),
+            (0x82, hw0), (0x83, hw1), (0x84, hw2), (0x85, hw3)]
+    return regs, st
+
+
 class Next:
     """One Spectrum Next. boot='bare' is the power-on state (config mode, the boot ROM's area reading 0xFF unless
     boot_rom= gives bytes); timing/hz/speed are in effect from the start (DESIGN.md §9.1 (1))."""
 
-    def __init__(self, timing='p3', hz=50, speed=0, boot='bare', boot_rom=None, issue=4):
-        if boot != 'bare':
-            raise NotImplementedError("boot='fast' comes with a later layer")
+    def __init__(self, timing='p3', hz=None, speed=0, boot='bare', boot_rom=None, issue=4, roms=None, settings=None):
+        """boot='fast' (NEXT-MACHINE.md §7.4 (2)): the firmware's work for timing's personality on MENU.DEF (p3: ZX
+        Spectrum Next (standard); 48k, 128k, pentagon: those machines), with the distribution's CONFIG.INI (roms=, or
+        $OMSE_AI_NEXT_ROMS, names its machines/next folder) and settings= (a dict of CONFIG.INI keys) over it, then the
+        soft reset: the CPU is at 0 in the chosen ROM. hz= overrides CONFIG.INI's 50_60hz, speed= the 3.5 MHz the soft
+        reset leaves."""
+        if boot not in ('bare', 'fast'):
+            raise ValueError("boot is 'bare' or 'fast'")
         if timing not in TIMINGS:
             raise ValueError(f'timing must be one of {sorted(TIMINGS)}')
+        if boot == 'fast':
+            d = next_roms_dir(roms)
+            mode, rom, div_rom, mf_rom = next_menu(d, NEXT_MENU[timing])
+            over = dict(settings or {})
+            if hz is not None:
+                over['50_60hz'] = 1 if hz == 60 else 0
+            regs, st = next_firmware_state(mode, next_settings(d, **over), div_rom, mf_rom)
+            hz = 60 if st['50_60hz'] else 50
         self.lib = _load_lib()
-        self.z = self.lib.zxn_new(TIMINGS[timing], 1 if hz == 60 else 0, speed & 3, issue)
+        # (fast: the timing and Hz are in effect from the start, as they are by the firmware's pause before its soft
+        # reset, which spans several frame syncs; boot.c 584-585)
+        self.z = self.lib.zxn_new(TIMINGS[timing], 1 if hz == 60 else 0, 0 if boot == 'fast' else speed & 3, issue)
         if boot_rom is not None:
             self.lib.zxn_set_bootrom(self.z, bytes(boot_rom), len(boot_rom))
         self.sram = (ctypes.c_uint8 * (2 << 20)).from_address(self.lib.zxn_sram(self.z))
         self.bram5 = (ctypes.c_uint8 * 16384).from_address(self.lib.zxn_bram5(self.z))
         self.bram7 = (ctypes.c_uint8 * 8192).from_address(self.lib.zxn_bram7(self.z))
+        if boot == 'fast':
+            self._fast_boot(d, mode, rom, div_rom, mf_rom, regs, st)
+            if speed:
+                self.nr_write(0x07, speed & 3)
+
+    def _fast_boot(self, d, mode, rom, div_rom, mf_rom, regs, st):
+        def load(name, page16, blocks, blocklen):     # through NR 0x04's window in the firmware; straight in here
+            path = _ci(d, name)
+            if not path:
+                raise FileNotFoundError(f"boot='fast' wants {name} in {d}")
+            data = open(path, 'rb').read()
+            for b in range(blocks):
+                chunk = data[b * blocklen:(b + 1) * blocklen]
+                if len(chunk) != blocklen:
+                    raise ValueError(f'{name} is too short for {blocks} block(s) of {blocklen}')
+                self.sram[(page16 + b) * 16384:(page16 + b) * 16384 + blocklen] = chunk
+        self.nr_write(0x07, 3)                         # the firmware's start: 28 MHz, NR 0x06 = 0xA0, the boot ROM off
+        self.nr_write(0x06, 0xA0)                      # (boot.c 445-460; NR 0x03 = 0 stays in config mode)
+        self.nr_write(0x03, 0x00)
+        if st['divmmc']:                               # load_roms (boot.c 86-176): divMMC 8K to 16K page 4,
+            load(div_rom or 'esxmmc.bin', 4, 1, 8192)  # the multiface 8K to page 5, the ROM to pages 0-3
+        if st['mf']:
+            load(mf_rom or {0: 'mf1.rom', 1: 'mf128.rom', 2: 'mf3.rom', 3: 'mf128.rom'}[mode], 5, 1, 8192)
+        load(rom, 0, {0: 1, 2: 4}.get(mode, 2), 16384)
+        for reg, v in regs:                            # init_registers (boot.c 279-407)
+            self.nr_write(reg, v)
+        self.nr_write(0x03, 0x80 | (mode + 1) << 4 | (mode + 1))   # the handover (boot.c 581-598)
+        self.nr_write(0x02, 0x01)
 
     def __del__(self):
         if getattr(self, 'z', None):
