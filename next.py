@@ -144,7 +144,8 @@ class Next:
     def slot_page(self, i, write=False):
         """What MMU slot i (0-7) shows to reads, or with write=True where a write lands (DESIGN.md §9.1 (8)): a plain
         page number 0x00-0xDF, or ('rom', n), ('altrom', n), 'boot', ('config', p16), 'divmmc-rom', ('divmmc', bank),
-        'mf-rom', 'mf-ram', ('l2', page), or None for no memory."""
+        'mf-rom', 'mf-ram', ('l2', page), or None for no memory. ('altrom', n): n 0 is the 128K alternate ROM (SRAM
+        0x18000), 1 the 48K one (0x1C000), as the VHDL's alt_128_n."""
         out = (ctypes.c_int * 2)()
         self.lib.zxn_slot_desc(self.z, i, 1 if write else 0, out)
         tag, val = out[0], out[1]

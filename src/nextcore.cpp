@@ -160,13 +160,23 @@ inline uint8_t* page_ptr(ZXN& z, int page, Kind& k) {
     return z.sram + 0x40000 + page * 0x2000;                                                      // ref §3.1
 }
 
-// The ROM in place, by machine type (ref §3.5): 48K ROM 0; 128K and Pentagon ROM 0/1 by 7FFD bit 4; +3 ROMs 0-3 by
-// 1FFD bit 2 (high) and 7FFD bit 4 (low). (NR 0x8C's locks and the alternate ROM: a later layer.)
-inline int rom_page(const ZXN& z) {
+// The ROM selection (ref §3.5; zxnext:2940-2967): which 16K ROM is in place, whether it's ROM 3 (the 48K BASIC,
+// which divMMC's automap will want), and which alternate ROM goes with it (alt48: 0 the 128K one at SRAM 0x18000,
+// 1 the 48K one at 0x1C000). 48K: ROM 0, and NR 0x8C's locks only choose the alternate ROM. 128K and Pentagon:
+// ROM 0/1 by 7FFD bit 4. +3: ROMs 0-3 by 1FFD bit 2 (high) and 7FFD bit 4 (low). NR 0x8C bits 5:4 lock ROM1/ROM0
+// in place over the ports. (The VHDL also decodes types 0 and 5-7, but NR 0x03 can only set 1-4: zxnext:5076-5083.)
+struct RomSel { int rom; bool rom3, alt48; };
+inline RomSel rom_select(const ZXN& z) {
+    int l1 = (z.nr[0x8C] >> 5) & 1, l0 = (z.nr[0x8C] >> 4) & 1;
+    int p = ((z.port1ffd >> 1) & 2) | ((z.port7ffd >> 4) & 1);         // port_1ffd_rom (zxnext:3713)
     switch (z.mtype) {
-        case 1: return 0;
-        case 3: return ((z.port1ffd >> 1) & 2) | ((z.port7ffd >> 4) & 1);
-        default: return (z.port7ffd >> 4) & 1;
+        case 1: return {0, true, !(!l1 && l0)};
+        case 3:
+            if (l1 | l0) return {l1 << 1 | l0, l1 && l0, l1 != 0};
+            return {p, p == 3, (p & 1) != 0};
+        default:
+            if (l1 | l0) return {l1, l1 != 0, l1 != 0};
+            return {p & 1, (p & 1) != 0, (p & 1) != 0};
     }
 }
 
@@ -187,14 +197,33 @@ void remap(ZXN& z) {
             z.rd_tag[s] = z.wr_tag[s] = T_CONFIG;
             z.rd_val[s] = z.wr_val[s] = z.nr04;
         } else {                                                      // ROM, read-only (ref §3.5)
-            z.rd[s] = z.sram + rom_page(z) * 16384 + s * 8192;
+            // NR 0x8C bit 7 brings in the alternate ROM, only here (not under an MMU page or config mode, whose
+            // override bit 0 is clear): bit 6 clear, it replaces the ROM on reads; set, it takes the writes and
+            // reads still see the ROM (zxnext:3015, 3037, 3075-3082).
+            RomSel r = rom_select(z);
+            int alt = z.nr[0x8C] & 0xC0;
+            uint8_t* ap = z.sram + 0x18000 + (r.alt48 ? 0x4000 : 0) + s * 8192;
             z.rd_kind[s] = K_SRAM;
-            z.rd_tag[s] = T_ROM;
-            z.rd_val[s] = rom_page(z);
-            z.wr[s] = nullptr;
-            z.wr_kind[s] = K_NONE;
-            z.wr_tag[s] = T_NONE;
-            z.wr_val[s] = 0;
+            if (alt == 0x80) {
+                z.rd[s] = ap;
+                z.rd_tag[s] = T_ALTROM;
+                z.rd_val[s] = r.alt48;
+            } else {
+                z.rd[s] = z.sram + r.rom * 16384 + s * 8192;
+                z.rd_tag[s] = T_ROM;
+                z.rd_val[s] = r.rom;
+            }
+            if (alt == 0xC0) {
+                z.wr[s] = ap;
+                z.wr_kind[s] = K_SRAM;
+                z.wr_tag[s] = T_ALTROM;
+                z.wr_val[s] = r.alt48;
+            } else {
+                z.wr[s] = nullptr;
+                z.wr_kind[s] = K_NONE;
+                z.wr_tag[s] = T_NONE;
+                z.wr_val[s] = 0;
+            }
         }
         if (s < 2 && z.bootrom_en) {                                  // the boot ROM wins on reads (ref §3.10)
             z.rd[s] = z.bootrom;
@@ -322,6 +351,14 @@ void nr_write(ZXN& z, int n, int v) {
             port_memory_change(z, was_allram, (v & 8) != 0);          // MMU6/7 kept after a write with bit 3 clear
             return;
         }
+        case 0x85:                                                    // bits 6:4 aren't kept (zxnext:5445-5459,
+        case 0x89:                                                    // 6045, 6057)
+            z.nr[n] = v & 0x8F;
+            return;
+        case 0x8C:                                                    // the alternate ROM and the ROM locks
+            z.nr[0x8C] = v;
+            remap(z);
+            return;
         case 0x8F:
             z.nr[0x8F] = v & 3;
             port_memory_change(z, z.port1ffd & 1);
@@ -348,6 +385,15 @@ void do_reset(ZXN& z, bool hard) {
     } else {
         z.reset_type = z.reset_type == 4 ? 2 : 1;                     // the first soft reset reads "hard" (ref §4.3)
         for (auto& r : NR_RESET) if (r.soft >= 0) z.nr[r.reg] = r.soft;
+        for (int r : {0x80, 0x8C}) z.nr[r] = (z.nr[r] & 0x0F) | ((z.nr[r] << 4) & 0xF0);   // zxnext:2141-2145, 2210-2214
+        if (z.nr[0x85] & 0x80) {                                      // the port enables come back if NR 0x85 b7 = 1,
+            z.nr[0x82] = z.nr[0x83] = z.nr[0x84] = 0xFF;              // and the bus's if NR 0x89 b7 = 0 (sic:
+            z.nr[0x85] |= 0x0F;                                       // zxnext:4991-5007)
+        }
+        if (!(z.nr[0x89] & 0x80)) {
+            z.nr[0x86] = z.nr[0x87] = z.nr[0x88] = 0xFF;
+            z.nr[0x89] |= 0x0F;
+        }
     }
     if (z.config_mode) z.bootrom_en = true;                           // ref §3.10
     static const uint8_t MMU0[8] = {0xFF, 0xFF, 0x0A, 0x0B, 0x04, 0x05, 0x00, 0x01};   // ref §3.3
