@@ -319,7 +319,7 @@ class Video:
             dfile = (self.port_ff & 1) ^ ((self.nr6a >> 4) & 1)     # zxnext:6703
             byte = self.bram5[(dfile << 13) | ((y >> 1) << 6) | (x >> 2)]
             nib = (byte >> 4) if not (x & 2) else (byte & 15)
-            ulap = self.ulap_en and not (self.nr43 & 1)             # zxnext:4185
+            ulap = self.ulap_en and not (self.nr43 & 1)             # zxnext:4187
             high = (0xC | (off & 3)) if ulap else off
             return (high << 4) | nib
         a = ((y >> 1) << 7) | (x >> 1)                              # lores:92-95: rows 96+ at +0x2000
