@@ -398,3 +398,167 @@ def altrom_base(mtype, port_7ffd=0, port_1ffd=0, nr_8c=0):
 # Ports, as decoded (zxnext:2537-2563). 0x3FFD reaches 7FFD only when A14 isn't
 # decoded, i.e. not under +3 timing (zxnext:2552).
 P7FFD, PDFFD, P1FFD, PEFF7, P123B, PE3 = 0x7FFD, 0xDFFD, 0x1FFD, 0xEFF7, 0x123B, 0x00E3
+
+
+# ----------------------------------------------------------------------------
+# Video timing (§2; zxula_timing.vhd, "ulat")
+# (timing, hz): (pixels a line = c_max_hc+1, lines = c_max_vc+1, c_int_h, c_int_v,
+#                c_min_hactive, c_min_vactive), each read off the constants.
+TIMINGS = {
+    ('48k', 50): (448, 312, 116, 0, 128, 64),        # ulat:257-270
+    ('48k', 60): (448, 264, 116, 0, 128, 40),        # ulat:285-298
+    ('128k', 50): (456, 311, 128, 1, 136, 64),       # ulat:187-204
+    ('128k', 60): (456, 264, 128, 0, 136, 40),       # ulat:221-238
+    ('p3', 50): (456, 311, 126, 1, 136, 64),         # ulat:189-204
+    ('p3', 60): (456, 264, 126, 0, 136, 40),         # ulat:223-238
+    ('pentagon', 50): (448, 320, 439, 319, 128, 80),  # ulat:155-168 (always 50 Hz)
+}
+TICKS_PER_PIXEL = 4                     # 7 MHz pixels of 28 MHz ticks (zxnext:6457-6459)
+TICKS_PER_CLOCK = {0: 8, 1: 4, 2: 2, 3: 1}   # 3.5/7/14/28 MHz (top4:1005-1030)
+INT_CLOCKS = {'48k': 32, 'p3': 32, '128k': 36, 'pentagon': 36}   # zxnext:1971-2003
+
+
+def frame_ticks(timing, hz):
+    L, N, *_ = TIMINGS[(timing, hz)]
+    return L * N * TICKS_PER_PIXEL
+
+
+def frame_tstates(timing, hz):
+    """T-states a frame at 3.5 MHz: two pixels a T-state (§1.2)."""
+    L, N, *_ = TIMINGS[(timing, hz)]
+    return L * N // 2
+
+
+def int_beam(timing, hz):
+    """(hc_ula, vc_ula) of the ULA interrupt: the match at raw (c_int_h,
+    c_int_v) is registered, so it shows the pixel after (ulat:548-556);
+    hc_ula = hc - (c_min_hactive - 11), and vc_ula steps when hc_ula wraps
+    (ulat:423-453)."""
+    L, N, ih, iv, ha, va = TIMINGS[(timing, hz)]
+    h = ih + 1
+    hc_ula = (h - (ha - 11)) % L
+    vc_ula = (iv - va - (0 if h >= ha - 11 else 1)) % N
+    return hc_ula, vc_ula
+
+
+def int_tstates_before_row0(timing, hz):
+    """T-states from the ULA interrupt to hc_ula = 0 of row 0 (§2.3, derived)."""
+    L, N, *_ = TIMINGS[(timing, hz)]
+    h, v = int_beam(timing, hz)
+    return ((N - v) * L - h) / 2
+
+
+# The survey's own derived figures (§2.3), which int_beam must reproduce.
+SURVEY_INT_BEFORE_ROW0 = {('48k', 50): 14336, ('128k', 50): 14362, ('p3', 50): 14363,
+                          ('pentagon', 50): 17982.5, ('48k', 60): 8960,
+                          ('128k', 60): 9118, ('p3', 60): 9119}
+
+
+def line_int_beam(timing, hz, line, offset=0):
+    """(hc_ula, vc_ula) where a line interrupt for `line` shows: the match at
+    hc_ula = 255 on cvc = line - 1 (or the last line for 0), registered
+    (ulat:561-583); cvc = vc_ula + NR 0x64 offset (ulat:455-472)."""
+    L, N, *_ = TIMINGS[(timing, hz)]
+    cvc = N - 1 if line == 0 else line - 1
+    return 256, (cvc - offset) % N
+
+
+# ----------------------------------------------------------------------------
+# Contention at 3.5 MHz (§1.2, §1.5), in the ULA's own counters.
+# The window (zxula.vhd:582-583): hc_adj = hc(3:0) + 1 in 4..15, hc(8) = 0,
+# vc in 0..191 (border_active_v, zxula.vhd:414). The clock (top4:994-1003): at
+# the end of an odd pixel it goes low unless contended; at the end of an even
+# one it goes high. So a T-state starts at an odd hc_ula q, and a contended
+# check there is held for each consecutive odd pixel q, q+2, ... whose low
+# nibble is 3..13 (q < 256): the classic 6,5,4,3,2,1,0,0, keyed to hc_ula.
+# Which T-states are checks (zxula.vhd:589-596): the memory term needs MREQ
+# high at the last rising CPU edge, so T1 of each memory cycle and every
+# internal T-state; the port term is a contended port's IORQ having just gone
+# low, at T2 of its I/O cycle; after that edge IORQ low ends both terms for a
+# contended port, while an uncontended port with a contended high byte keeps
+# the memory term at T3 and T4: the classic four I/O cases (docs/contention.md).
+
+HOLD_NIBBLES = {3, 5, 7, 9, 11, 13}
+
+
+def contended_page(timing, page):
+    """zxnext:4430-4434."""
+    if page >= 0x10:
+        return False
+    if timing == '48k':
+        return page in (0x0A, 0x0B)
+    if timing == '128k':
+        return bool(page & 0x02)
+    if timing == 'p3':
+        return bool(page & 0x08)
+    return False                                    # Pentagon: zxnext:4422
+
+
+def port_contended(timing, port):
+    """port_contend (zxnext:4437): A0 = 0, 7FFD under 128K/+3 timing, ULA+."""
+    if not port & 1:
+        return True
+    if port in (0xBF3B, 0xFF3B):
+        return True
+    p7ffd = (not port & 0x8000) and (port & 0x4000 or timing != 'p3') \
+        and port & 3 == 1 and not ((port >> 12) & 0xF == 0x1)       # zxnext:2552, 2557
+    return bool(p7ffd and timing in ('128k', 'p3'))
+
+
+class Contention:
+    """T-states (held ones included) for a run of bus events at 3.5 MHz,
+    from the beam position where the first T-state starts."""
+
+    def __init__(self, timing, mmu, line_len, lines, enabled=True):
+        self.timing, self.mmu, self.L, self.N = timing, mmu, line_len, lines
+        self.enabled = enabled and timing != 'pentagon'
+
+    def mem(self, addr):
+        return contended_page(self.timing, self.mmu[(addr >> 13) & 7])
+
+    def holds(self, q, v):
+        if not self.enabled or v >= 192:
+            return 0
+        k = 0
+        while q + 2 * k < 256 and ((q + 2 * k) & 15) in HOLD_NIBBLES:
+            k += 1
+        return k
+
+    def run(self, q, v, events):
+        """events: (addr, n): a check at addr (if contended) then n T-states;
+        (None, n): n T-states, no check; ('io', port): an I/O cycle."""
+        assert q & 1, f'a 3.5 MHz T-state starts on an odd hc_ula, not {q}'
+        total = 0
+
+        def step(check, n):
+            nonlocal q, v, total
+            for i in range(n):
+                if check and i == 0:
+                    h = self.holds(q, v)
+                    total += h
+                    self.advance(2 * h)
+                    q, v = self.q, self.v
+                total += 1
+                self.advance(2)
+                q, v = self.q, self.v
+
+        self.q, self.v = q, v
+        for e in events:
+            if e[0] == 'io':
+                port = e[1]
+                hc, ula = self.mem(port), port_contended(self.timing, port)
+                steps = ([(True, 1), (True, 3)] if hc and ula else
+                         [(True, 1)] * 4 if hc else
+                         [(False, 1), (True, 3)] if ula else [(False, 4)])
+                for check, n in steps:
+                    step(check, n)
+            else:
+                a, n = e
+                step(a is not None and self.mem(a), n)
+        return total
+
+    def advance(self, pixels):
+        self.q += pixels
+        while self.q >= self.L:
+            self.q -= self.L
+            self.v = (self.v + 1) % self.N

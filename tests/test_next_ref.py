@@ -125,6 +125,92 @@ class Tables(unittest.TestCase):
         self.assertEqual(ref.altrom_base(0b001), ref.ALTROM_48)
         self.assertEqual(ref.altrom_base(0b010, 0x00), ref.ALTROM_128)
 
+    def test_int_beam_reproduces_the_surveys_derived_offsets(self):
+        for key, want in ref.SURVEY_INT_BEFORE_ROW0.items():
+            self.assertEqual(ref.int_tstates_before_row0(*key), want, key)
+
+    def test_frame_figures(self):
+        want = {('48k', 50): 69888, ('48k', 60): 59136, ('128k', 50): 70908,
+                ('128k', 60): 60192, ('p3', 50): 70908, ('pentagon', 50): 71680}  # §2.2
+        for key, t in want.items():
+            self.assertEqual(ref.frame_tstates(*key), t, key)
+
+    def test_contention_pattern_is_the_classic_one(self):
+        c = ref.Contention('48k', [0xFF, 0xFF, 0x0A, 0x0B, 4, 5, 0, 1], 448, 312)
+        self.assertEqual([c.holds(q, 0) for q in range(1, 17, 2)], [0, 6, 5, 4, 3, 2, 1, 0])
+        self.assertEqual(c.holds(3, 192), 0, 'border row')
+        self.assertEqual(c.holds(259, 0), 0, 'right half of the line')
+        self.assertEqual(c.holds(243, 0), 6, 'the last group of the line')
+        four = [c.run(3, 0, [('io', p)]) - 4 for p in (0x40FE, 0x80FE, 0x40FF, 0x80FF)]
+        # From the first check at the "6" phase: C:1 (6), C:3 at the phase after (0);
+        # N:1, C:3 at the next phase (5); C:1 x4: 6, then 0, 6, 0 (12); N:4 (0).
+        self.assertEqual(four, [6, 5, 12, 0], 'C:1,C:3 / N:1,C:3 / C:1x4 / N:4')
+
+    def test_the_next_window_is_the_classic_table(self):
+        """The Next's rule in hc_ula terms (zxula.vhd) against the documented
+        table (docs/contention.md: delay 6,5,4,3,2,1,0,0 from the first
+        contended T-state of a line, 128 T a line), on random runs."""
+        import random
+        rnd = random.Random(1234)
+        mmu = [0xFF, 0xFF, 0x0A, 0x0B, 4, 5, 0, 1]
+        L, N = 448, 312
+
+        def classic(q, v, events):
+            t = 0
+            def delay():
+                if v >= 192 or q < 3:
+                    return 0
+                k = (q - 3) // 2
+                return [6, 5, 4, 3, 2, 1, 0, 0][k % 8] if k < 128 else 0
+            def adv(n):
+                nonlocal q, v
+                q += 2 * n
+                while q >= L:
+                    q -= L
+                    v = (v + 1) % N
+            for e in events:
+                steps = []
+                if e[0] == 'io':
+                    hc = 0x4000 <= e[1] < 0x8000
+                    ula = not e[1] & 1
+                    steps = ([(True, 1), (True, 3)] if hc and ula else [(True, 1)] * 4 if hc
+                             else [(False, 1), (True, 3)] if ula else [(False, 4)])
+                else:
+                    steps = [(e[0] is not None and 0x4000 <= e[0] < 0x8000, e[1])]
+                for check, n in steps:
+                    if check:
+                        d = delay()
+                        t += d
+                        adv(d)
+                    t += n
+                    adv(n)
+            return t
+
+        for trial in range(3000):
+            q, v = rnd.randrange(1, L, 2), rnd.choice([rnd.randrange(0, 192), rnd.randrange(0, N)])
+            ev = [rnd.choice([(0x4000 + rnd.randrange(0x4000), rnd.choice([1, 3, 4])),
+                              (0x8000 + rnd.randrange(0x8000), rnd.choice([3, 4])),
+                              (None, rnd.randrange(1, 5)),
+                              ('io', rnd.choice([0x40FE, 0x80FE, 0x40FF, 0x80FF]))])
+                  for _ in range(rnd.randrange(1, 40))]
+            c = ref.Contention('48k', mmu, L, N)
+            self.assertEqual(c.run(q, v, ev), classic(q, v, ev), f'q={q} v={v} {ev}')
+
+    @unittest.skipUnless(VHDL.exists(), f'needs the 3.02.02 VHDL at {VHDL}')
+    def test_contention_window_is_transcribed(self):
+        ula = (ref.SOURCES / 'src/video/zxula.vhd').read_text().splitlines()
+        self.assertIn('hc_adj <= i_hc(3 downto 0) + 1;', ula[581])
+        self.assertIn('(hc_adj(3 downto 2) /= "00")', ula[582])
+        self.assertIn("i_hc(8) = '0'", ula[582])
+
+    def test_port_contention_model(self):
+        self.assertTrue(ref.port_contended('48k', 0x00FE))
+        self.assertFalse(ref.port_contended('48k', 0x7FFD), '7FFD: 128K/+3 timing only')
+        self.assertTrue(ref.port_contended('128k', 0x7FFD))
+        self.assertTrue(ref.port_contended('128k', 0x3FFD), 'A14 not decoded under 128K')
+        self.assertFalse(ref.port_contended('p3', 0x3FFD))
+        self.assertFalse(ref.port_contended('128k', 0x1FFD), '1FFD is not 7FFD (zxnext:2552)')
+
     def test_reset_type_model(self):
         for n, want in enumerate(ref.RESET_TYPE_READS):
             self.assertEqual(ref.reset_type_after(n), want, f'after {n} soft resets')
