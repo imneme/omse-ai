@@ -122,7 +122,7 @@ class Automap(NextCase):
         a, b = go(zx, 0x0000)
         self.assertEqual(a, 0x44, 'the fetch at 1FF8h is divMMC\'s, its operand the ROM\'s '
                                   '(BB b6, zxnext:2849; divmmc:136)')
-        self.assertEqual(b, 0x22)
+        self.assertEqual(b, 0x99, 'delayed: divMMC\'s LD B never ran as an opcode (Ratio)')
         self.assertEqual(zx.slot_page(0), ('rom', 0), 'unmapped')
 
     def test_retn_unmaps(self):
