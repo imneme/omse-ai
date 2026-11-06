@@ -23,6 +23,9 @@
 // SPI master and the fast boot are the next layers (machine-build-notes.md).
 
 #include "next_audio.h"                // the sound (Slide Fern): generators, DACs, beeper, mixer
+#include "next_dma.h"                  // the zxnDMA (Kelp Fern)
+#include "next_serial.h"               // the UARTs, the I2C bus and its optional DS1307 (Ratio Fern)
+#include <array>
 #include "z80.h"
 #include "sdcard.h"
 
@@ -58,6 +61,7 @@ enum Kind : uint8_t { K_NONE, K_SRAM, K_BRAM5, K_BRAM7, K_BOOT };
 enum Tag : uint8_t { T_PAGE, T_ROM, T_ALTROM, T_BOOT, T_CONFIG, T_DIVROM, T_DIV, T_MFROM, T_MFRAM, T_L2, T_NONE };
 
 struct IoEvent { uint64_t t28, cpu_clocks; uint16_t port; uint8_t value, write; };
+struct DmaEvent { uint64_t t28, cpu_clocks; uint16_t addr; uint8_t value, kind; };   // §9.1 (16)
 struct IntEvent { uint64_t start, end; };
 
 }  // namespace
@@ -163,8 +167,25 @@ struct ZXN {
     bool mf_fetch66 = false;            // the fetch from 0x0066 that pages it in, while it lasts
     bool dm_button = false;             // divmmc.vhd's button_nmi
     uint16_t joy[2] = {0, 0};           // the joysticks: X Z Y START A C B U D L R in bits 10:0 (zxnext:3398-3400)
+    uint8_t mouse_x = 0, mouse_y = 0;   // the Kempston mouse as the PS/2 side counts it (ps2_mouse.v:186-203)
+    uint8_t mouse_btn = 0, mouse_wheel = 0;   // b0 left, b1 right, b2 middle; the wheel's 4-bit count
+    nserial::Uart uart[2];              // 0 the ESP's, 1 the Pi's (uart.vhd)
+    int uart_sel = 0;                   // port 0x153B b6 (uart.vhd:262-279)
+    uint16_t uart_req = 0;              // the UARTs' interrupt requests at the last tick (im2p's int_req_d)
+    bool serial_on = true;              // a UART may be busy: step them (one test a tick when they're idle)
+    bool i2c_scl = true, i2c_sda = true;      // our open-drain outputs, 1 released (zxnext:3189-3211)
+    bool bus_scl = true, bus_sda = true;      // the bus as all its drivers make it
+    nserial::Rtc rtc;                   // the optional DS1307 at 0x68 (none by default, §9.1 (18))
+    bool i2c_logging = false;
+    std::vector<std::array<uint64_t, 3>> i2c_log;
     uint8_t ay_reg[3][16] = {{0}};      // the AYs' register files (ym2149.vhd), chip 0 = AY_ID 11, 1 = 10, 2 = 01
     nextaudio::Audio audio;             // what makes the sound (next_audio.h)
+    DmaBus db;                          // the zxnDMA and the bus request (next_dma.h, next_dma_bus.inc)
+    uint64_t bus_pins = 0;              // the bus in the last T-state: the CPU's pins, or the DMA's while it has it
+    bool io_now = false;                // io_out/io_in: no time passes (§9.1 (6))
+    bool spi_last_d = false;            // spi_master's state_last_d (spi:154-160), for the DMA's SPI wait
+    bool dma_logging = false;
+    std::vector<DmaEvent> dma_log;
     uint8_t ay_addr[3] = {0, 0, 0};     // each chip's selected register (5 bits)
     int ay_sel = 0;                     // turbosound.vhd's ay_select, as a chip number
     uint8_t ulap_mode = 0, ulap_index = 0;   // port 0xBF3B (zxnext:4466-4478)
@@ -498,6 +519,111 @@ void spr_mirror_write(ZXN& z, int n, int v) {
     }
 }
 
+// ---- the UARTs' and I2C's glue (zxnext:2237-2293, 2587-2598, 3180-3226, 3298-3379, 3494-3497)
+const uint64_t F_SYS = 28000000;        // the master clock; NR 0x11's VGA settings (28.57-33 MHz) aren't tracked yet
+inline bool uart_rerouted(const ZXN& z, int n) {                     // NR 0x0B: b7 on, b5 UART mode, b0 which UART
+    return (z.nr[0x0B] & 0x80) && (z.nr[0x0B] & 0x20) && (z.nr[0x0B] & 1) == n;
+}
+inline bool uart_pi(const ZXN& z) { return z.nr[0xA0] & 0x10; }      // pi_uart_en = NR 0xA0 b4 (zxnext:2238)
+// the Pi is fixed: it sends on GPIO 14 and listens on 15 (ruling f), so the Next meets it only with b5 swapping its
+// pins (pi_uart_rx from GPIO 14, Tx on 15, zxnext:2282-2293); with b5 clear both face the Pi's own pins
+inline bool uart_pi_talks(const ZXN& z) { return uart_pi(z) && (z.nr[0xA0] & 0x20); }
+void int_raise(ZXN& z, int i, bool unq);
+void serial_edges(ZXN& z);
+void serial_tick(ZXN& z) {
+    const int side = (z.nr[0x0B] >> 4) & 1;                           // b4: the left or right joystick port
+    const bool jrx = !(z.joy[side] & 0x20), jcts_n = !(z.joy[side] & 0x10);   // not JOY(5), not JOY(4)
+    for (int n = 0; n < 2; n++) {
+        nserial::Uart& u = z.uart[n];
+        const bool rr = uart_rerouted(z, n);
+        const bool host = n == 0 || uart_pi_talks(z);
+        const bool rx = rr ? jrx : host ? u.line_level : true;       // undriven pins idle high
+        // UART 1's CTS: from the Pi's RTS (GPIO 17) with b5; clear unless the Pi UART and flow control are on (2293).
+        // Without b5 it comes from GPIO 16, which the fixed Pi doesn't drive and which has no pull-up (accel_io[16]
+        // in zxnext_pins_issue4.xdc: IOSTANDARD and DRIVE only), so on the machine it's undefined; read here as high,
+        // not clear (ruling h; no test may depend on it)
+        const bool cts_n = rr ? jcts_n : n == 0 ? u.host_cts_n
+                         : (uart_pi(z) && (u.frame & 0x20)) ? (uart_pi_talks(z) ? u.host_cts_n : true) : false;
+        nserial::uart_tick(u, z.t28, false, rx, cts_n, !rr && host);
+        const bool wire = (!rr && host) ? u.t.out : true;             // what the host's receiving wire carries
+        if (wire != u.wire) {
+            u.wire = wire;
+            if (u.tx_logging) u.tx_events.push_back({z.t28, wire});
+        }
+    }
+    serial_edges(z);
+}
+// the UARTs' interrupt requests (zxnext:1900-1909), edge-detected (im2p:92-101); status records whatever's enabled
+void serial_edges(ZXN& z) {
+    const uint16_t req = (z.uart[1].o_tx_empty << 13) | (z.uart[0].o_tx_empty << 12) |
+                         ((z.uart[1].o_near_full || (z.uart[1].o_avail && !(z.nr[0xC6] & 0x20))) << 2) |
+                         ((z.uart[0].o_near_full || (z.uart[0].o_avail && !(z.nr[0xC6] & 0x02))) << 1);
+    const uint16_t rise = req & ~z.uart_req;
+    z.uart_req = req;
+    for (int i : {1, 2, 12, 13}) if (rise & (1 << i)) int_raise(z, i, false);
+}
+uint8_t uart_read(ZXN& z, int reg) {
+    nserial::Uart& u = z.uart[z.uart_sel];
+    u.wake = 4;
+    z.serial_on = true;
+    switch (reg) {
+        case 0: {                                                     // 0x143B: the Rx FIFO's head, or 0 (uart.vhd:322-343)
+            const uint8_t v = u.rxf.empty() ? 0 : u.rxf.head() & 0xFF;
+            u.rxf.pop();
+            return v;
+        }
+        case 1: return (z.uart_sel ? 0x40 : 0) | u.presc_msb;         // 0x153B
+        case 2: return u.frame;                                       // 0x163B
+        default: {                                                    // 0x133B: status, its errors cleared by the read
+            const bool brk = u.r.state == nserial::Rx::ERROR && u.r.shift == 0;
+            const bool busy = u.t.state != nserial::Tx::IDLE || (u.frame & 0xC0);
+            const uint8_t v = brk << 7 | u.st_framing << 6 | ((u.rxf.head() >> 8) & !u.rxf.empty()) << 5 |
+                              (u.txf.empty() && !busy) << 4 | u.rxf.near_full() << 3 | u.st_overflow << 2 |
+                              u.txf.full() << 1 | !u.rxf.empty();
+            u.st_overflow = u.st_framing = false;                     // (uart.vhd:528-533: tx_rd's falling edge)
+            return v;
+        }
+    }
+}
+void uart_write(ZXN& z, int reg, uint8_t v) {
+    z.serial_on = true;
+    switch (reg) {
+        case 0: {                                                     // 0x143B: the prescaler's 14 low bits, 7 at a time
+            nserial::Uart& u = z.uart[z.uart_sel];
+            u.presc_lsb = (v & 0x80) ? (u.presc_lsb & 0x7F) | (v & 0x7F) << 7 : (u.presc_lsb & ~0x7Fu) | (v & 0x7F);
+            u.wake = 4;
+            break;
+        }
+        case 1:                                                       // 0x153B: select (b6), and b2:0 the prescaler's top if b4
+            z.uart_sel = (v >> 6) & 1;
+            if (v & 0x10) z.uart[z.uart_sel].presc_msb = v & 7;
+            z.uart[z.uart_sel].wake = 4;
+            break;
+        case 2: {                                                     // 0x163B
+            nserial::Uart& u = z.uart[z.uart_sel];
+            u.frame = v; u.wake = 4;
+            if (v & 0x80) {     // b7 holds both FIFOs, the status and both state machines in reset (uart.vhd:385, 528,
+                                // uart_rx:208, uart_tx:162); a program's next access is an instruction later, so at once
+                u.rxf.reset(); u.txf.reset(); u.avail_d = false; u.byte_d = 0; u.st_overflow = u.st_framing = false;
+                u.r.state = nserial::Rx::PAUSE; u.t.state = nserial::Tx::IDLE;
+            }
+            break;
+        }
+        default: z.uart[z.uart_sel].txf.push(v); z.uart[z.uart_sel].wake = 4;         // 0x133B: into the Tx FIFO
+    }
+}
+// the bus after a change of our outputs: the DS1307 sees each change and may answer on SDA (it never drives SCL)
+void i2c_update(ZXN& z) {
+    for (int k = 0; k < 4; k++) {
+        const bool scl = z.i2c_scl, sda = z.i2c_sda && z.rtc.sda;
+        if (scl == z.bus_scl && sda == z.bus_sda) return;
+        const bool scl0 = z.bus_scl, sda0 = z.bus_sda;
+        z.bus_scl = scl; z.bus_sda = sda;
+        if (z.i2c_logging) z.i2c_log.push_back({z.t28 + 1, (uint64_t)scl, (uint64_t)sda});   // at the next CLK_28 edge
+        nserial::rtc_bus(z.rtc, scl0, sda0, scl, sda, z.t28 + 1, F_SYS);
+    }
+}
+
 int nr_read(ZXN& z, int n) {
     switch (n) {
         case 0x34: return z.spr_mirror & 0x7F;                        // '0' & the mirror's sprite (zxnext:5939-5940)
@@ -562,6 +688,7 @@ int nr_read(ZXN& z, int n) {
 
 void nr_write(ZXN& z, int n, int v) {
     v &= 0xFF;
+    if (n == 0x0B || n == 0xA0 || n == 0xC6) { z.uart[0].wake = z.uart[1].wake = 4; z.serial_on = true; }   // routing, interrupts
     if (n >= 0x2C && n <= 0x2E && (z.nr[0x08] & 8)) {               // the DACs from next registers (soundrive:66-90)
         if (n == 0x2C) z.audio.dac[1] = v;                            // left: B
         else if (n == 0x2E) z.audio.dac[2] = v;                       // right: C
@@ -803,6 +930,17 @@ void nr_write(ZXN& z, int n, int v) {
 
 void do_reset(ZXN& z, bool hard) {
     z.spr_ai = z.spr_pi = z.spr_mirror = 0;                           // sprites.vhd's reset (the RAMs keep)
+    z.uart_sel = 0;                                                   // the UARTs' reset (uart.vhd:262-319): FIFOs, state
+    for (auto& u : z.uart) {
+        if (hard) u.hard_reset();
+        u.rxf.reset(); u.txf.reset(); u.r = nserial::Rx(); u.r.state = nserial::Rx::PAUSE; u.t = nserial::Tx();
+        u.avail_d = false; u.byte_d = 0; u.st_overflow = u.st_framing = false; u.wake = 4;
+    }
+    z.uart_req = 0;                                                   // im2p's int_req_d: high requests rise again
+    z.serial_on = true;
+    for (auto& u : z.uart) { u.o_tx_empty = true; u.o_avail = u.o_near_full = false; }
+    z.i2c_scl = z.i2c_sda = true;                                     // released (zxnext:3193, 3204)
+    i2c_update(z);
     z.spr_status = 0;
     z.spr_state = 0; z.spr_idx = 0; z.spr_vcount = 0; z.spr_disp = 0; z.spr_t = z.t28; z.spr_swap_at = 0;
     z.sa_rt = z.sa_h = z.sa_vis = z.sa_rot = z.sa_xm = z.sa_ym = false;
@@ -867,6 +1005,7 @@ void do_reset(ZXN& z, bool hard) {
     z.cop_data = 0;
     z.nmi_flags = 0;                                                  // (zxnext:3784-3785, 3797-3798)
     ay_reset(z);
+    z.db.reset();                                                     // (dma:211-245; t80n:1690)
     z.nmi_cause = z.nmi_state = 0;                                    // (zxnext:2057-2060, 2113)
     z.nmi_pending_mf = z.nmi_pending_dm = false;
     z.mf_active = z.mf_enable = z.mf_fetch66 = false;                 // (multiface:63-120)
@@ -886,6 +1025,9 @@ void do_reset(ZXN& z, bool hard) {
     z.cpu.z80n = true;                                                // the Z80N's instructions (Strobe Fern's z80.h)
     z.stackless_retn = false;
     remap(z);
+    // the Tx FIFOs are empty through the reset, so those requests rise at the first clock after it and their statuses
+    // set, enabled or not (im2p:92-101, 156-160; Loam's foil): nothing can look sooner, so it's done here
+    serial_edges(z);
 }
 
 // ---- ports (ref §5.1; zxnext:2537-2658). Layer 2: the Next register ports, 0xFE, 0xFF, and the legacy paging ports.
@@ -919,7 +1061,13 @@ uint8_t floating_bus(const ZXN& z) {
     return scr[((v & 0xC0) << 5) | ((v & 7) << 8) | ((v & 0x38) << 2) | col];
 }
 
+inline bool dma_port_decode(const ZXN& z, uint16_t port);       // port_dma (next_dma_bus.inc)
+inline bool dma_port(const ZXN& z, uint16_t port);
+uint8_t dma_port_read(ZXN& z, uint16_t port);
+void dma_port_write(ZXN& z, uint16_t port, uint8_t v);
+
 uint8_t io_read(ZXN& z, uint16_t port) {
+    if (dma_port(z, port)) return dma_port_read(z, port);           // the DMA (next_dma_bus.inc)
     if (port == 0x243B) return z.nr_sel;                              // both decode all 16 bits (ref §4.1)
     if (port == 0x253B) return nr_read(z, z.nr_sel);
     if (port == 0x303B && port_en(z, 14)) {                           // sprite status, cleared by the read (979-995)
@@ -939,6 +1087,17 @@ uint8_t io_read(ZXN& z, uint16_t port) {
         for (int i = 0; i < z.spi_npend; i++)                         // (spi_master:155-175)
             if (z.spi_pend[i].due <= z.cpu_clocks + 1) v = z.spi_pend[i].byte;
         return v;
+    }
+    if ((port & 0xFF) == 0x3B && (port >> 11) == 2 && (((port >> 10) ^ ((port >> 9) & (port >> 8))) & 1) && port_en(z, 12))
+        return uart_read(z, (port >> 8) & 3);                         // the UARTs (zxnext:2598, 3327)
+    if ((port == 0x103B || port == 0x113B) && port_en(z, 10))         // I2C: the lines as the bus has them (3215-3226)
+        return 0xFE | (port == 0x103B ? z.bus_scl : z.bus_sda);
+    if ((port & 0xFF) == 0xDF && port_en(z, 13)) {                    // the Kempston mouse (zxnext:2627-2629, 3496-3520)
+        const int a = (port >> 8) & 0x0F;
+        if (a == 0x0B) return z.mouse_x;
+        if (a == 0x0F) return z.mouse_y;
+        if (a == 0x0A)
+            return (z.mouse_wheel & 15) << 4 | 8 | (~z.mouse_btn & 4) | (~z.mouse_btn & 1) << 1 | (~z.mouse_btn & 2) >> 1;
     }
     if ((port & 0xFF) == 0x1F && port_en(z, 6) && joy_port_on(z, 0x1F)) return joy_read(z, 0x1F);   // (zxnext:2633)
     if ((port & 0xFF) == 0x37 && port_en(z, 7) && joy_port_on(z, 0x37)) return joy_read(z, 0x37);   // (zxnext:2634)
@@ -963,8 +1122,15 @@ uint8_t io_read(ZXN& z, uint16_t port) {
 }
 
 void io_write(ZXN& z, uint16_t port, uint8_t v) {
+    if (dma_port(z, port)) dma_port_write(z, port, v);              // the DMA (next_dma_bus.inc)
     if (port == 0x243B) { z.nr_sel = v; return; }
     if (port == 0x253B) { nr_write(z, z.nr_sel, v); return; }
+    if ((port & 0xFF) == 0x3B && (port >> 11) == 2 && (((port >> 10) ^ ((port >> 9) & (port >> 8))) & 1) && port_en(z, 12))
+        uart_write(z, (port >> 8) & 3, v);                            // the UARTs (zxnext:2598, 3327)
+    if ((port == 0x103B || port == 0x113B) && port_en(z, 10)) {       // I2C: b0 drives the line, 0 low (3189-3211)
+        (port == 0x103B ? z.i2c_scl : z.i2c_sda) = v & 1;
+        i2c_update(z);
+    }
     if (port_en(z, 14)) {                                             // sprites (zxnext:2638-2640, 2746-2749)
         if (port == 0x303B) spr_select(z, v);
         else if ((port & 0xFF) == 0x57) spr_attr_port(z, v);
@@ -1918,27 +2084,35 @@ void snoop_fetch(ZXN& z, uint8_t op) {
     }
 }
 
+#include "next_dma_bus.inc"
+
 bool cpu_edge(ZXN& z) {
     z80_t saved = z.cpu;
     uint64_t saved_pins = z.pins;
+    const uint64_t bus_before = z.bus_pins;                           // the CPU's pins, or the DMA's
+    const DmaBus db_saved = z.db;
     uint64_t p = z.pins;
     const bool p3w = p3_wait_now(z);
     if (z.wait_next || p3w) p |= Z80_WAIT; else p &= ~Z80_WAIT;
-    im2_edge(z, saved_pins);
-    nmi_edge(z, saved_pins);
+    const bool dma_bus = dma_edge(z, bus_before, z.wait_next, p3w);     // the DMA's edge, and BUSRQ/BUSAK
+    im2_edge(z, bus_before);
+    nmi_edge(z, bus_before);
     if (nmi_line(z)) p |= Z80_NMI; else p &= ~Z80_NMI;
     if (z.int_low || im2_int(z)) p |= Z80_INT; else p &= ~Z80_INT;     // pulse_int_n and im2_int_n (zxnext:1799)
-    p = z80_tick(&z.cpu, p);
-    if (z.stop_on && !z.first_edge && z80_opdone(&z.cpu)) {
+    if (dma_bus) p = dma_pins(z);                                     // the CPU frozen, the bus the DMA's
+    else p = z80_tick(&z.cpu, p);
+    if (!dma_bus && z.stop_on && !z.first_edge && z80_opdone(&z.cpu)) {
         uint16_t a = Z80_GET_ADDR(p);
         if (a >= z.stop_lo && a <= z.stop_hi) {
             z.cpu = saved;
             z.pins = saved_pins;
+            z.db = db_saved;
             z.hit = true;
             z.hit_pc = a;
             return false;
         }
     }
+    if (!dma_bus) z.db.mc_end = z80_mcycle_end(&z.cpu);
     z.first_edge = false;
     z.wait_next = false;
     z.cpu_clocks++;
@@ -1976,10 +2150,12 @@ bool cpu_edge(ZXN& z) {
         remap(z);
     }
     if (fetch) dm_fetch(z, Z80_GET_ADDR(p));
-    classify(z, p);
+    if (dma_bus) dma_classify(z, p); else classify(z, p);            // (the DMA's: next_dma_bus.inc)
     z.p3_waiting = p3w;
     if (!p3w) z.p3_mem = (p & Z80_MREQ) && (p & (Z80_RD | Z80_WR)) && !(p & Z80_RFSH) && contended_page(z, Z80_GET_ADDR(p));
-    if (p & Z80_MREQ) {
+    if (dma_bus) z.p3_mem = z.p3_waiting = false;                    // the DMA's +3 WAIT is its own
+    if (dma_bus) dma_cycle(z, p);                                     // the DMA's bus cycle (next_dma_bus.inc)
+    else if (p & Z80_MREQ) {
         uint16_t a = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
             Kind k;
@@ -2030,6 +2206,7 @@ bool cpu_edge(ZXN& z) {
             z.spi_npend--;
         }
         if (old_state < 16) z.spi_state = old_state + 1;
+        z.spi_last_d = old_state == 15;
         const uint16_t port = Z80_GET_ADDR(p);
         if ((p & Z80_IORQ) && !(p & Z80_M1) && (p & (Z80_RD | Z80_WR)) && (port & 0xFF) == 0xEB && port_en(z, 11) &&
             (old_state == 16 || old_state == 15)) {
@@ -2043,7 +2220,7 @@ bool cpu_edge(ZXN& z) {
     // the effective speed follows the programmed one only between bus cycles (ref §1.3)
     // (the VHDL samples MREQ, IORQ and M1 as they were before the edge: the previous T-state's pins, not this one's;
     // Speccy-Zone's review)
-    if (!(saved_pins & (Z80_MREQ | Z80_IORQ | Z80_M1))) {
+    if (!(bus_before & (Z80_MREQ | Z80_IORQ | Z80_M1)) && !db_saved.busak) {   // and the DMA not holding it (5714)
         z.speed_eff = z.speed_prog;
         if (hc_ula(z) & 0x100) z.eff_cd = z.nr[0x08] & 0x40;          // in the line's right half only (zxnext:5729-5731)
     }
@@ -2053,13 +2230,18 @@ bool cpu_edge(ZXN& z) {
         z.int_low = false;
         z.int_log.back().end = z.t28 + 1;                             // the first tick that starts with INT high
     }
-    z.pins = p;
+    if (!dma_bus) z.pins = p;
+    z.bus_pins = p;
     return true;
 }
 
 // One 28 MHz master tick. Returns false if a stop was due before anything moved.
 void spr_swap(ZXN& z);
 bool master_tick(ZXN& z) {
+    if (z.serial_on) {                                                // stepped while busy, free when idle
+        serial_tick(z);
+        z.serial_on = z.uart[0].active() || z.uart[1].active();
+    }
     if (z.spr_swap_at == z.t28 && z.spr_swap_at) spr_swap(z);       // line_reset_re: the next line's render begins
     if (z.in_latch_at == z.t28 && z.in_latch_at) {                    // the 253Bh register takes INT (cpu_edge's IN)
         z.in_latch_at = 0;
@@ -2281,7 +2463,55 @@ int zxn_io_in(ZXN* z, int port) { return io_read(*z, port & 0xFFFF); }
 void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
 uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
 int zxn_cvc(ZXN* z) { return cvc(*z); }                          // DESIGN.md §9
-void zxn_set_joy(ZXN* z, int left, int right) { z->joy[0] = left & 0x7FF; z->joy[1] = right & 0x7FF; }
+void zxn_set_joy(ZXN* z, int left, int right) {
+    z->joy[0] = left & 0x7FF; z->joy[1] = right & 0x7FF;
+    z->uart[0].wake = z->uart[1].wake = 4;                            // a joystick port may carry a UART
+    z->serial_on = true;
+}
+void zxn_uart_feed(ZXN* z, int n, const uint8_t* data, int len, uint64_t bit_t28, int bits, int parity, int stops) {
+    z->uart[n & 1].feed(z->t28, data, len, bit_t28, bits, parity, stops);
+    z->serial_on = true;
+}
+void zxn_uart_feed_levels(ZXN* z, int n, const uint8_t* levels, const uint64_t* ticks, int count) {
+    z->uart[n & 1].feed_levels(z->t28, levels, ticks, count);
+    z->serial_on = true;
+}
+void zxn_uart_tx_logging(ZXN* z, int n, int on) {
+    nserial::Uart& u = z->uart[n & 1];
+    u.tx_logging = on;
+    if (!on) u.tx_events.clear();
+}
+int zxn_uart_tx_log_len(ZXN* z, int n) { return (int)z->uart[n & 1].tx_events.size(); }
+void zxn_uart_tx_log_get(ZXN* z, int n, int i, uint64_t* out) {
+    out[0] = z->uart[n & 1].tx_events[i].first; out[1] = z->uart[n & 1].tx_events[i].second;
+}
+int zxn_uart_sent_len(ZXN* z, int n) { return (int)z->uart[n & 1].sent.size(); }
+void zxn_uart_sent_get(ZXN* z, int n, int i, uint64_t* out) { out[0] = z->uart[n & 1].sent[i].first; out[1] = z->uart[n & 1].sent[i].second; }
+void zxn_uart_sent_clear(ZXN* z, int n) { z->uart[n & 1].sent.clear(); }
+void zxn_uart_cts(ZXN* z, int n, int clear) { z->uart[n & 1].host_cts_n = !clear; z->uart[n & 1].wake = 4; z->serial_on = true; }
+int zxn_uart_rts(ZXN* z, int n) {                                     // -1: not driven toward the host (ruling d)
+    n &= 1;
+    if (uart_rerouted(*z, n) || (n == 1 && !(uart_pi_talks(*z) && (z->uart[1].frame & 0x20)))) return -1;
+    return !z->uart[n].rtr_n;
+}
+void zxn_i2c_rtc(ZXN* z, int attach, int sec, int min, int hour, int dow, int date, int month, int year) {
+    nserial::Rtc& c = z->rtc;
+    if (attach) {
+        c = nserial::Rtc();
+        c.attached = true;
+        c.regs[0] = nserial::bcd_put(sec); c.regs[1] = nserial::bcd_put(min); c.regs[2] = nserial::bcd_put(hour);
+        c.regs[3] = (uint8_t)dow; c.regs[4] = nserial::bcd_put(date); c.regs[5] = nserial::bcd_put(month);
+        c.regs[6] = nserial::bcd_put(year % 100); c.regs[7] = 0;
+        c.anchor = z->t28;
+    } else c = nserial::Rtc();
+    i2c_update(*z);
+}
+void zxn_i2c_logging(ZXN* z, int on) { z->i2c_logging = on; if (!on) z->i2c_log.clear(); }
+int zxn_i2c_log_len(ZXN* z) { return (int)z->i2c_log.size(); }
+void zxn_i2c_log_get(ZXN* z, int i, uint64_t* out) { for (int k = 0; k < 3; k++) out[k] = z->i2c_log[i][k]; }
+void zxn_set_mouse(ZXN* z, int x, int y, int buttons, int wheel) {
+    z->mouse_x = x & 0xFF; z->mouse_y = y & 0xFF; z->mouse_btn = buttons & 7; z->mouse_wheel = wheel & 15;
+}
 void zxn_button(ZXN* z, int which) {                                  // 1 = M1 (multiface), 2 = DRIVE (divMMC): a press
     if (which == 1 && (z->nr[0x06] & 0x08)) nmi_request(*z, true);    // needs NR 0x06 b3 (zxnext:2049)
     if (which == 2 && (z->nr[0x06] & 0x10)) nmi_request(*z, false);   // b4 (2050)
@@ -2301,7 +2531,14 @@ int zxn_f9_width() { return F9_W; }
 int zxn_fb_width() { return FB_W; }
 int zxn_fb_height() { return FB_H; }
 int zxn_border(ZXN* z) { return z->border; }
-void zxn_io_out(ZXN* z, int port, int v) { io_write(*z, port & 0xFFFF, v & 0xFF); }
+void zxn_io_out(ZXN* z, int port, int v) { z->io_now = true; io_write(*z, port & 0xFFFF, v & 0xFF); z->io_now = false; }
+int zxn_busak(ZXN* z) { return z->db.busak; }
+void zxn_dma_logging(ZXN* z, int on) { if (on) z->dma_log.clear(); z->dma_logging = on != 0; }
+int zxn_dma_log_len(ZXN* z) { return (int)z->dma_log.size(); }
+void zxn_dma_log_get(ZXN* z, int i, uint64_t* out) {
+    const DmaEvent& e = z->dma_log[i];
+    out[0] = e.t28; out[1] = e.cpu_clocks; out[2] = e.kind; out[3] = e.addr; out[4] = e.value;
+}
 
 int zxn_int_log_len(ZXN* z) { return (int)z->int_log.size(); }
 void zxn_int_log_get(ZXN* z, int i, uint64_t* out) { out[0] = z->int_log[i].start; out[1] = z->int_log[i].end; }
