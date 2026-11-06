@@ -11,9 +11,9 @@ LIB = lib/libzxcore.so
 SHARED = -shared
 endif
 
-$(LIB): src/zxcore.cpp src/z80.h src/ay38910.h src/sdcard.h
+$(LIB): src/zxcore.cpp src/nextcore.cpp src/nextregs_reset.inc src/z80.h src/ay38910.h src/sdcard.h
 	@mkdir -p lib
-	$(CXX) $(CXXFLAGS) $(SHARED) -o $@ src/zxcore.cpp
+	$(CXX) $(CXXFLAGS) $(SHARED) -o $@ src/zxcore.cpp src/nextcore.cpp
 
 test: $(LIB)
 	./tests/run.sh
