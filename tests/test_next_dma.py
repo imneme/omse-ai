@@ -27,6 +27,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import nextref as ref                                   # noqa: E402
 from test_next_regs import Next, needs_next, NextCase, bare  # noqa: E402
+from test_next_timing import launch                      # noqa: E402
+from test_next_interrupts import main_loop, vector, CODE, F48  # noqa: E402
 
 ZXN, Z80 = 0x6B, 0x0B
 DEC, INC, FIXED = 0, 1, 2
@@ -111,6 +113,31 @@ class Registers(NextCase):
         zx.io_out(ZXN, 0x06)
         zx.io_in(ZXN)
         self.assertEqual(reads(zx, 1), [0x05], 'A7h starts the sequence again (dma:694-722)')
+
+    def test_wr4_with_only_bit_4_locks_the_register_writes(self):
+        """WR4 with b4 set and b2, b3 clear sends the write sequence to
+        R4_BYTE_2 (dma:607-608), whose case is commented out (dma:835-857), so
+        `when others => null` (dma:891) keeps it there: every later write is
+        lost, C3h included, until a reset (dma:229). Reads still answer.
+        (Found by Tally's second-sources reader; checked in the VHDL.)"""
+        zx = machine()
+        zx.write(A, pattern(4))
+        zx.write(B, bytes(4))
+        zx.io_out(ZXN, 0x91)
+        zx.io_out(ZXN, 0xC3)
+        zx.dma_log(True)
+        program(zx, A, B, 4)
+        zx.run_ticks(20000)
+        self.assertEqual(zx.dma_events, [], 'nothing written after 91h reaches the DMA')
+        self.assertEqual(zx.read(B, 4), bytes(4))
+        self.assertEqual(reads(zx, 3, restart=False), [0x3A, 0x00, 0x00], 'reads still answer')
+        zx.reset()
+        zx.load(0x8000, COUNTING_LOOP)
+        zx.set_regs(pc=0x8000, sp=0x7FF0, hl=0)
+        zx.dma_log(True)
+        program(zx, A, B, 4)
+        zx.run_ticks(20000)
+        self.assertEqual(zx.read(B, 4), pattern(4), 'a reset frees it')
 
     def test_reset_command(self):
         zx = machine()
@@ -397,6 +424,68 @@ class Timing(NextCase):
                 clocks, ticks = self.intervals(zx)
                 self.assertEqual(clocks, [r, w] * 5 + [r])
                 self.assertEqual(ticks, clocks, '28 MHz: a t28 a clock')
+
+
+ISR = bytes([0x3A, 0x00, 0x98, 0x3C, 0x32, 0x00, 0x98,   # LD A,(9800h); INC A; LD (9800h),A
+             0xFB, 0xED, 0x4D])                           # EI; RETI (at 9208h)
+BLOCK = 30000                                           # fixed to fixed: about 2.6 frames at 48K
+
+
+@needs_next
+class Interrupts(NextCase):
+    """NEXT-MACHINE §6.6. In hardware IM2 mode a source whose bit is set in NR
+    CC-CE drives im2_dma_int from its request until RETI (im2d:151;
+    zxnext:1916-1917), which holds the DMA's delay (zxnext:1960-1967): the DMA
+    gives the bus up after the byte under way (dma:426-428) and waits in
+    START_DMA (dma:269-275); RETI's own states keep it waiting through the pops
+    (im2c:184-189, 238). In pulse mode the IM2 devices are held in reset
+    (im2p:105), so nothing but an NMI interrupts a transfer."""
+
+    def setup(self, c0, cc):
+        zx = bare(timing='48k')
+        zx.nr_write(0x03, 0x00)                         # boot ROM off (see test_next_interrupts)
+        zx.nr_write(0xC0, c0)
+        zx.nr_write(0xCC, cc)
+        loop = main_loop(zx, 2)
+        zx.load(0x9200, ISR)
+        vector(zx, 0x90, (c0 & 0xE0) | 11 << 1, 0x9200)  # the ULA's vector
+        vector(zx, 0x90, 0xFF, 0x9200)                  # pulse mode's
+        launch(zx, CODE)
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=2 * F48), 'a first interrupt, DMA idle')
+        self.assertTrue(zx.run_until_pc(loop, max_ticks=F48))   # back, nothing pending: the next
+        zx.poke(0x9800, 0)                                      # one is about a frame away
+        zx.dma_log(True)
+        program(zx, 0xA000, 0xC000, BLOCK, a_mode=FIXED, b_mode=FIXED)
+        return zx
+
+    def test_an_enabled_im2_source_takes_the_bus_between_bytes(self):
+        zx = self.setup(0xA1, 0x01)                     # hardware IM2; NR CC b0: the ULA
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=2 * F48), 'the ULA\'s handler')
+        n = len(zx.dma_events)
+        self.assertTrue(0 < n < 2 * BLOCK, f'entered mid-block ({n} cycles done)')
+        self.assertEqual(n % 2, 0, 'between bytes')
+        self.assertFalse(zx.busak)
+        self.assertTrue(zx.run_until_pc(0x9208, max_ticks=F48))
+        self.assertEqual(len(zx.dma_events), n, 'the DMA stays off the bus through the handler')
+        for _ in range(4000):
+            zx.run_ticks(1)
+            if len(zx.dma_events) > n:
+                break
+        self.assertGreater(len(zx.dma_events), n, 'the DMA came back')
+        self.assertEqual(zx.regs()['sp'], 0x7FF0, 'only after RETI\'s pops (im2c:184-189)')
+        zx.run_ticks(4 * F48)
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'and finished the block')
+        self.assertGreaterEqual(zx.peek(0x9800), 2, 'every interrupt in the block served')
+
+    def test_without_its_enable_the_interrupt_waits_for_the_block(self):
+        zx = self.setup(0xA1, 0x00)
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=4 * F48))
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'continuous mode kept the bus to the end')
+
+    def test_pulse_mode_never_interrupts_the_dma(self):
+        zx = self.setup(0xA0, 0x01)                     # pulse mode, NR CC b0 set all the same
+        self.assertTrue(zx.run_until_pc(0x9200, max_ticks=4 * F48))
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'the IM2 devices are held in reset (im2p:105)')
 
 
 @needs_next
