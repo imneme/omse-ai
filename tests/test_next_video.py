@@ -244,6 +244,16 @@ class ModelSense(unittest.TestCase):
             orders.add(tuple(pic(sprites_l2_scene(order))))
         self.assertEqual(len(orders), 8, 'each layer order draws differently')
 
+    def test_wrap_scene_wraps(self):
+        """Each of wrap_sprites draws at the line's start, and a wrap mask blind to the scale would lose it."""
+        v = sprite_scene(0x03, wrap_sprites()).model()
+        for idx, (row, last) in enumerate(((40, 9), (70, 15), (100, 15), (130, 75))):
+            owners = [None] * 320
+            nv._sprite_line(v, row, owners)
+            self.assertEqual(max(x for x in range(320) if owners[x] == idx), last, f'sprite {idx}')
+            x = [490, 0x1D0, 400, 460][idx]
+            self.assertNotEqual((x >> 4) & 0x1F, 0x1F, 'a 1x mask would stop it at once')
+
     def test_power_on_picture_is_black(self):
         self.assertEqual(set(nv.Video().frame9()[2]), {0}, '§9.1 (13): palette RAMs start all zero')
 
@@ -879,6 +889,16 @@ def sprites_l2_scene(order):
     return s.nr(0x15, 0x01 | (order << 2))
 
 
+def wrap_sprites():
+    """Scaled sprites straddling x 511 (a2 bit 0 = x8), each wrapping onto the line's start: 2x at 490 (to
+    0-9), 4x at 1D0h (464-511, then 0-15), 8x at 400 (to 0-15) and at 460 (to 0-75). The scale widens the
+    wrap window: 11111, 11110, 11100, 11000 (sprites:855, 919-927)."""
+    return [[490 & 0xFF, 40, 0x01, 0xC0 | 4, 0x08],
+            [0x1D0 & 0xFF, 70, 0x11, 0xC0 | 5, 0x10],
+            [400 & 0xFF, 100, 0x21, 0xC0 | 6, 0x18],
+            [460 & 0xFF, 130, 0x31, 0xC0 | 7, 0x18]]
+
+
 @needs_next
 class SpriteSurvivors(VideoCase):
     """Behaviours Speccy-Zone's sprite mutants showed the suite missing (10 real of 24 on 64d9b75), as scenes.
@@ -956,6 +976,9 @@ class SpriteSurvivors(VideoCase):
                     s.nr(0x1C, 0x02).nr(0x19, *clip)
                 self.assertEqual(nv.sprite_status(s.model()), 0x01)
                 self.assertEqual(s.machine().io_in(0x303B), 0x01, 'sprites:991, whatever is shown')
+
+    def test_scaled_sprites_wrap_past_511(self):
+        self.assertFrameMatches(sprite_scene(0x03, wrap_sprites()))   # over the border, unclipped
 
     def test_collision_flag(self):
         for spr, want in (([[100, 100, 0, 0x80 | 2], [108, 104, 0, 0x80 | 3]], 0x01),
