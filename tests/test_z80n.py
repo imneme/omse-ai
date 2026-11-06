@@ -64,7 +64,8 @@ def harness(header=None):
         return _libs[header]
     ext = 'dylib' if sys.platform == 'darwin' else 'so'
     tag = '' if header is None else '-' + hashlib.sha1(header.encode()).hexdigest()[:12]
-    lib = OUT / f'libbarez80{tag}.{ext}'
+    lib = (OUT if header is None else OUT / 'mutants') / f'libbarez80{tag}.{ext}'
+    lib.parent.mkdir(exist_ok=True)
     src = ROOT / 'tests' / 'bare_z80.cpp'
     deps = [src, Path(header) if header else ROOT / 'src' / 'z80.h']
     if not lib.exists() or any(d.stat().st_mtime > lib.stat().st_mtime for d in deps):
