@@ -649,7 +649,7 @@ class Speccy:
     def sd_eject(self):
         self.lib.zx_sd_eject(self.z)
 
-    def sd_timing(self, ncr=1, nac=1, busy=2, init_tries=2):
+    def sd_timing(self, ncr=1, nac=3, busy=2, init_tries=2):
         """The card's delays, in SPI bytes: before a response (N_CR, 0-8 on a
         real SD card), before a data block (N_AC), busy after a write; and how
         many ACMD41s it takes to leave the idle state."""

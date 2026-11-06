@@ -19,7 +19,9 @@
 //   - CMD0 and CMD8 must carry a valid CRC7 (others only after CMD59 turns
 //     CRCs on); a bad one gets R1 with the CRC error bit, and isn't obeyed;
 //   - a response comes N_CR bytes after the command (0 to 8 for SD cards;
-//     ncr, default 1), a data block N_AC bytes after its R1 (nac, default 1),
+//     ncr, default 1), a data block N_AC bytes after its R1 (nac, default 3; a
+//     CSD or CID block nac_reg, default 0: as a 32 GB Samsung SDHC card does on
+//     a real divMMC, measured with SDPROBE),
 //     and a write is followed by its data response token and then busy (MISO
 //     held low: `busy` bytes of 00, default 2);
 //   - CMD12 stops a multiple-block read with a stuff byte (the next byte
@@ -60,7 +62,8 @@ struct SDCard {
     std::unordered_map<uint32_t, std::array<uint8_t, 512>> overlay;
 
     // timing, in bytes (transfers)
-    int ncr = 1, nac = 1, busy = 2, init_tries = 2;
+    int ncr = 1, nac = 3, busy = 2, init_tries = 2;
+    int nac_reg = 0;            // N_AC before a CSD or CID block (nac: before a data block)
 
     // power-up and mode
     uint32_t wake_bits = 0;     // bits clocked with MOSI high, before SPI mode
@@ -202,8 +205,9 @@ struct SDCard {
     }
 
     // a data block: N_AC bytes of FF, the start token, the bytes, their CRC16
-    void block(const uint8_t* d, int n) {
-        for (int i = 0; i < nac; i++) out.push_back(0xFF);
+    // (nac before a data block, nac_reg before a register's)
+    void block(const uint8_t* d, int n, bool reg = false) {
+        for (int i = 0; i < (reg ? nac_reg : nac); i++) out.push_back(0xFF);
         out.push_back(0xFE);
         for (int i = 0; i < n; i++) out.push_back(d[i]);
         uint16_t c = crc16(d, n);
@@ -323,7 +327,7 @@ struct SDCard {
                 if (c == 9) csd(d); else cid(d);
                 r = r1();
                 respond({r});
-                block(d, 16);
+                block(d, 16, true);
                 break;
             }
             case 12: {                   // STOP_TRANSMISSION: a stuff byte, then R1b

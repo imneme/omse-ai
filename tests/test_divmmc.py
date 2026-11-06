@@ -305,7 +305,7 @@ class TestSPI(unittest.TestCase):
         zx = machine(card=card_image())
         z = init_card(Z80())
         z.out(0xEB, *cmd(58)).in_(7)
-        z.out(0xEB, *cmd(17, 5)).in_(520)
+        z.out(0xEB, *cmd(17, 5)).in_(522)
         got = z.run(zx)
         self.assertEqual(list(got[6:11]), [0x01, 0x00, 0x00, 0x01, 0xAA])   # R7: echo of 1AA
         acmd41 = [got[i] for i in (12 + 3 + 2, 12 + 6 + 3 + 2)]
@@ -350,6 +350,7 @@ class TestSPI(unittest.TestCase):
 
     def test_multiple_block_read_stops_at_cmd12(self):
         zx = machine(card=card_image())
+        zx.sd_timing(nac=1)                                # the arithmetic below assumes N_AC 1
         z = init_card(Z80())
         z.out(0xEB, *cmd(18, 3)).in_(2 * 520)
         z.out(0xEB, *cmd(12)).in_(8)
@@ -450,10 +451,10 @@ class TestCardKinds(unittest.TestCase):
     def test_cmd16_reads_a_shorter_block(self):
         z = start(Z80(), 'sdsc')
         z.out(0xEB, *cmd(16, 256)).in_(3)
-        z.out(0xEB, *cmd(17, 5 * 512 + 256)).in_(264)
+        z.out(0xEB, *cmd(17, 5 * 512 + 256)).in_(266)
         z.out(0xEB, *cmd(24, 6 * 512)).in_(3)                      # a write needs 512 again
         zx, got = self.card('sdsc', z)
-        blk = got[-(264 + 3):-3]
+        blk = got[-(266 + 3):-3]
         i = blk.index(0xFE, 3)
         self.assertEqual(blk[i + 1:i + 257], sector(5)[256:])
         self.assertEqual(blk[i + 257] << 8 | blk[i + 258], crc16(sector(5)[256:]))
