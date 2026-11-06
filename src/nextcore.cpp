@@ -321,7 +321,7 @@ void remap(ZXN& z) {
         // divMMC over slots 0-1, ahead of Layer 2, ROMCS, the alternate ROM and the rest (zxnext:3049-3066): with
         // conmem or automap, 0x0000-0x1FFF is its ROM (SRAM 0x010000) or, with mapram, RAM bank 3, read-only either
         // way; 0x2000-0x3FFF is the bank from port 0xE3, read-only if mapram is set and it's bank 3 (divmmc:83-101;
-        // "Issue #7": conmem with mapram also brings in bank 3). (The multiface, when it comes, excludes it.)
+        // "Issue #7": conmem with mapram also brings in bank 3). The multiface, when mapped, excludes it.
         if (s < 2 && dm_en(z) && ((z.porte3 & 0x80) || dm_automap(z)) && !mf_mapped(z)) {
             const bool mapram = z.porte3 & 0x40;
             if (s == 0 && !mapram) {
@@ -1285,7 +1285,7 @@ void dm_fetch(ZXN& z, uint16_t a) {
 }
 
 // im2_control.vhd's snooper, at each opcode fetch with the byte fetched: RETN (ED 45 only) unmaps divMMC
-// (divmmc_retn_seen, zxnext:4052; the multiface's exception: later); IM n is remembered for NR 0xC0 (im2c:212-229).
+// (divmmc_retn_seen, zxnext:4052, unless the multiface is active); IM n is remembered for NR 0xC0 (im2c:212-229).
 void snoop_fetch(ZXN& z, uint8_t op) {
     switch (z.snoop) {
         case 1:                                                       // after ED
@@ -1455,6 +1455,8 @@ bool master_tick(ZXN& z) {
         default: edge = true;
     }
     if (edge && !cpu_edge(z)) return false;
+    copper_tick(z);                                                   // copper.vhd samples hc and cvc as they were before
+                                                                      // this edge: after a possible stop, before the beam's step
     if (z.speed_eff == 0 && edge7) {
         if ((hc_ula(z) & 1) == 0) z.cpu_clk_high = true;
         else {
@@ -1501,7 +1503,6 @@ bool master_tick(ZXN& z) {
         }
         draw_pixel(z);
     }
-    copper_tick(z);
     ctc_tick(z);
     z.t28++;
     return true;
