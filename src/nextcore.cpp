@@ -163,6 +163,8 @@ struct ZXN {
     bool mf_fetch66 = false;            // the fetch from 0x0066 that pages it in, while it lasts
     bool dm_button = false;             // divmmc.vhd's button_nmi
     uint16_t joy[2] = {0, 0};           // the joysticks: X Z Y START A C B U D L R in bits 10:0 (zxnext:3398-3400)
+    uint8_t mouse_x = 0, mouse_y = 0;   // the Kempston mouse as the PS/2 side counts it (ps2_mouse.v:186-203)
+    uint8_t mouse_btn = 0, mouse_wheel = 0;   // b0 left, b1 right, b2 middle; the wheel's 4-bit count
     uint8_t ay_reg[3][16] = {{0}};      // the AYs' register files (ym2149.vhd), chip 0 = AY_ID 11, 1 = 10, 2 = 01
     nextaudio::Audio audio;             // what makes the sound (next_audio.h)
     uint8_t ay_addr[3] = {0, 0, 0};     // each chip's selected register (5 bits)
@@ -939,6 +941,13 @@ uint8_t io_read(ZXN& z, uint16_t port) {
         for (int i = 0; i < z.spi_npend; i++)                         // (spi_master:155-175)
             if (z.spi_pend[i].due <= z.cpu_clocks + 1) v = z.spi_pend[i].byte;
         return v;
+    }
+    if ((port & 0xFF) == 0xDF && port_en(z, 13)) {                    // the Kempston mouse (zxnext:2627-2629, 3496-3520)
+        const int a = (port >> 8) & 0x0F;
+        if (a == 0x0B) return z.mouse_x;
+        if (a == 0x0F) return z.mouse_y;
+        if (a == 0x0A)
+            return (z.mouse_wheel & 15) << 4 | 8 | (~z.mouse_btn & 4) | (~z.mouse_btn & 1) << 1 | (~z.mouse_btn & 2) >> 1;
     }
     if ((port & 0xFF) == 0x1F && port_en(z, 6) && joy_port_on(z, 0x1F)) return joy_read(z, 0x1F);   // (zxnext:2633)
     if ((port & 0xFF) == 0x37 && port_en(z, 7) && joy_port_on(z, 0x37)) return joy_read(z, 0x37);   // (zxnext:2634)
@@ -2282,6 +2291,9 @@ void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
 uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
 int zxn_cvc(ZXN* z) { return cvc(*z); }                          // DESIGN.md §9
 void zxn_set_joy(ZXN* z, int left, int right) { z->joy[0] = left & 0x7FF; z->joy[1] = right & 0x7FF; }
+void zxn_set_mouse(ZXN* z, int x, int y, int buttons, int wheel) {
+    z->mouse_x = x & 0xFF; z->mouse_y = y & 0xFF; z->mouse_btn = buttons & 7; z->mouse_wheel = wheel & 15;
+}
 void zxn_button(ZXN* z, int which) {                                  // 1 = M1 (multiface), 2 = DRIVE (divMMC): a press
     if (which == 1 && (z->nr[0x06] & 0x08)) nmi_request(*z, true);    // needs NR 0x06 b3 (zxnext:2049)
     if (which == 2 && (z->nr[0x06] & 0x10)) nmi_request(*z, false);   // b4 (2050)

@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
         'zxn_audio_capture': ([P, I], None), 'zxn_audio_take': ([P, U16P, I], I), 'zxn_audio_cap_len': ([P], I),
@@ -395,6 +395,11 @@ class Next:
         """The two joysticks, a bit per control pressed: R L D U B C A START Y Z X in bits 0-10 (zxnext:3398-3400).
         Kempston reads bits 5:0 (fire, up, down, left, right), MD adds 7:6."""
         self.lib.zxn_set_joy(self.z, left, right)
+
+    def set_mouse(self, x=0, y=0, buttons=0, wheel=0):
+        """The Kempston mouse: X and Y counts (0-255, as the PS/2 side accumulates them), buttons b0 left, b1 right,
+        b2 middle, and the wheel's 4-bit count. Ports xBDF, xFDF and xADF read them (zxnext:3496-3520)."""
+        self.lib.zxn_set_mouse(self.z, x, y, buttons, wheel)
 
     def sd_eject(self):
         self.lib.zxn_sd_eject(self.z)
