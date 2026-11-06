@@ -43,8 +43,9 @@ LOOP = bytes([0xF3, 0x18, 0xFE])                        # DI; JR $ (on itself)
 class Scene:
     """A list of writes, applied identically to a machine and to the model."""
 
-    def __init__(self, palette='zero'):
+    def __init__(self, palette='zero', timing='p3'):
         self.palette = palette
+        self.timing = timing
         self.ops = []
 
     def nr(self, n, *vals):
@@ -69,7 +70,7 @@ class Scene:
         return self
 
     def model(self):
-        v = nv.Video(palette=self.palette)
+        v = nv.Video(palette=self.palette, timing=self.timing)
         for op in self.ops:
             kind = op[0]
             if kind == 'nr':
@@ -83,6 +84,8 @@ class Scene:
 
     def machine(self, frames=2):
         kw = {} if self.palette == 'zero' else {'palette': self.palette}
+        if self.timing != 'p3':
+            kw['timing'] = self.timing
         zx = Next(boot='bare', **kw)
         zx.load(PARK, LOOP)
         zx.set_regs(pc=PARK, sp=0x7FF0)
@@ -202,6 +205,44 @@ class ModelSense(unittest.TestCase):
                 slow = v.frame9(rows=rows)[2]
                 bad = [i for i, x in enumerate(slow) if x is not None and x != fast[i]]
                 self.assertEqual(bad[:5], [], f'{len(bad)} samples differ between the two paths')
+
+    def test_sprite_budget_by_hand(self):
+        """The cycle counts written in budget_cut_slots and budget_boundary_slots, against the model."""
+        def last_x(slots, timing, idx):
+            v = budget_scene(slots, timing).model()
+            owners = [None] * 320
+            nv._sprite_line(v, 100, owners)
+            return max(x for x in range(320) if owners[x] == idx)
+        self.assertEqual(last_x(budget_cut_slots(), 'p3', 77), 172 + 40)
+        self.assertEqual(last_x(budget_cut_slots(), '48k', 77), 172 + 8)
+        for d, over, last in ((0, 0, 319), (1, 1, 319), (2, 1, 318)):
+            v = budget_scene(budget_boundary_slots(d)).model()
+            self.assertEqual(nv._sprite_line(v, 100)[1], over, f'd={d}')
+            self.assertEqual(last_x(budget_boundary_slots(d), 'p3', 127), last, f'd={d}')
+
+    def test_sprite_scenes_can_see_what_they_test(self):
+        """Each sprite-survivor scene against the same scene with its behaviour taken away: the pictures
+        must differ, or the scene is testing nothing (mixed_sprites once had no overlaps at all)."""
+        def pic(s):
+            return nv.frame9_np(s.model())[2]
+        self.assertNotEqual(pic(sprite_scene(0x01, cluster_sprites())), pic(sprite_scene(0x41, cluster_sprites())))
+        self.assertNotEqual(pic(sprite_scene(0x01, mixed_sprites())), pic(sprite_scene(0x41, mixed_sprites())))
+        a = sprite_scene(0x03, four_bit_sprites(), four_bit=True)
+        self.assertNotEqual(pic(a), pic(sprite_scene(0x03, four_bit_sprites(), four_bit=True).nr(0x4B, 0x5A)))
+        b = sprite_scene(0x01, mixed_sprites())
+        write_palette(b, 0b110, unique_palette(77))
+        first = pic(b)
+        self.assertNotEqual(first, pic(b.nr(0x43, 0x08)), 'the second sprite palette shows')
+        c = sprite_scene(0x01, [[120, 100, 0x00, 0x80 | 5], [160, 100, 0x0A, 0x80 | 5]])
+        before = pic(c)
+        c.io(0x303B, 0x80 | 5)
+        for i in range(128):
+            c.io(0x5B, (i * 0x3B + 0x11) & 0xFF)
+        self.assertNotEqual(before, pic(c), 'the second-half upload is on screen')
+        orders = set()
+        for order in range(8):
+            orders.add(tuple(pic(sprites_l2_scene(order))))
+        self.assertEqual(len(orders), 8, 'each layer order draws differently')
 
     def test_power_on_picture_is_black(self):
         self.assertEqual(set(nv.Video().frame9()[2]), {0}, '§9.1 (13): palette RAMs start all zero')
@@ -471,10 +512,27 @@ class Layer2(VideoCase):
 
     def test_blend_modes(self):
         for order in (6, 7):
-            for blend in (0, 2, 3):
+            for blend in (0, 1, 2, 3):
                 with self.subTest(order=order, blend=blend):
                     s = l2_scene(0).nr(0x15, order << 2).nr(0x68, blend << 5)
                     self.assertFrameMatches(s, name=f'blend_{order}_{blend}')
+
+    def test_ula_off_still_blends(self):
+        for order in (6, 7):                          # blend 00 takes ula_mix, which ignores NR 0x68 b7;
+            for nr68 in (0x80, 0xC0):                 # blend 10 takes ula_final, which doesn't (zxnext:7007-7010,
+                with self.subTest(order=order, nr68=nr68):                                  # 7049-7058)
+                    s = l2_scene(0).nr(0x15, order << 2).nr(0x68, nr68).nr(0x4A, 0x31)
+                    self.assertFrameMatches(s, name=f'ula_off_blend_{order}_{nr68:02x}')
+
+    def test_256x192_y_scroll_past_192(self):
+        for sy in (200, 255):                         # y = vc + scroll - 192 once, so rows 192-254 of the
+            with self.subTest(sy=sy):                 # bank range show at the bottom (layer2:156-158)
+                s = l2_scene(0)
+                s.sram(nv.L2_SRAM_BASE + 11 * 0x4000, bytes(((a * 0x61) ^ (a >> 7)) & 0xFF for a in range(0x4000)))
+                self.assertFrameMatches(s.nr(0x17, sy), name=f'l2_scroll_y_{sy}')
+
+    def test_resolution_11_is_640(self):
+        self.assertFrameMatches(l2_scene(3).nr(0x70, 0x35))   # layer2:145, 202 (bit 5 alone decides)
 
 
 
@@ -585,6 +643,12 @@ class LoRes(VideoCase):
     def test_radastan(self):
         self.assertFrameMatches(self.lores_scene(radastan=True))
 
+    def test_radastan_under_ula_plus(self):
+        s = self.lores_scene(radastan=True).io(0xBF3B, 0x40).io(0xFF3B, 0x01)
+        for i in range(64):
+            s.io(0xBF3B, i).io(0xFF3B, (i * 0x47 + 3) & 0xFF)
+        self.assertFrameMatches(s)                    # 192 + offset(1:0) x 16 + nibble (lores:107; zxnext:4187)
+
 
 def tm_scene(control=0x80, seed=31, ula_seed=1):
     """The tilemap over the ULA scene: map in bank 5 at +0x2000 (NR 0x6E = 0x20), tile definitions in bank 7
@@ -641,12 +705,19 @@ class Tilemap(VideoCase):
     def test_transparent_index(self):
         self.assertFrameMatches(tm_scene(0x80).nr(0x4C, 0x03))
 
+    def test_text_mode_transparency_is_by_colour(self):
+        pal = unique_palette(31)                      # NR 0x4C is ignored in text mode; NR 0x14 matches the
+        for idx in (0x43, 0x86):                      # colour (zxnext:7016; tilemap:385-429)
+            with self.subTest(idx=idx):
+                s = tm_scene(0x88).nr(0x4C, 0x03).nr(0x14, pal[idx] >> 1)
+                self.assertFrameMatches(s, name=f'tm_text_trans_{idx:02x}')
+
     def test_stencil(self):
         self.assertFrameMatches(tm_scene(0x80).nr(0x68, 0x01))
 
     def test_blends_with_the_tilemap(self):
         for order in (6, 7):
-            for blend in (0, 2, 3):
+            for blend in (0, 1, 2, 3):
                 with self.subTest(order=order, blend=blend):
                     s = tm_scene(0x80)
                     s.ops += l2_scene(0).ops[len(ula_scene(1).ops):]     # Layer 2 over the same ULA
@@ -674,6 +745,22 @@ def sprite_scene(nr15=0x01, sprites=None, four_bit=False, seed=41, ula_seed=1):
     return s
 
 
+def four_bit_sprites():
+    """Twelve 4-bit sprites: both halves (N6), every scale in x and y, palette offsets, y mirror."""
+    spr = []
+    for i in range(12):
+        x, y = 10 + (i % 6) * 48, 20 + (i // 6) * 90
+        a4 = 0x80 | ((i & 1) << 6) | ((i % 4) << 3) | (((i // 2) % 4) << 1)
+        spr.append([x, y, ((i * 0x30) & 0xF0) | ((i & 3) << 2), 0xC0 | (i * 3 & 0x3F), a4])
+    return spr
+
+
+def cluster_sprites():
+    """Twelve sprites piled 6 px apart, every mirror/rotate, so most pixels have several writers."""
+    return [[100 + (i % 4) * 6, 80 + (i // 4) * 6, ((i * 0x50) & 0xF0) | ((i & 7) << 1), 0x80 | (i * 7 & 0x3F)]
+            for i in range(12)]
+
+
 def mixed_sprites():
     """Sixteen sprites: every mirror/rotate combination, palette offsets, overlaps, one across the left
     border, one wrapping past x 511, one partly below line 224."""
@@ -685,7 +772,7 @@ def mixed_sprites():
     out.append([4, 100, 0x00, 0x80 | 7])                       # across the left border
     out.append([500 & 0xFF, 120, 0x01, 0x80 | 9])              # x 500: wraps to 0-3
     out.append([140, 216, 0x20, 0x80 | 11])                    # crosses line 224
-    out.append([150, 60, 0x40, 0x80 | 12])                     # overlaps sprite 4
+    out.append([150, 40, 0x40, 0x80 | 12])                     # overlaps sprite 4 (156, 35)
     return out
 
 
@@ -710,12 +797,7 @@ class Sprites(VideoCase):
         self.assertFrameMatches(s)
 
     def test_four_bit_and_scaling(self):
-        spr = []
-        for i in range(12):
-            x, y = 10 + (i % 6) * 48, 20 + (i // 6) * 90
-            a4 = 0x80 | ((i & 1) << 6) | ((i % 4) << 3) | (((i // 2) % 4) << 1)
-            spr.append([x, y, ((i * 0x30) & 0xF0) | ((i & 3) << 2), 0xC0 | (i * 3 & 0x3F), a4])
-        self.assertFrameMatches(sprite_scene(0x03, spr, four_bit=True).nr(0x4B, 0x03))
+        self.assertFrameMatches(sprite_scene(0x03, four_bit_sprites(), four_bit=True).nr(0x4B, 0x03))
 
     def test_relative_sprites(self):
         spr = [[60, 40, 0x10, 0xC0 | 2, 0x00],                 # composite anchor (5 bytes, bit 5 = 0)
@@ -729,6 +811,243 @@ class Sprites(VideoCase):
             with self.subTest(order=order):
                 s = sprite_scene(0x03 | (order << 2), mixed_sprites())
                 self.assertFrameMatches(s, name=f'sprites_border_order_{order}')
+
+
+def budget_scene(slots, timing='p3'):
+    """sprite_scene with all 128 slots written (the unlisted ones invisible), so every slot's cost is known;
+    sprites over the border with no clip (NR 0x15 = 03h), so whc 0-319 all show."""
+    s = sprite_scene(0x03, list(slots) + [[0, 0, 0x00, 0x00]] * (128 - len(slots)))
+    s.timing = timing
+    return s
+
+
+def budget_cut_slots():
+    """Forty sprites on the row but off the right (x 330: S_QUALIFY and one S_PROCESS cycle each, sprites:855),
+    24 invisible (S_QUALIFY only), then sixteen 8x-wide overlapping sprites, a palette step each: the line's
+    time runs out in the fourteenth (cycle 2 + 80 + 24, then 129 each: sprite 77 gets 41 of its 128 cycles
+    on 128K/+3 timing, 9 on 48K)."""
+    out = [[330 & 0xFF, 100, 0x01, 0x80 | i] for i in range(40)]
+    out += [[40, 100, 0x00, i] for i in range(24)]
+    out += [[16 + 12 * i, 100, i << 4, 0xC0 | (20 + i), 0x18] for i in range(16)]
+    return out
+
+
+def budget_boundary_slots(d):
+    """114 invisible slots (cycles 2-115), thirteen full 8x sprites (129 each), and in slot 127 one at
+    x 290 - d running to whc 319 (30 + d cycles): its last pixel is cycle 1823 + d and the machine idles at
+    1824 + d. d = 0 fits exactly; d = 1 is overtime though that pixel, in cycle 1824 itself, still lands;
+    d = 2 loses it (sprites:470-501, 531-537, 977). The drawn sprites must come last: invisible slots after
+    them would spend the time in S_QUALIFY instead."""
+    out = [[0, 0, 0x00, 0x00]] * 114
+    out += [[8 + 14 * i, 100, i << 4, 0xC0 | (30 + i), 0x18] for i in range(13)]
+    out.append([(290 - d) & 0xFF, 100, 0xF1, 0xC0 | 50, 0x18])
+    return out
+
+
+@needs_next
+class SpriteBudget(VideoCase):
+    """The renderer's time: one line of 28 MHz cycles from line reset to line reset (4 x 456 on 128K/+3
+    timing, 4 x 448 on 48K and Pentagon); one cycle per sprite qualified and one per pixel processed; what
+    doesn't fit is never drawn, and port 0x303B bit 1 says so (sprites:517-537, 826-866, 951-995)."""
+
+    def test_line_runs_out_mid_sprite(self):
+        for timing in ('p3', '48k'):
+            with self.subTest(timing=timing):
+                self.assertFrameMatches(budget_scene(budget_cut_slots(), timing), name=f'budget_cut_{timing}')
+
+    def test_the_boundary_to_the_cycle(self):
+        for d in (0, 1, 2):
+            with self.subTest(d=d):
+                self.assertFrameMatches(budget_scene(budget_boundary_slots(d)), name=f'budget_boundary_{d}')
+
+    def test_status_says_overtime_and_clears_on_read(self):
+        for d, want in ((0, 0x01), (1, 0x03), (2, 0x03)):
+            with self.subTest(d=d):
+                s = budget_scene(budget_boundary_slots(d))
+                self.assertEqual(nv.sprite_status(s.model()), want)
+                zx = s.machine()
+                self.assertEqual(zx.io_in(0x303B), want, 'sprites:977, 990-991')
+                self.assertEqual(zx.io_in(0x303B), 0x00, 'sprites:986-988: a read clears it')
+
+
+def sprites_l2_scene(order):
+    """Sprites, Layer 2 (with its band of transparent E3) and the ULA, in layer order `order`. ULA paper 4
+    is the transparent colour too, or with the ULA on top the order beneath it would never show."""
+    s = sprite_scene(0x01, cluster_sprites() + mixed_sprites())
+    s.ops += l2_scene(0).ops[len(ula_scene(1).ops):]
+    write_palette(s, 0b000, [nv.rgb9_from8(0xE3)], start=16 + 4)
+    return s.nr(0x15, 0x01 | (order << 2))
+
+
+@needs_next
+class SpriteSurvivors(VideoCase):
+    """Behaviours Speccy-Zone's sprite mutants showed the suite missing (10 real of 24 on 64d9b75), as scenes.
+    Her #5 (overlap sets status bit 0) and #10 (a read clears it) are in SpriteBudget and test_collision_flag;
+    her #11 (9-bit Y wrap) is an equivalent mutant."""
+
+    def test_four_byte_sprite_is_an_anchor_despite_a_stale_fifth_byte(self):
+        s = sprite_scene(0x01, [[200, 150, 0x00, 0xC0 | 2, 0x40], [100, 100, 0x00, 0xC0 | 3, 0x00]])
+        s.io(0x303B, 0x00)                                  # sprite 0 again, four bytes: byte 4 keeps 40h
+        for b in (100, 80, 0x00, 0x80 | 5):                 # (sprites:639-664), and bit 6 = 0 makes it an
+            s.io(0x57, b)                                   # anchor anyway (sprites:756)
+        self.assertFrameMatches(s)
+
+    def test_relatives_hide_with_their_anchor(self):
+        spr = [[60, 40, 0x00, 0x40 | 2, 0x00],              # an anchor, invisible
+               [16, 0, 0x00, 0xC0 | 3, 0x40], [0, 16, 0x00, 0xC0 | 4, 0x40],   # visible relatives: hidden too
+               [150, 40, 0x00, 0xC0 | 5, 0x00],             # a visible anchor (sprites:784, 932)
+               [16, 0, 0x00, 0xC0 | 6, 0x40], [0, 16, 0x00, 0x40 | 7, 0x40]]
+        self.assertFrameMatches(sprite_scene(0x01, spr))
+
+    def test_four_bit_relative_takes_its_half_from_the_added_pattern(self):
+        spr = [[80, 60, 0x10, 0xC0 | 9, 0xC0],              # 4-bit anchor, N6 = 1: pattern 19
+               [16, 0, 0x00, 0xC0 | 4, 0x41],               # own N6 0, + anchor: 8 + 19 = 27, odd half
+               [0, 16, 0x00, 0xC0 | 5, 0x61],               # own N6 1: 11 + 19 = 30, even half
+               [16, 16, 0x00, 0xC0 | 6, 0x40]]              # no pattern add: its own 12
+        self.assertFrameMatches(sprite_scene(0x01, spr, four_bit=True))   # sprites:803, 928, 962-963
+
+    def test_four_bit_transparency_is_the_low_nibble(self):
+        for nr4b in (0xE3, 0x5A):                           # nibble 3, nibble A (sprites:971)
+            with self.subTest(nr4b=nr4b):
+                s = sprite_scene(0x03, four_bit_sprites(), four_bit=True).nr(0x4B, nr4b)
+                self.assertFrameMatches(s, name=f'sprites_4bit_trans_{nr4b:02x}')
+
+    def test_zero_on_top_where_sprites_really_overlap(self):
+        for nr15 in (0x01, 0x41):                           # sprites:972
+            with self.subTest(nr15=nr15):
+                self.assertFrameMatches(sprite_scene(nr15, cluster_sprites()), name=f'sprites_cluster_{nr15:02x}')
+
+    def test_second_sprite_palette(self):
+        s = sprite_scene(0x01, mixed_sprites())
+        write_palette(s, 0b110, unique_palette(77))
+        s.nr(0x43, 0x08)                                    # NR 0x43 bit 3 (zxnext:5329, 6735)
+        self.assertFrameMatches(s)
+
+    def test_sprites_and_layer2_in_every_order(self):
+        for order in range(8):                              # zxnext:7123-7192 and on
+            with self.subTest(order=order):
+                self.assertFrameMatches(sprites_l2_scene(order), name=f'sprites_l2_order_{order}')
+
+    def test_pattern_upload_into_the_second_half(self):
+        s = sprite_scene(0x01, [[120, 100, 0x00, 0x80 | 5], [160, 100, 0x0A, 0x80 | 5]])
+        s.io(0x303B, 0x80 | 5)                              # pattern 5 from byte 128 (sprites:736)
+        for i in range(128):
+            b = (i * 0x3B + 0x11) & 0xFF
+            s.io(0x5B, 0x00 if b == 0xE3 else b)
+        self.assertFrameMatches(s)
+
+    def test_sprites_in_the_blend_modes(self):
+        for tm in (False, True):                            # the blend layer's partner sits above or below
+            for order in (6, 7):                            # sprites by tm_pixel_below (zxnext:7046-7085,
+                for blend in (1, 2, 3):                     # 7193-7258)
+                    with self.subTest(tm=tm, order=order, blend=blend):
+                        s = sprites_l2_scene(order)
+                        if tm:
+                            s.ops += tm_scene(0x80).ops[len(ula_scene(1).ops):]
+                        s.nr(0x68, blend << 5)
+                        self.assertFrameMatches(s, name=f'sprites_blend_{int(tm)}_{order}_{blend}')
+
+    def test_flags_ignore_display(self):
+        pair = [[100, 100, 0, 0x80 | 2], [108, 104, 0, 0x80 | 3]]
+        for nr15, clip in ((0x00, None), (0x01, (100, 120, 10, 20)), (0x23, (0, 0, 0, 0))):
+            with self.subTest(nr15=nr15, clip=clip):       # sprites off, or clipped away: the flags still
+                s = sprite_scene(nr15, pair)                # come from the line store (sprites:842, 971-991)
+                if clip:
+                    s.nr(0x1C, 0x02).nr(0x19, *clip)
+                self.assertEqual(nv.sprite_status(s.model()), 0x01)
+                self.assertEqual(s.machine().io_in(0x303B), 0x01, 'sprites:991, whatever is shown')
+
+    def test_collision_flag(self):
+        for spr, want in (([[100, 100, 0, 0x80 | 2], [108, 104, 0, 0x80 | 3]], 0x01),
+                          ([[100, 100, 0, 0x80 | 2], [140, 104, 0, 0x80 | 3]], 0x00)):
+            with self.subTest(want=want):
+                s = sprite_scene(0x01, spr)
+                self.assertEqual(nv.sprite_status(s.model()), want)
+                zx = s.machine()
+                self.assertEqual(zx.io_in(0x303B), want, 'sprites:991')
+                self.assertEqual(zx.io_in(0x303B), 0x00, 'sprites:986-988')
+
+
+@needs_next
+class Registers(VideoCase):
+    """What port 0x253B reads back for the video registers (zxnext:5836-6024)."""
+
+    REGS = (0x12, 0x14, 0x15, 0x16, 0x17, 0x26, 0x27, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x42, 0x4A, 0x4B, 0x4C,
+            0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6E, 0x6F, 0x70, 0x71)
+
+    def test_video_register_readbacks(self):
+        for pat in (0xFF, 0xA5, 0x5A, 0x00):
+            with self.subTest(pat=pat):
+                s = ula_scene(1)
+                for n in self.REGS:
+                    s.nr(n, pat)
+                s.nr(0x43, pat & 0x7F).nr(0x44, pat)  # NR 0x28 keeps NR 0x44's first byte
+                s.nr(0x18, pat).nr(0x19, pat, pat ^ 0x0F).nr(0x1A, pat, 1, 2).nr(0x1C, 0x02)
+                s.nr(0x1B, pat ^ 0x33)
+                v, zx = s.model(), s.machine(frames=1)
+                bad = {f'{n:02X}': (f'{zx.nr_read(n):02X}', f'{v.nr_read(n):02X}')
+                       for n in self.REGS + (0x28, 0x43, 0x18, 0x19, 0x1A, 0x1B, 0x1C) if zx.nr_read(n) != v.nr_read(n)}
+                self.assertEqual(bad, {}, f'NR: (got, want) after writing {pat:02X}')
+
+
+def upload_half(s, start, salt):
+    """128 pattern bytes through port 0x5B from wherever its pointer is (none the transparent E3)."""
+    for i in range(128):
+        b = (i * 0x3B + salt) & 0xFF
+        s.io(0x5B, 0x00 if b == 0xE3 else b)
+    return s
+
+
+@needs_next
+class SpriteMirror(VideoCase):
+    """The nextreg route to the sprites: NR 0x34 picks the mirror's sprite, NR 0x35-0x39 write its bytes,
+    NR 0x75-0x79 write and then step; NR 0x09 b4 ties the mirror to the ports (zxnext:4794-4855, 5126,
+    5939; sprites:594-745)."""
+
+    def check(self, s):
+        v, zx = s.model(), s.machine()
+        self.assertEqual(zx.nr_read(0x34), v.nr_read(0x34), 'NR 0x34 (zxnext:5939-5940)')
+        self.assertFrameMatches(s)
+
+    def test_nextreg_writes_and_steps(self):
+        s = sprite_scene(0x01, [[20 + 24 * i, 150, 0x00, 0x00 | i] for i in range(24)])   # invisible ones
+        s.nr(0x34, 30).nr(0x35, 60).nr(0x36, 50).nr(0x37, 0x24).nr(0x38, 0xC0 | 3).nr(0x79, 0x0A)   # 30, steps
+        s.nr(0x35, 100).nr(0x36, 50).nr(0x37, 0x30).nr(0x78, 0x80 | 4)                               # 31, steps
+        s.nr(0x35, 140).nr(0x36, 52).nr(0x37, 0x4E).nr(0x38, 0x80 | 7)                               # 32, stays
+        s.nr(0x34, 8)
+        for i in range(8):                                  # make 8-15 visible, a step each
+            s.nr(0x78, 0x80 | (9 + i))
+        self.check(s)
+
+    def test_lockstep_moves_the_ports(self):
+        s = sprite_scene(0x01, []).nr(0x09, 0x10)
+        s.nr(0x34, 0x80 | 5)                                # sprite 5, pattern 5's second half
+        for b in (90, 70, 0x00, 0x80 | 5):
+            s.io(0x57, b)                                   # port 0x57 now writes sprite 5
+        upload_half(s, 0, 0x29)                             # port 0x5B, pattern 5 from byte 128
+        s.nr(0x34, 7).nr(0x75, 130).nr(0x35, 0)             # sprite 7's x, a step to 8 moves port 0x57 too
+        for b in (200, 70, 0x10, 0x80 | 5):
+            s.io(0x57, b)                                   # sprite 8 (the step reloaded the port's index)
+        self.check(s)
+
+    def test_port_advance_moves_the_mirror_but_not_the_pattern_pointer(self):
+        s = sprite_scene(0x01, []).nr(0x09, 0x10)
+        s.io(0x303B, 0x80 | 12)                             # mirror follows: sprite 12 (sprites:607-609)
+        for b in (40, 90, 0x00, 0x80 | 12, 40, 110, 0x00, 0x80 | 13):
+            s.io(0x57, b)                                   # sprites 12 and 13; the mirror is now 14
+        upload_half(s, 0, 0x45)                             # still pattern 12's second half
+        s.nr(0x37, 0x50).nr(0x38, 0x80 | 12).nr(0x36, 110).nr(0x35, 80)   # sprite 14 by nextreg
+        self.check(s)
+
+    def test_untied_nextreg_leaves_the_ports_alone(self):
+        s = sprite_scene(0x01, [])
+        s.io(0x303B, 20)
+        s.nr(0x34, 0x80 | 3)                                # untied: ports stay at sprite 20, pattern 20
+        for b in (60, 100, 0x00, 0x80 | 20):
+            s.io(0x57, b)
+        upload_half(s, 0, 0x17)
+        s.nr(0x35, 160).nr(0x36, 100).nr(0x37, 0x00).nr(0x38, 0x80 | 3)   # sprite 3 by nextreg
+        self.check(s)
 
 
 def ulap_scene(seed=8):
@@ -775,7 +1094,7 @@ class Survivors(VideoCase):
 @needs_next
 class ProbeV2(VideoCase):
     """P-V2's sprite card (next-build/probes/pv2_scene.py, the scene defined once): the machine against the
-    model, with the per-line-limit strip's rows masked until the hardware says where it stops."""
+    model, the per-line strip cut where the line's time runs out (whc 152 on 128K/+3 timing)."""
 
     def test_pv2_sprite_card(self):
         probes = Path.home() / 'next-build/probes'
@@ -794,12 +1113,76 @@ class ProbeV2(VideoCase):
         for w in sc.copper_words():
             s.nr(0x63, w >> 8, w & 0xFF)
         s.nr(0x62, 0xC0)
-        got = list(s.machine(frames=3).frame9()[2])
+        zx = s.machine(frames=3)
+        got = list(zx.frame9()[2])
         want = nv.frame9_np(s.model(), sc.schedule())[2]
-        strip = range((48 + 160) * nv.W, (48 + 178) * nv.W)
-        bad = [i for i in range(len(want)) if got[i] != want[i] and i not in strip]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
         if bad:
             path = self._save_diff('pv2_sprite_card', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+        self.assertEqual(zx.io_in(0x303B), 0x03, 'the strip runs out of time and overlaps (sprites:977, 991)')
+
+
+@needs_next
+class ProbeV3(VideoCase):
+    """P-V3's blend card (next-build/probes/pv3_scene.py, the scene defined once): the machine against the
+    model, band by band, and the read-backs the probe prints (NR 0x28, NR 0x34, the card's sprite status)."""
+
+    def test_pv3_blend_card(self):
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv3_scene.py').exists():
+            self.skipTest('needs next-build/probes/pv3_scene.py')
+        sys.path.insert(0, str(probes))
+        import pv3_model as pm
+        import pv3_scene as sc
+        s = Scene()
+        for kind, a, b in pm.writes():
+            (s.nr if kind == 'nr' else s.io)(a, b)
+        bm, at = sc.ula()
+        s.bram5(0, bm).bram5(0x1800, at)
+        s.sram(nv.L2_SRAM_BASE + sc.L2_BANK * 0x4000, sc.layer2())
+        s.nr(0x62, 0x00).nr(0x61, 0x00)
+        for w in sc.copper_words():
+            s.nr(0x63, w >> 8, w & 0xFF)
+        s.nr(0x62, 0xC0)
+        zx, v = s.machine(frames=3), s.model()
+        got = list(zx.frame9()[2])
+        want = nv.frame9_np(v, sc.schedule())[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('pv3_blend_card', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+        self.assertEqual((zx.nr_read(0x28), zx.nr_read(0x34), zx.io_in(0x303B)),
+                         (v.nr_read(0x28), v.nr_read(0x34), nv.sprite_status(v)), 'NR 0x28, NR 0x34, status')
+
+
+@needs_next
+class ProbeV4(VideoCase):
+    """P-V4's Layer 2 card (next-build/probes/pv4_scene.py, the scene defined once): resolutions 00/01/10/11,
+    a bank range past SRAM's end, palette offsets in 640 mode, and a Y scroll past 384 reading bank + 3."""
+
+    def test_pv4_layer2_card(self):
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv4_scene.py').exists():
+            self.skipTest('needs next-build/probes/pv4_scene.py')
+        sys.path.insert(0, str(probes))
+        import pv4_model as pm
+        import pv4_scene as sc
+        s = Scene()
+        for kind, a, b in pm.writes():
+            (s.nr if kind == 'nr' else s.io)(a, b)
+        bm, at = sc.ula()
+        s.bram5(0, bm).bram5(0x1800, at)
+        s.sram(nv.L2_SRAM_BASE + sc.L2_BANK * 0x4000, sc.layer2())
+        s.nr(0x62, 0x00).nr(0x61, 0x00)
+        for w in sc.copper_words():
+            s.nr(0x63, w >> 8, w & 0xFF)
+        s.nr(0x62, 0xC0)
+        got = list(s.machine(frames=3).frame9()[2])
+        want = nv.frame9_np(s.model(), sc.schedule())[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('pv4_layer2_card', got, want, bad)
             self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
 
 
