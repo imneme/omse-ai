@@ -49,6 +49,7 @@ def _load_lib():
         'zxn_regs': ([P, U16P], None), 'zxn_set_reg': ([P, I, I], None),
         'zxn_peek': ([P, I], I), 'zxn_poke': ([P, I, I, I], None),
         'zxn_sram': ([P], P), 'zxn_bram5': ([P], P), 'zxn_bram7': ([P], P), 'zxn_slot_page': ([P, I], I),
+        'zxn_slot_desc': ([P, I, I, ctypes.POINTER(ctypes.c_int)], None),
         'zxn_nr_read': ([P, I], I), 'zxn_nr_write': ([P, I, I], None),
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
@@ -137,7 +138,18 @@ class Next:
         for i, b in enumerate(data):
             self.poke(a + i, b, force)
 
-    def slot_page(self, i):
+    def slot_page(self, i, write=False):
+        """What MMU slot i (0-7) shows to reads, or with write=True where a write lands (DESIGN.md §9.1 (8)): a plain
+        page number 0x00-0xDF, or ('rom', n), ('altrom', n), 'boot', ('config', p16), 'divmmc-rom', ('divmmc', bank),
+        'mf-rom', 'mf-ram', ('l2', page), or None for no memory."""
+        out = (ctypes.c_int * 2)()
+        self.lib.zxn_slot_desc(self.z, i, 1 if write else 0, out)
+        tag, val = out[0], out[1]
+        return [val, ('rom', val), ('altrom', val), 'boot', ('config', val), 'divmmc-rom', ('divmmc', val),
+                'mf-rom', 'mf-ram', ('l2', val), None][tag]
+
+    def mmu(self, i):
+        """The MMU register for slot i (NR 0x50 + i), whatever overrides it."""
         return self.lib.zxn_slot_page(self.z, i)
 
     # registers and ports, as the CPU sees them (side effects included), taking no time

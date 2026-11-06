@@ -50,6 +50,8 @@ const Timing TIMINGS[5][2] = {
 };
 
 enum Kind : uint8_t { K_NONE, K_SRAM, K_BRAM5, K_BRAM7, K_BOOT };
+// what a slot shows, for slot_page (DESIGN.md §9.1 (8)): the tag and its value
+enum Tag : uint8_t { T_PAGE, T_ROM, T_ALTROM, T_BOOT, T_CONFIG, T_DIVROM, T_DIV, T_MFROM, T_MFRAM, T_L2, T_NONE };
 
 struct IoEvent { uint64_t t28, cpu_clocks; uint16_t port; uint8_t value, write; };
 struct IntEvent { uint64_t start, end; };
@@ -69,6 +71,8 @@ struct ZXN {
     uint8_t* rd[8];
     uint8_t* wr[8];
     Kind rd_kind[8], wr_kind[8];
+    Tag rd_tag[8], wr_tag[8];
+    int rd_val[8], wr_val[8];
     uint8_t last_sram = 0xFF;           // what a read of "no memory" returns (ref §3.3)
 
     // machine state
@@ -97,6 +101,8 @@ struct ZXN {
     bool ck_mem = false, ck_port = false;  // what the current T-state asks the ULA (set at each rising CPU edge)
     bool prev_mreq = false, prev_io = false;
     int io_phase = 0;
+    bool p3_mem = false;                // +3 timing: the last T-state began a contended memory cycle
+    bool p3_waiting = false;            // +3 timing: the last T-state was a contention wait
     bool wait_next = false;             // a 28 MHz read wait for the next CPU clock
     bool contention = true;             // on, as the hardware is (zxn_contention can turn it off, for comparisons)
 
@@ -157,19 +163,29 @@ void remap(ZXN& z) {
         if (s >= 2 || z.mmu[s] < 0xE0) {
             z.rd[s] = z.wr[s] = p;
             z.rd_kind[s] = z.wr_kind[s] = k;
+            z.rd_tag[s] = z.wr_tag[s] = p ? T_PAGE : T_NONE;
+            z.rd_val[s] = z.wr_val[s] = z.mmu[s];
         } else if (z.config_mode) {                                   // NR 0x04's 16K page, absolute (ref §3.10)
             uint8_t* q = z.sram + (z.nr04 * 16384 + s * 8192) % SRAM_SIZE;
             z.rd[s] = z.wr[s] = q;
             z.rd_kind[s] = z.wr_kind[s] = K_SRAM;
+            z.rd_tag[s] = z.wr_tag[s] = T_CONFIG;
+            z.rd_val[s] = z.wr_val[s] = z.nr04;
         } else {                                                      // ROM, read-only (ref §3.5)
             z.rd[s] = z.sram + rom_page(z) * 16384 + s * 8192;
             z.rd_kind[s] = K_SRAM;
+            z.rd_tag[s] = T_ROM;
+            z.rd_val[s] = rom_page(z);
             z.wr[s] = nullptr;
             z.wr_kind[s] = K_NONE;
+            z.wr_tag[s] = T_NONE;
+            z.wr_val[s] = 0;
         }
         if (s < 2 && z.bootrom_en) {                                  // the boot ROM wins on reads (ref §3.10)
             z.rd[s] = z.bootrom;
             z.rd_kind[s] = K_BOOT;
+            z.rd_tag[s] = T_BOOT;
+            z.rd_val[s] = 0;
         }
     }
 }
@@ -384,6 +400,18 @@ inline bool wait_s(const ZXN& z) {
     return adj >= 4 && h < 256 && v < 192;
 }
 
+// +3 timing's form (zxula.vhd 597-600): WAIT while MREQ is low on a contended page, in the window wait_s gives +3
+// (hc_adj(3:1) = 000 as well: slots 15, 0 and 3-14). The Z80 samples WAIT on the falling edge of T2 and of each Tw;
+// z80.h checks it at the start of the T2 step and repeats the step while it's set. So before each rising edge, the
+// window is evaluated at the slot of that T-state's falling edge, hc_ula + 1. No I/O contention in +3 timing.
+inline bool p3_wait_now(const ZXN& z) {
+    if (!z.contention || z.timing != 3 || z.speed_eff != 0 || (z.nr[0x08] & 0x40)) return false;
+    if (!z.p3_mem && !z.p3_waiting) return false;
+    int h = hc_ula(z) + 1, v = vc_ula(z);
+    int adj = ((h & 15) + 1) & 15;
+    return (adj >= 4 || adj <= 1) && (h & 0x1FF) < 256 && v < 192;
+}
+
 // ---- the clock
 
 // One rising edge of the CPU clock. Returns false (and changes nothing) if a run_until_pc stop is due: the CPU is
@@ -392,7 +420,8 @@ bool cpu_edge(ZXN& z) {
     z80_t saved = z.cpu;
     uint64_t saved_pins = z.pins;
     uint64_t p = z.pins;
-    if (z.wait_next) p |= Z80_WAIT; else p &= ~Z80_WAIT;
+    const bool p3w = p3_wait_now(z);
+    if (z.wait_next || p3w) p |= Z80_WAIT; else p &= ~Z80_WAIT;
     if (z.int_low) p |= Z80_INT; else p &= ~Z80_INT;
     p = z80_tick(&z.cpu, p);
     if (z.stop_on && !z.first_edge && z80_opdone(&z.cpu)) {
@@ -409,6 +438,8 @@ bool cpu_edge(ZXN& z) {
     z.wait_next = false;
     z.cpu_clocks++;
     classify(z, p);
+    z.p3_waiting = p3w;
+    if (!p3w) z.p3_mem = (p & Z80_MREQ) && (p & (Z80_RD | Z80_WR)) && !(p & Z80_RFSH) && contended_page(z, Z80_GET_ADDR(p));
     if (p & Z80_MREQ) {
         uint16_t a = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
@@ -604,6 +635,12 @@ uint8_t* zxn_sram(ZXN* z) { return z->sram; }
 uint8_t* zxn_bram5(ZXN* z) { return z->bram5; }
 uint8_t* zxn_bram7(ZXN* z) { return z->bram7; }
 int zxn_slot_page(ZXN* z, int i) { return z->mmu[i & 7]; }
+// what slot i shows to reads (write = 0) or where a write lands (write = 1): tag (enum Tag) and value
+void zxn_slot_desc(ZXN* z, int i, int write, int* out) {
+    i &= 7;
+    out[0] = write ? z->wr_tag[i] : z->rd_tag[i];
+    out[1] = write ? z->wr_val[i] : z->rd_val[i];
+}
 
 int zxn_nr_read(ZXN* z, int n) { return nr_read(*z, n & 0xFF); }
 void zxn_nr_write(ZXN* z, int n, int v) { nr_write(*z, n & 0xFF, v); }
