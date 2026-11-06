@@ -1022,39 +1022,71 @@ inline void draw_pixel(ZXN& z) {
     uint8_t c = z.border;
     const bool next = z.nr[0x43] & 1, ulap = z.ulap_en && !next;     // ULANext wins over ULA+ (zxula:492-531)
     const bool border = !(x >= 0 && x < 256 && y >= 0 && y < 192);
-    uint8_t attr = (z.border << 3) | z.border, idx;                   // border_clr: "00" & border & border (zxula:417)
-    bool on = false;
+    // the Timex modes (port 0xFF b2:0; none with the shadow screen, zxula:191): b0 the display file at 2000h, b1 the
+    // attributes from the second file's pixel area (hi-colour), b2 hi-res, 16 pixels a cell at 14 MHz in port 0xFF
+    // b5:3's ink on its inverse, BRIGHT, with the border in that paper too (zxula:220-256, 386-447)
+    const int mode = (z.port7ffd & 8) ? 0 : z.portff & 7;
+    const bool hires = mode & 4;
+    const uint8_t tmx = 0x40 | (~(z.portff >> 3) & 7) << 3 | ((z.portff >> 3) & 7);   // border_clr_tmx (zxula:419)
+    uint8_t attr2[2];
+    attr2[0] = attr2[1] = hires ? tmx : (z.border << 3) | z.border;   // border_clr: "00" & border & border (zxula:417)
+    bool on[2] = {false, false};
     if (!border) {
+        // the ULA's scroll (zxula:189-216): NR 0x27 wraps within the 192 lines; NR 0x26 and NR 0x68 b2's half pixel
+        // move the content left in half pixels, each pixel keeping its own cell's attribute
+        const int ys = y + z.nr[0x27];
+        const int cy = ys >= 384 ? ys - 384 : ys >= 192 ? ys - 192 : ys;
         const uint8_t* scr = (z.port7ffd & 8) ? z.bram7 : z.bram5;
-        uint8_t bits = scr[((y & 0xC0) << 5) | ((y & 7) << 8) | ((y & 0x38) << 2) | (x >> 3)];
-        attr = scr[0x1800 + (y >> 3) * 32 + (x >> 3)];
-        on = (bits >> (7 - (x & 7))) & 1;
-        if ((attr & 0x80) && z.flash_on && !next && !ulap) on = !on;  // no FLASH for ULANext or ULA+ (zxula:470)
-        c = (on ? (attr & 7) : ((attr >> 3) & 7)) | ((attr & 0x40) ? 8 : 0);
+        for (int smp = 0; smp < 2; smp++) {
+            const int half = (2 * x + smp + 2 * z.nr[0x26] + ((z.nr[0x68] >> 2) & 1)) & 511;
+            const int cx = half >> 1;
+            const int pa = ((cy & 0xC0) << 5) | ((cy & 7) << 8) | ((cy & 0x38) << 2) | (cx >> 3);
+            const uint8_t bits = scr[(mode & 1) << 13 | pa];
+            const uint8_t second = scr[(mode & 2) ? 0x2000 | pa : (mode & 1) << 13 | (0x1800 + (cy >> 3) * 32 + (cx >> 3))];
+            if (hires) {                                              // pixel byte's 8, then the second byte's 8
+                const int sub = half & 15;
+                on[smp] = sub < 8 ? (bits >> (7 - sub)) & 1 : (second >> (15 - sub)) & 1;
+            } else {
+                attr2[smp] = second;
+                on[smp] = (bits >> (7 - (cx & 7))) & 1;
+                if ((second & 0x80) && z.flash_on && !next && !ulap) on[smp] = !on[smp];   // no FLASH for ULANext/ULA+
+            }
+        }
+        const uint8_t a = attr2[0];
+        c = (on[0] ? (a & 7) : ((a >> 3) & 7)) | ((a & 0x40) ? 8 : 0);
     }
     z.fb[fy * FB_W + fx] = c;
-    // the ULA's palette index (zxula:484-560): standard 000 & paper & BRIGHT & colour; ULA+ 11 & attr7:6 & paper &
-    // colour; ULANext the ink masked by NR 0x42, the paper above it from 128, format FF's paper and border the fallback
-    bool bgnd = false;
-    if (next) {
-        const uint8_t f = z.nr[0x42];
-        if (border) { idx = 0x80 | ((attr >> 3) & 7); bgnd = f == 0xFF; }
-        else if (on) idx = attr & f;
-        else switch (f) {
-            case 0x01: idx = 0x80 | attr >> 1; break;
-            case 0x03: idx = 0xC0 | attr >> 2; break;
-            case 0x07: idx = 0xE0 | attr >> 3; break;
-            case 0x0F: idx = 0xF0 | attr >> 4; break;
-            case 0x1F: idx = 0xF8 | attr >> 5; break;
-            case 0x3F: idx = 0xFC | attr >> 6; break;
-            case 0x7F: idx = 0xFE | attr >> 7; break;
-            default: idx = 0; bgnd = true;
+    // the ULA's palette index per 14 MHz sample (zxula:484-560): standard 000 & paper & BRIGHT & colour; ULA+ 11 &
+    // attr7:6 & paper (always, in hi-res) & colour; ULANext the ink masked by NR 0x42, the paper above it from 128,
+    // format FF's paper and border the fallback
+    uint8_t idx2[2];
+    bool bgnd2[2] = {false, false};
+    for (int smp = 0; smp < 2; smp++) {
+        const bool o = on[smp];
+        const uint8_t attr = attr2[smp];
+        uint8_t& idx = idx2[smp];
+        if (next) {
+            const uint8_t f = z.nr[0x42];
+            if (border) { idx = 0x80 | ((attr >> 3) & 7); bgnd2[smp] = f == 0xFF; }
+            else if (o) idx = attr & f;
+            else switch (f) {
+                case 0x01: idx = 0x80 | attr >> 1; break;
+                case 0x03: idx = 0xC0 | attr >> 2; break;
+                case 0x07: idx = 0xE0 | attr >> 3; break;
+                case 0x0F: idx = 0xF0 | attr >> 4; break;
+                case 0x1F: idx = 0xF8 | attr >> 5; break;
+                case 0x3F: idx = 0xFC | attr >> 6; break;
+                case 0x7F: idx = 0xFE | attr >> 7; break;
+                default: idx = 0; bgnd2[smp] = true;
+            }
+        } else if (ulap) {
+            idx = 0xC0 | (attr & 0xC0) >> 2 | ((hires || !o) ? 8 : 0) | (o ? attr & 7 : (attr >> 3) & 7);
+        } else {
+            idx = (o ? 0 : 0x10) | (attr & 0x40) >> 3 | (o ? attr & 7 : (attr >> 3) & 7);
         }
-    } else if (ulap) {
-        idx = 0xC0 | (attr & 0xC0) >> 2 | (on ? 0 : 8) | (on ? attr & 7 : (attr >> 3) & 7);
-    } else {
-        idx = (on ? 0 : 0x10) | (attr & 0x40) >> 3 | (on ? attr & 7 : (attr >> 3) & 7);
     }
+    uint8_t idx = idx2[0];
+    bool bgnd = bgnd2[0], lores = false;
     // LoRes (NR 0x15 b7) replaces the ULA's pixel inside the ULA's clip window (lores.vhd; zxnext:6831-6840): 128 x 96
     // from bank 5 (rows 0-47 at 0000, 48-95 at 2000), or Radastan's 4-bit pixels from a Timex display file (NR 0x6A
     // b5), scrolled by NR 0x32/0x33, through the ULA's palette
@@ -1076,9 +1108,15 @@ inline void draw_pixel(ZXN& z) {
                 idx = (((d >> 4) + off) & 15) << 4 | (d & 15);
             }
             bgnd = false;
+            lores = true;
         }
     }
-    const uint16_t urgb = bgnd ? rgb9(z.nr[0x4A]) : z.pal[0][((z.nr[0x43] >> 1) & 1) << 8 | idx] & 0x1FF;
+    uint16_t urgb2[2];
+    for (int smp = 0; smp < 2; smp++) {
+        const uint8_t i = lores ? idx : idx2[smp];
+        const bool b = lores ? bgnd : bgnd2[smp];
+        urgb2[smp] = b ? rgb9(z.nr[0x4A]) : z.pal[0][((z.nr[0x43] >> 1) & 1) << 8 | i] & 0x1FF;
+    }
     // the compositor (zxnext:7000-7180). The ULA is transparent where its colour's bits 8:1 match NR 0x14, outside its
     // clip window (NR 0x1A; never in the border), or when it's off (NR 0x68 b7); Layer 2 where it doesn't show or
     // matches NR 0x14; its priority bit lifts it over everything. No sprites or tilemap yet: they're transparent.
@@ -1086,10 +1124,11 @@ inline void draw_pixel(ZXN& z) {
     // 10 the ULA as shown, 01/11 none: the ULA then sits below), 110 saturating at 7, 111 then less 5 (zxnext:7032-7250).
     const uint8_t* uc = z.clip[2];
     const bool uclip = !border && (x < uc[0] || x > uc[1] || y < uc[2] || y > uc[3]);
-    const bool ut = (urgb >> 1) == z.nr[0x14] || uclip || (z.nr[0x68] & 0x80);
     const uint16_t fb9 = rgb9(z.nr[0x4A]);
     const int order = (z.nr[0x15] >> 2) & 7;
     for (int smp = 0; smp < 2; smp++) {
+        const uint16_t urgb = urgb2[smp];
+        const bool ut = (urgb >> 1) == z.nr[0x14] || uclip || (z.nr[0x68] & 0x80);
         uint16_t lrgb = 0;
         bool lp = false;
         const bool lt = !l2_pixel(z, x, y, smp, lrgb, lp) || (lrgb >> 1) == z.nr[0x14];
