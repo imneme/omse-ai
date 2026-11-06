@@ -143,7 +143,7 @@ def _load_lib():
         'zx_frame': ([P], U64), 'zx_render_static': ([P], None),
         'zx_frame_pos': ([P], I), 'zx_frame_len': ([P], I),
         'zx_make_128': ([P, ctypes.c_char_p, ctypes.c_char_p], None), 'zx_model': ([P], I),
-        'zx_clock': ([P], I), 'zx_paging': ([P], I), 'zx_bank': ([P, I], P),
+        'zx_clock': ([P], I), 'zx_paging': ([P], I), 'zx_bank': ([P, I], P), 'zx_poke': ([P, I, I], None),
         'zx_ay_record': ([P, I], None), 'zx_ay_rate': ([], I),
         'zx_ay_samples_len': ([P], I), 'zx_ay_samples_get': ([P, ctypes.POINTER(ctypes.c_float)], None),
         'zx_ay_samples_clear': ([P], None), 'zx_ay_log_len': ([P], I),
@@ -262,8 +262,7 @@ class Speccy:
         return self.mem[a] | (self.mem[(a + 1) & 0xFFFF] << 8)
 
     def poke(self, a, v):
-        if a >= 0x4000:
-            self.mem[a] = v & 0xFF
+        self.lib.zx_poke(self.z, a, v & 0xFF)       # as the CPU's write would land (128 mirrors)
 
     def read(self, a, n):
         return bytes(self.mem[a:a + n])

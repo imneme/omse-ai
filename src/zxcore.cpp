@@ -903,6 +903,9 @@ void zx_set_kempston(ZX* z, uint8_t v) { z->kempston = v; }
 
 uint8_t* zx_memory(ZX* z) { return z->mem; }
 uint8_t* zx_bank(ZX* z, int b) { return bank_ptr(*z, b & 7); }
+// a write from outside the machine, as the CPU's would land (so a bank paged at
+// two addresses changes at both), but never into the ROM area
+void zx_poke(ZX* z, int a, int v) { if (a >= 0x4000 && a <= 0xFFFF) mem_write(*z, a, v); }
 const uint8_t* zx_framebuffer(ZX* z) { return z->fb; }
 int zx_fb_width(void) { return FB_W; }
 int zx_fb_height(void) { return FB_H; }
