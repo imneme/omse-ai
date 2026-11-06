@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
     }
@@ -163,7 +163,8 @@ class Next:
     """One Spectrum Next. boot='bare' is the power-on state (config mode, the boot ROM's area reading 0xFF unless
     boot_rom= gives bytes); timing/hz/speed are in effect from the start (DESIGN.md §9.1 (1))."""
 
-    def __init__(self, timing='p3', hz=None, speed=0, boot='bare', boot_rom=None, issue=4, roms=None, settings=None):
+    def __init__(self, timing='p3', hz=None, speed=0, boot='bare', boot_rom=None, issue=4, roms=None, settings=None,
+                 palette=None):
         """boot='fast' (NEXT-MACHINE.md §7.4 (2)): the firmware's work for timing's personality on MENU.DEF (p3: ZX
         Spectrum Next (standard); 48k, 128k, pentagon: those machines), with the distribution's CONFIG.INI (roms=, or
         $OMSE_AI_NEXT_ROMS, names its machines/next folder) and settings= (a dict of CONFIG.INI keys) over it, then the
@@ -190,10 +191,31 @@ class Next:
         self.sram = (ctypes.c_uint8 * (2 << 20)).from_address(self.lib.zxn_sram(self.z))
         self.bram5 = (ctypes.c_uint8 * 16384).from_address(self.lib.zxn_bram5(self.z))
         self.bram7 = (ctypes.c_uint8 * 8192).from_address(self.lib.zxn_bram7(self.z))
+        if boot == 'bare' and palette == 'loader':     # power-on with the loader's palettes, for pictures (§9.1 (13))
+            self._loader_palette()
+            self.nr_write(0x43, 0x00)                  # (the soft reset would clear it; keep the power-on registers)
+            self.nr_write(0x40, 0x00)
         if boot == 'fast':
             self._fast_boot(d, mode, rom, div_rom, mf_rom, regs, st)
             if speed:
                 self.nr_write(0x07, speed & 3)
+
+    LOADER_COLOURS = [0x00, 0x02, 0xA0, 0xA2, 0x14, 0x16, 0xB4, 0xB6, 0x00, 0x03, 0xE0, 0xE7, 0x1C, 0x1F, 0xFC, 0xFF]
+
+    def _loader_palette(self):
+        """What the boot ROM's loader writes before anything else runs (fw/loader/src/vdp.c vdp_init): the ULA's
+        first palette, inks 0-127 and papers 128-255 in repeating 16-colour blocks; Layer 2's and the sprites' first
+        palettes ordered. It leaves NR 0x43 at 0x20."""
+        for base in (0, 128):
+            self.nr_write(0x40, base)
+            for _ in range(8):
+                for c in self.LOADER_COLOURS:
+                    self.nr_write(0x41, c)
+        for sel in (0x10, 0x20):
+            self.nr_write(0x43, sel)
+            self.nr_write(0x40, 0)
+            for c in range(256):
+                self.nr_write(0x41, c)
 
     def _fast_boot(self, d, mode, rom, div_rom, mf_rom, regs, st):
         def load(name, page16, blocks, blocklen):     # through NR 0x04's window in the firmware; straight in here
@@ -206,6 +228,7 @@ class Next:
                 if len(chunk) != blocklen:
                     raise ValueError(f'{name} is too short for {blocks} block(s) of {blocklen}')
                 self.sram[(page16 + b) * 16384:(page16 + b) * 16384 + blocklen] = chunk
+        self._loader_palette()                         # the boot ROM's loader runs first (§9.1 (13))
         self.nr_write(0x07, 3)                         # the firmware's start: 28 MHz, NR 0x06 = 0xA0, the boot ROM off
         self.nr_write(0x06, 0xA0)                      # (boot.c 445-460; NR 0x03 = 0 stays in config mode)
         self.nr_write(0x03, 0x00)
@@ -327,13 +350,21 @@ class Next:
         w, h = self.lib.zxn_fb_width(), self.lib.zxn_fb_height()
         return w, h, bytes((ctypes.c_uint8 * (w * h)).from_address(self.lib.zxn_framebuffer(self.z)))
 
+    def frame9(self):
+        """The visible area as 9-bit RRRGGGBBB colours (0-511), (w, h, values) with w = 704 14 MHz samples, two per
+        7 MHz pixel, and h = 288; the ULA's paper pixel (px, py) is samples (96 + 2px, 48 + py) and (97 + 2px, 48 + py)
+        (DESIGN.md §9.1 (12))."""
+        w, h = self.lib.zxn_f9_width(), self.lib.zxn_fb_height()
+        return w, h, list((ctypes.c_uint16 * (w * h)).from_address(self.lib.zxn_frame9(self.z)))
+
     def image(self, path=None, scale=2):
-        """The screen as a PIL image (scaled), saved to path if given."""
+        """The screen as a PIL image (scaled), saved to path if given: frame9's colours, 3 bits to 8 as the Next's
+        video output widens them."""
         from PIL import Image
-        w, h, data = self.framebuffer()
-        im = Image.frombytes('P', (w, h), data)
-        im.putpalette([c for rgb in self.PALETTE for c in rgb])
-        im = im.convert('RGB').resize((w * scale, h * scale), Image.NEAREST)
+        w, h, f9 = self.frame9()
+        e = lambda v: v << 5 | v << 2 | v >> 1
+        rgb = bytes(c for v in f9 for c in (e(v >> 6), e((v >> 3) & 7), e(v & 7)))
+        im = Image.frombytes('RGB', (w, h), rgb).resize((w // 2 * scale, h * scale), Image.NEAREST)
         if path:
             im.save(path)
         return im

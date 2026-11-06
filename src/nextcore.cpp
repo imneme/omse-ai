@@ -37,6 +37,7 @@ namespace {
 constexpr uint32_t SRAM_SIZE = 2u << 20;          // 2 MB (issue 4, ref §3.2)
 constexpr int BRAM5_SIZE = 16384, BRAM7_SIZE = 8192, BOOTROM_SIZE = 8192;
 constexpr int FB_W = 352, FB_H = 288, FB_BORDER = 48;  // the visible area at 7 MHz, as zxcore's (48 pixels of border)
+constexpr int F9_W = 2 * FB_W;                          // frame9: 14 MHz samples across the same area (§9.1 (12))
 
 // Video timing per machine timing and 50/60 Hz (ref §2.2): pixels a line, lines, the raw hc where the 256-wide area
 // starts (c_min_hactive), the raw line of pixel row 0 (c_min_vactive), the ULA interrupt's raw position, and the
@@ -92,6 +93,11 @@ struct ZXN {
     uint8_t border = 0;                 // port 0xFE bits 2:0 (ref §2.5)
     uint8_t keys[8] = {0};              // the keyboard matrix: half-row r (A8+r low), bit set = key down
     uint8_t fb[FB_W * FB_H];            // indexed: 0-7, +8 for BRIGHT
+    uint16_t f9[F9_W * FB_H];           // frame9: 9-bit RRRGGGBBB per 14 MHz sample
+    uint16_t pal[2][1024];              // the palette RAMs (zxnext:6851-6960): 0 ULA/tilemap, 1 Layer 2/sprites;
+                                        // address layer << 9 | second << 8 | index; data priority << 14 | RGB333
+    uint8_t pal_idx = 0, pal_stored = 0;   // NR 0x40, and NR 0x44's first byte
+    bool pal_sub = false;               // NR 0x44's write phase (reads in NR 0x03 b7)
     int flash_count = 0;
     bool flash_on = false;
 
@@ -143,7 +149,6 @@ struct ZXN {
     int ay_sel = 0;                     // turbosound.vhd's ay_select, as a chip number
     uint8_t ulap_mode = 0, ulap_index = 0;   // port 0xBF3B (zxnext:4466-4478)
     bool ulap_en = false;               // port_ff3b_ulap_en
-    uint8_t ulap_pal[64] = {0};         // ULA+ entries as written through 0xFF3B (the palette system itself: later)
     struct Ctc {                        // ctc_chan.vhd: one channel
         uint8_t state = 0;              // 0 reset, 1 reset awaiting a time constant, 2 trigger, 3 run, 4 run awaiting one
         uint8_t ctrl = 0;               // the control word's bits 7:3 (b4 int enable, b3 counter, b2 /256, b1 rising, b0 trigger)
@@ -404,6 +409,13 @@ void port_memory_change(ZXN& z, bool was_allram, bool set_top = true) {
 
 // ---- the Next registers (ref §4, machine/nextregs.tsv)
 
+// ---- the palettes (zxnext:4857-4859, 5312-5341, 6843-6960). NR 0x43 b6:4 picks the one to edit: b0 == b1 the
+// ULA/tilemap RAM (b1 = tilemap), else the Layer 2/sprite RAM (b1 = sprites); b2 the second palette.
+inline int pal_ram(const ZXN& z) { const int w = (z.nr[0x43] >> 4) & 7; return ((w >> 1) & 1) != (w & 1); }
+inline int pal_addr(const ZXN& z) { const int w = (z.nr[0x43] >> 4) & 7; return ((w >> 1) & 1) << 9 | ((w >> 2) & 1) << 8 | z.pal_idx; }
+inline uint16_t rgb9(uint8_t v) { return (v << 1) | (((v >> 1) | v) & 1); }  // an 8-bit RRRGGGBB, blue LSB = B1 | B0
+inline void pal_step(ZXN& z) { if (!(z.nr[0x43] & 0x80)) z.pal_idx++; }  // auto-increment unless NR 0x43 b7
+
 void nr_write(ZXN& z, int n, int v);
 void do_reset(ZXN& z, bool hard);
 inline bool locked(const ZXN& z);
@@ -422,8 +434,8 @@ uint8_t joy_read(const ZXN& z, int port);
 int nr_read(ZXN& z, int n) {
     switch (n) {
         case 0x02: return (z.reset_type == 2 ? 2 : z.reset_type == 1 ? 1 : 0) | (z.nr[0x02] & 0x80) | z.nmi_flags;
-        case 0x03: return (z.pend_timing << 4) | (z.lock << 3) | z.mtype; // the registers, not the timing in effect
-                                                                      // (zxnext:5800-5801; palette sub-index b7: later)
+        case 0x03: return (z.pal_sub << 7) | (z.pend_timing << 4) | (z.lock << 3) | z.mtype;   // the registers, not the
+                                                                      // timing in effect; b7 NR 0x44's phase (5800-5801)
         case 0x05: return z.nr[0x05];
         case 0x07: return (z.speed_eff << 4) | z.speed_prog;                                  // ref §1.3
         case 0x0F: return z.issue == 4 ? 0x02 : 0x00;
@@ -447,6 +459,9 @@ int nr_read(ZXN& z, int n) {
             return ((st & 1) << 7) | (((st >> 11) & 1) << 6) | ((st >> 3) & 0x0F);
         }
         case 0xC6: return z.nr[0xC6] & 0x77;                          // (zxnext:6151-6152)
+        case 0x40: return z.pal_idx;                                  // the palettes (zxnext:5942-5955)
+        case 0x41: return (z.pal[pal_ram(z)][pal_addr(z)] >> 1) & 0xFF;
+        case 0x44: { const uint16_t e = z.pal[pal_ram(z)][pal_addr(z)]; return (e >> 14) << 6 | (e & 1); }
         case 0x68: return (z.nr[0x68] & 0xF5) | (z.ulap_en ? 0x08 : 0);   // b3 is port_ff3b_ulap_en (zxnext:5998-5999)
         case 0x61: return z.cop_waddr & 0xFF;                         // (zxnext:5990-5994)
         case 0x62: return (z.cop_mode << 6) | (z.cop_waddr >> 8);
@@ -492,6 +507,27 @@ void nr_write(ZXN& z, int n, int v) {
             z.portff = (z.portff & ~0x40) | ((v & 4) << 4);           // b2 is port FF b6 (zxnext:3577-3578)
             z.ula_int_disabled = z.portff & 0x40;
             z.nr[0x22] = v & 3;                                       // the line interrupt: enable, line b8 (zxnext:5233-5236)
+            return;
+        case 0x40:                                                    // the palette index (zxnext:5312-5314)
+            z.pal_idx = v;
+            z.pal_sub = false;
+            return;
+        case 0x41:                                                    // an 8-bit colour, priority cleared (4857-4859, 5316-5321)
+            z.pal[pal_ram(z)][pal_addr(z)] = rgb9(v);
+            pal_step(z);
+            z.pal_sub = false;
+            return;
+        case 0x43:                                                    // (5326-5333)
+            z.nr[0x43] = v;
+            z.pal_sub = false;
+            return;
+        case 0x44:                                                    // RRRGGGBB, then the blue LSB and priority (5335-5341)
+            if (!z.pal_sub) z.pal_stored = v;
+            else {
+                z.pal[pal_ram(z)][pal_addr(z)] = (v >> 6) << 14 | z.pal_stored << 1 | (v & 1);
+                pal_step(z);
+            }
+            z.pal_sub = !z.pal_sub;
             return;
         case 0x68:                                                    // b3: ULA+ on (zxnext:4491-4492; the rest: later)
             z.nr[0x68] = v;
@@ -662,6 +698,7 @@ void do_reset(ZXN& z, bool hard) {
         z.lock = 0;
         z.nr04 = 0;
         z.coreid = 1;                                                 // the FPGA reloads: declared values (ref §7.1)
+        memset(z.pal, 0, sizeof z.pal);                               // the palette RAMs have no init file (none.bin.txt)
         z.timing = z.pend_timing = 3;
         z.hz60 = z.pend_hz60 = 0;
         z.issue = z.issue;
@@ -689,6 +726,8 @@ void do_reset(ZXN& z, bool hard) {
     z.speed_prog = z.speed_eff = 0;
     z.eff_cd = false;                                                 // (zxnext:5706-5709)
     z.l2_en = false;                                                  // (zxnext:3849)
+    z.pal_idx = 0;                                                    // (zxnext:4938-4948)
+    z.pal_sub = false;
     z.cvc_off = 0;                                                    // NR 0x64 resets to 0 (zxnext:4963)
     z.porte3 = 0;                                                     // (zxnext:4114-4117; divmmc:107-140)
     z.l2_wr = z.l2_rd = z.l2_shadow = false;                          // (zxnext:3847-3854)
@@ -780,7 +819,11 @@ uint8_t io_read(ZXN& z, uint16_t port) {
         if (hi == 3 || (hi == 2 && z.timing == 3)) return ay_read(z, false);
     }
     if (port == 0xFF3B && port_en(z, 24))                             // ULA+ (zxnext:4497-4508)
-        return z.ulap_mode == 0 ? z.ulap_pal[z.ulap_index] : z.ulap_en;
+    {
+        if (z.ulap_mode != 0) return z.ulap_en;                       // mode 00: the entry, GGGRRRBB (zxnext:4497-4505)
+        const uint16_t e = z.pal[0][((z.nr[0x43] >> 6) & 1) << 8 | 0xC0 | z.ulap_index];
+        return ((e >> 3) & 7) << 5 | ((e >> 6) & 7) << 2 | ((e >> 1) & 3);
+    }
     if ((port & 0xF8FF) == 0x183B && port_en(z, 27))                  // the CTC: channel by A10:8, 4-7 answer 00
         return ((port >> 8) & 7) < 4 ? z.ctc[(port >> 8) & 7].count : 0x00;    // (zxnext:2649, 2792; ctc:155-176)
     if ((port & 0xFF) == 0xE3 && dm_en(z)) return z.porte3 & 0xCF;    // divMMC (zxnext:2567, 4131)
@@ -810,7 +853,8 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
         if (z.ulap_mode == 0) z.ulap_index = v & 0x3F;
     }
     if (port == 0xFF3B && port_en(z, 24)) {                           // mode 00: a palette entry; 01: the enable
-        if (z.ulap_mode == 0) z.ulap_pal[z.ulap_index] = v;
+        if (z.ulap_mode == 0)                                         // GGGRRRBB in, as register 0xFF (zxnext:4684, 6865)
+            z.pal[0][((z.nr[0x43] >> 6) & 1) << 8 | 0xC0 | z.ulap_index] = rgb9(((v >> 2) & 7) << 5 | ((v >> 5) & 7) << 2 | (v & 3));
         else if (z.ulap_mode == 1) z.ulap_en = v & 1;
     }
     if (port == 0x123B && port_en(z, 15)) {                           // Layer 2's control (zxnext:3855-3864)
@@ -916,15 +960,43 @@ inline void draw_pixel(ZXN& z) {
     const int fx = x + FB_BORDER, fy = y + FB_BORDER;
     if (fx < 0 || fx >= FB_W || fy < 0 || fy >= FB_H) return;
     uint8_t c = z.border;
-    if (x >= 0 && x < 256 && y >= 0 && y < 192) {
+    const bool next = z.nr[0x43] & 1, ulap = z.ulap_en && !next;     // ULANext wins over ULA+ (zxula:492-531)
+    const bool border = !(x >= 0 && x < 256 && y >= 0 && y < 192);
+    uint8_t attr = (z.border << 3) | z.border, idx;                   // border_clr: "00" & border & border (zxula:417)
+    bool on = false;
+    if (!border) {
         const uint8_t* scr = (z.port7ffd & 8) ? z.bram7 : z.bram5;
         uint8_t bits = scr[((y & 0xC0) << 5) | ((y & 7) << 8) | ((y & 0x38) << 2) | (x >> 3)];
-        uint8_t attr = scr[0x1800 + (y >> 3) * 32 + (x >> 3)];
-        bool on = (bits >> (7 - (x & 7))) & 1;
-        if ((attr & 0x80) && z.flash_on) on = !on;
+        attr = scr[0x1800 + (y >> 3) * 32 + (x >> 3)];
+        on = (bits >> (7 - (x & 7))) & 1;
+        if ((attr & 0x80) && z.flash_on && !next && !ulap) on = !on;  // no FLASH for ULANext or ULA+ (zxula:470)
         c = (on ? (attr & 7) : ((attr >> 3) & 7)) | ((attr & 0x40) ? 8 : 0);
     }
     z.fb[fy * FB_W + fx] = c;
+    // the ULA's palette index (zxula:484-560): standard 000 & paper & BRIGHT & colour; ULA+ 11 & attr7:6 & paper &
+    // colour; ULANext the ink masked by NR 0x42, the paper above it from 128, format FF's paper and border the fallback
+    bool bgnd = false;
+    if (next) {
+        const uint8_t f = z.nr[0x42];
+        if (border) { idx = 0x80 | ((attr >> 3) & 7); bgnd = f == 0xFF; }
+        else if (on) idx = attr & f;
+        else switch (f) {
+            case 0x01: idx = 0x80 | attr >> 1; break;
+            case 0x03: idx = 0xC0 | attr >> 2; break;
+            case 0x07: idx = 0xE0 | attr >> 3; break;
+            case 0x0F: idx = 0xF0 | attr >> 4; break;
+            case 0x1F: idx = 0xF8 | attr >> 5; break;
+            case 0x3F: idx = 0xFC | attr >> 6; break;
+            case 0x7F: idx = 0xFE | attr >> 7; break;
+            default: idx = 0; bgnd = true;
+        }
+    } else if (ulap) {
+        idx = 0xC0 | (attr & 0xC0) >> 2 | (on ? 0 : 8) | (on ? attr & 7 : (attr >> 3) & 7);
+    } else {
+        idx = (on ? 0 : 0x10) | (attr & 0x40) >> 3 | (on ? attr & 7 : (attr >> 3) & 7);
+    }
+    const uint16_t rgb = bgnd ? rgb9(z.nr[0x4A]) : z.pal[0][((z.nr[0x43] >> 1) & 1) << 8 | idx] & 0x1FF;
+    z.f9[fy * F9_W + 2 * fx] = z.f9[fy * F9_W + 2 * fx + 1] = rgb;
 }
 
 // ---- the clock
@@ -1641,6 +1713,8 @@ void zxn_sd_timing(ZXN* z, int ncr, int nac, int busy, int init_tries) {   // as
 }
 int zxn_spi_state(ZXN* z) { return z->spi_state; }
 uint64_t zxn_spi_count(ZXN* z) { return z->spi_count; }
+const uint16_t* zxn_frame9(ZXN* z) { return z->f9; }
+int zxn_f9_width() { return F9_W; }
 int zxn_fb_width() { return FB_W; }
 int zxn_fb_height() { return FB_H; }
 int zxn_border(ZXN* z) { return z->border; }
