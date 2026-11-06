@@ -59,6 +59,10 @@ POWER_ON = {
     0x26: (0x00, 'zxnext:4926', 'zxnext:5904-5905'),
     0x27: (0x00, 'zxnext:4928', 'zxnext:5907-5908'),
     0x28: (0x00, 'zxnext:4950 stored palette value', 'zxnext:5910-5911'),
+    0x2C: (0x80, 'zxnext:2316 I2S off at reset: pi_audio_L = "10" & X"00"',
+           'zxnext:5913-5915'),
+    0x2D: (0x00, 'zxnext:2316 the latched low bits of pi_audio are 00', 'zxnext:5917-5918'),
+    0x2E: (0x80, 'zxnext:2317 pi_audio_R = "10" & X"00"', 'zxnext:5920-5922'),
     0x2F: (0x00, 'zxnext:4930', 'zxnext:5924-5925'),
     0x30: (0x00, 'zxnext:4930', 'zxnext:5927-5928'),
     0x31: (0x00, 'zxnext:4932', 'zxnext:5930-5931'),
@@ -150,9 +154,6 @@ NOT_RESET_VALUES = {
     0x05: 'frame-synced copies; tested after the first frame (NR05_AFTER_FIRST_FRAME)',
     0x1E: 'the beam (cvc), zxnext:5889-5890',
     0x1F: 'the beam (cvc), zxnext:5892-5893',
-    0x2C: 'reads the Pi I2S input, not DAC B (zxnext:5913-5915)',
-    0x2D: 'reads the latched I2S sample (zxnext:5917-5918)',
-    0x2E: 'reads the Pi I2S input, not DAC C (zxnext:5920-5922)',
     0x41: 'reads palette RAM at the index (zxnext:5945-5946)',
     0x44: 'reads palette RAM at the index (zxnext:5954-5955)',
     0x81: 'bit 7 is a bus pin; bits 6:0 checked with NR81_STORED_MASK',
@@ -277,7 +278,7 @@ STEMS = {
     0x02: r'nr_02_|reset_type', 0x03: r'nr_03_', 0x07: r'nr_07_|cpu_speed',
     0x08: r'nr_08_|port_7ffd', 0x0A: r'nr_0a_', 0x0B: r'nr_0b_',
     0x10: r'nr_10_', 0x11: r'nr_11_', 0x1C: r'clip_idx', 0x22: r'nr_22_|nr_23_|port_ff_reg',
-    0x28: r'nr_stored_palette_value', 0x2F: r'nr_30_', 0x30: r'nr_30_', 0x40: r'nr_palette_idx',
+    0x28: r'nr_stored_palette_value', 0x2C: r'pi_audio', 0x2D: r'pi_audio', 0x2E: r'pi_audio', 0x2F: r'nr_30_', 0x30: r'nr_30_', 0x40: r'nr_palette_idx',
     0x61: r'nr_copper_addr', 0x62: r'nr_62_|nr_copper_addr',
     0x68: r'nr_68_|port_ff3b_ulap_en', 0x69: r'port_123b|port_7ffd|port_ff_reg',
     0x6E: r'nr_6e_', 0x6F: r'nr_6f_',
@@ -327,3 +328,73 @@ def nr03_timing_written(field):
 
 def nr03_read(timing, lock, mtype, palette_sub_idx=0):
     return palette_sub_idx << 7 | timing << 4 | lock << 3 | mtype
+
+
+# ----------------------------------------------------------------------------
+# Memory (§3; zxnext:2919-3115, 3597-3760, 4546-4641)
+
+def sram_of_page(page):
+    """SRAM address of 8K page N: 0x40000 + N x 0x2000 (zxnext:2921, §3.1)."""
+    return 0x40000 + page * 0x2000
+
+
+ROM_SRAM = [0x0000, 0x4000, 0x8000, 0xC000]   # ROMs 0-3 (zxnext:3009 "00000" & rom & A13)
+ALTROM_128 = 0x18000                          # zxnext:3077 "000011" & alt_128_n & A13
+ALTROM_48 = 0x1C000
+DIVMMC_ROM = 0x10000                          # zxnext:3043 "00001000"
+BLOCK_RAM_PAGES = {0x0A: ('bram5', 0x0000), 0x0B: ('bram5', 0x2000), 0x0E: ('bram7', 0x0000)}
+
+
+def divmmc_ram(bank):
+    return 0x20000 + bank * 0x2000            # zxnext:3051 "0001" & divmmc_bank
+
+
+def all_ram_mmu(cfg):
+    """MMU0-7 in all-RAM mode for 1FFD bits 2:1 = cfg, by the arithmetic at
+    zxnext:4565-4572 (r2 = 1FFD bit 2, r1 = bit 1)."""
+    r2, r1 = cfg >> 1 & 1, cfg & 1
+    o, a = r2 | r1, r2 & r1
+    m6 = (1 - r2) & r1
+    return [o << 3 | 0, o << 3 | 1, o << 3 | a << 2 | 2, o << 3 | a << 2 | 3,
+            o << 3 | 4, o << 3 | 5, m6 << 3 | 6, m6 << 3 | 7]
+
+
+# The +3's own table, 16K banks at 0000/4000/8000/C000 (ports.txt:150-154, whose
+# configuration 10 says bank 5 at 0x0000: a typo, see tests-notes.md; the VHDL
+# and a real +3 give bank 4).
+ALL_RAM_BANKS = {0: (0, 1, 2, 3), 1: (4, 5, 6, 7), 2: (4, 5, 6, 3), 3: (4, 7, 6, 3)}
+
+
+def layer2_page(base_bank, segment, offset, addr):
+    """The 8K page port 0x123B maps addr to (zxnext:2924-2927): segment 3 uses
+    A15:14 as the 16K offset; plus the stored bank offset; x2 + A13."""
+    seg = (addr >> 14) & 3 if segment == 3 else segment
+    return (base_bank + seg + offset) * 2 + (addr >> 13 & 1)
+
+
+def rom_for(mtype, port_7ffd=0, port_1ffd=0, nr_8c=0):
+    """The ROM 0-3 a machine type shows (zxnext:2938-2967)."""
+    lock1, lock0 = nr_8c >> 5 & 1, nr_8c >> 4 & 1
+    hi, lo = port_1ffd >> 2 & 1, port_7ffd >> 4 & 1
+    if mtype == 0b001:                        # 48K
+        return 0
+    if mtype == 0b011:                        # +3
+        return (lock1 << 1 | lock0) if (lock1 or lock0) else (hi << 1 | lo)
+    return lock1 if (lock1 or lock0) else lo  # 128K, Pentagon
+
+
+def altrom_base(mtype, port_7ffd=0, port_1ffd=0, nr_8c=0):
+    """Which alternate ROM replaces the ROM (sram_alt_128_n, zxnext:2938-2967)."""
+    lock1, lock0 = nr_8c >> 5 & 1, nr_8c >> 4 & 1
+    if mtype == 0b001:
+        alt_48 = not ((not lock1) and lock0)
+    elif mtype == 0b011:
+        alt_48 = bool(lock1) if (lock1 or lock0) else bool(port_7ffd >> 4 & 1)
+    else:
+        alt_48 = bool(lock1) if (lock1 or lock0) else bool(port_7ffd >> 4 & 1)
+    return ALTROM_48 if alt_48 else ALTROM_128
+
+
+# Ports, as decoded (zxnext:2537-2563). 0x3FFD reaches 7FFD only when A14 isn't
+# decoded, i.e. not under +3 timing (zxnext:2552).
+P7FFD, PDFFD, P1FFD, PEFF7, P123B, PE3 = 0x7FFD, 0xDFFD, 0x1FFD, 0xEFF7, 0x123B, 0x00E3

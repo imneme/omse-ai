@@ -104,6 +104,27 @@ class Tables(unittest.TestCase):
                 bad.append(f'NR {reg:#04x}: tsv {tsv:#04x}, reference {mine:#04x}')
         self.assertEqual(bad, [])
 
+    def test_all_ram_arithmetic_is_the_p3s_table(self):
+        for cfg, banks in ref.ALL_RAM_BANKS.items():
+            pages = [p for b in banks for p in (b * 2, b * 2 + 1)]
+            self.assertEqual(ref.all_ram_mmu(cfg), pages, f'configuration {cfg:02b}')
+
+    @unittest.skipUnless(VHDL.exists(), f'needs the 3.02.02 VHDL at {VHDL}')
+    def test_all_ram_arithmetic_is_transcribed(self):
+        text = '\n'.join(vhdl_lines()[4564:4572])        # zxnext:4565-4572
+        self.assertIn('MMU0 <= X"0" & (port_1ffd_reg(2) or port_1ffd_reg(1)) & "00" & \'0\'', text)
+        self.assertIn('MMU6 <= X"0" & (not(port_1ffd_reg(2)) and port_1ffd_reg(1)) & "11" & \'0\'',
+                      text)
+
+    def test_layer2_and_rom_models(self):
+        self.assertEqual(ref.layer2_page(8, 0, 0, 0x0000), 16)
+        self.assertEqual(ref.layer2_page(8, 3, 0, 0x8000), 20)
+        self.assertEqual(ref.layer2_page(8, 1, 2, 0x2000), 23)
+        self.assertEqual([ref.rom_for(0b011, f << 4 & 0x10, f << 1 & 0x04) for f in range(4)],
+                         [0, 1, 2, 3])
+        self.assertEqual(ref.altrom_base(0b001), ref.ALTROM_48)
+        self.assertEqual(ref.altrom_base(0b010, 0x00), ref.ALTROM_128)
+
     def test_reset_type_model(self):
         for n, want in enumerate(ref.RESET_TYPE_READS):
             self.assertEqual(ref.reset_type_after(n), want, f'after {n} soft resets')
