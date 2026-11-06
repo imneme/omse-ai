@@ -1000,15 +1000,19 @@ inline bool wait_s(const ZXN& z) {
 }
 
 // +3 timing's form (zxula.vhd 597-600): WAIT while MREQ is low on a contended page, in the window wait_s gives +3
-// (hc_adj(3:1) = 000 as well: slots 15, 0 and 3-14). The Z80 samples WAIT on the falling edge of T2 and of each Tw;
-// z80.h checks it at the start of the T2 step and repeats the step while it's set. So before each rising edge, the
-// window is evaluated at the slot of that T-state's falling edge, hc_ula + 1. No I/O contention in +3 timing.
+// (hc_adj(3:1) = 000 as well: slots 15, 0 and 3-14). The T80N samples WAIT_n at the rising edge that ends T2 and
+// each Tw (t80n.vhd's T-state process, "TState = 2 and WAIT_n = '0'"; t80na.vhd:193 passes it straight in), seeing
+// the hc from before that edge. z80.h checks WAIT at the start of the T2 step, the edge that begins T2, and repeats
+// the step while it's set; +3 never stretches the clock, so the deciding edge is one T on: hc_ula + 2, into the next
+// row past the line's end (Loam's ContentionP3Exact). No I/O contention in +3 timing.
 inline bool p3_wait_now(const ZXN& z) {
     if (!z.contention || z.timing != 3 || z.speed_eff != 0 || (z.nr[0x08] & 0x40)) return false;
     if (!z.p3_mem && !z.p3_waiting) return false;
-    int h = hc_ula(z) + 1, v = vc_ula(z);
+    const Timing& t = T(z);
+    int h = hc_ula(z) + 2, v = vc_ula(z);
+    if (h >= t.hc_len) { h -= t.hc_len; v = (v + 1) % t.vc_len; }    // vc_ula steps at hc_ula 0
     int adj = ((h & 15) + 1) & 15;
-    return (adj >= 4 || adj <= 1) && (h & 0x1FF) < 256 && v < 192;
+    return (adj >= 4 || adj <= 1) && h < 256 && v < 192;
 }
 
 // ---- Layer 2 at the beam (video/layer2.vhd). (x, y) is the pixel relative to the ULA's paper; sample 0/1 the two
