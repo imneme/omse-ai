@@ -91,6 +91,10 @@ def harness(header=None):
     h.bare_get.argtypes = [ctypes.c_void_p, ctypes.c_int]
     h.bare_set.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint]
     h.bare_step.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_int]
+    if hasattr(h, 'bare_endlog'):
+        h.bare_steplog.restype = h.bare_endlog.restype = ctypes.c_void_p
+        h.bare_steplog.argtypes = h.bare_endlog.argtypes = [ctypes.c_void_p]
+        h.bare_set_int.argtypes = [ctypes.c_void_p, ctypes.c_int]
     _libs[header] = h
     return h
 
@@ -128,7 +132,21 @@ class Bare:
     def step(self, limit=400):
         n = self.h.bare_step(self.b, self.log, 512, limit)
         assert n >= 0, 'ran away: no next instruction within the limit'
+        self.last_n = n
         return [tick_of(self.log[i]) for i in range(min(n, 512))]
+
+    def ends(self):
+        """z80_mcycle_end after each tick of the last step"""
+        e = (ctypes.c_uint8 * 2048).from_address(self.h.bare_endlog(self.b))
+        return [bool(e[i]) for i in range(min(self.last_n, 2048))]
+
+    def steps(self):
+        """the decoder step each tick of the last step ran"""
+        e = (ctypes.c_uint16 * 2048).from_address(self.h.bare_steplog(self.b))
+        return [e[i] for i in range(min(self.last_n, 2048))]
+
+    def interrupt(self, on):
+        self.h.bare_set_int(self.b, int(on))
 
 
 def tick_of(p):

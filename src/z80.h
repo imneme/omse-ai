@@ -400,6 +400,7 @@ typedef struct {
     uint8_t im;
     bool iff1, iff2;
     bool z80n;          // the ZX Spectrum Next's Z80N: its extra ED instructions (off: a Zilog Z80)
+    uint16_t ran_step;  // the decoder step the last tick ran (for z80_mcycle_end)
 } z80_t;
 
 // initialize a new Z80 instance and return initial pin mask
@@ -412,6 +413,8 @@ uint64_t z80_tick(z80_t* cpu, uint64_t pins);
 uint64_t z80_prefetch(z80_t* cpu, uint16_t new_pc);
 // return true when full instruction has finished
 bool z80_opdone(z80_t* cpu);
+// true if the last tick was the last T-state of a machine cycle
+bool z80_mcycle_end(z80_t* cpu);
 
 #ifdef __cplusplus
 } // extern C
@@ -517,6 +520,11 @@ uint64_t z80_reset(z80_t* cpu) {
     cpu->wz = cpu->sp = cpu->ix = cpu->iy = 0xFFFF;
     cpu->af2 = cpu->bc2 = cpu->de2 = cpu->hl2 = 0xFFFF;
     return z80_prefetch(cpu, 0x0000);
+}
+
+bool z80_mcycle_end(z80_t* cpu) {
+    (void)cpu;
+    return false;
 }
 
 bool z80_opdone(z80_t* cpu) {
@@ -1219,6 +1227,7 @@ uint64_t z80_prefetch(z80_t* cpu, uint16_t new_pc) {
 #define _cc_m           (cpu->f&Z80_SF)
 
 uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
+    cpu->ran_step = cpu->step;
     pins &= ~(Z80_CTRL_PIN_MASK|Z80_RETI|Z80N_SIDEBAND_MASK);
     switch (cpu->step) {
         // <% decoder

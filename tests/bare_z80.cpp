@@ -14,6 +14,10 @@ struct Bare {
     uint64_t pins;
     bool at_t1;                 // the last tick was an instruction's first (its fetch's T1)
     uint64_t t1_pins;           // ... and these were its pins
+    uint16_t t1_step;           // ... the step it ran
+    bool t1_end;                // ... and whether z80_mcycle_end said so
+    uint16_t steplog[2048];     // per tick of the last bare_step: the step it ran
+    uint8_t endlog[2048];       // ... and z80_mcycle_end after it
     int wait_mem;               // wait states to add to each memory cycle (read or write), at its T2
     int wait_rd;                // ... or to each memory *read* only (the Next at 28 MHz)
     int waits_left;
@@ -45,6 +49,8 @@ static uint64_t tick(Bare* b) {
         b->waits_left = b->wait_mem + ((p & Z80_RD) ? b->wait_rd : 0);
     } else if ((p & Z80_IORQ) && !(p & Z80_M1) && (p & Z80_RD)) {
         Z80_SET_DATA(p, b->io_in[a]);
+    } else if ((p & Z80_IORQ) && (p & Z80_M1)) {
+        Z80_SET_DATA(p, 0xFF);  // an interrupt acknowledge: FFh, as on the Next (IM 0: RST 38h)
     }
     // a wait state is asked for on T1's pins (or a held T2's), and the next tick's T2 sees it and stays a T2
     p &= ~Z80_WAIT;
@@ -93,7 +99,7 @@ void bare_set(Bare* b, int r, unsigned v) {
     switch (r) {
         case 0: c.af = v; break; case 1: c.bc = v; break; case 2: c.de = v; break; case 3: c.hl = v; break;
         case 4: c.ix = v; break; case 5: c.iy = v; break; case 6: c.sp = v; break;
-        case 7: b->pins = z80_prefetch(&c, v); b->at_t1 = false; break;
+        case 7: b->pins = z80_prefetch(&c, v); c.int_bits = 0; b->at_t1 = false; break;   // a fresh start
         case 8: c.wz = v; break; case 9: c.ir = v; break; case 10: c.af2 = v; break; case 11: c.bc2 = v; break;
         case 12: c.de2 = v; break; case 13: c.hl2 = v; break; case 14: c.im = v; break;
         case 15: c.iff1 = v; break; case 16: c.iff2 = v; break;
@@ -111,17 +117,32 @@ void bare_reset(Bare* b) { b->pins = z80_reset(&b->cpu); b->at_t1 = false; }
 // of ticks (its T-states, waits included), or -1 if it ran past `limit` ticks.
 int bare_step(Bare* b, uint64_t* log, int max, int limit) {
     int n = 0;
-    uint64_t p = b->at_t1 ? b->t1_pins : tick(b);
+    uint64_t p;
+    uint16_t st;
+    bool end;
+    if (b->at_t1) {
+        p = b->t1_pins, st = b->t1_step, end = b->t1_end;
+    } else {
+        p = tick(b), st = b->cpu.ran_step, end = z80_mcycle_end(&b->cpu);
+    }
     for (;;) {
         if (n < max) log[n] = p;
+        if (n < 2048) {
+            b->steplog[n] = st;
+            b->endlog[n] = end;
+        }
         n++;
         if (n > limit) return -1;
-        p = tick(b);
+        p = tick(b), st = b->cpu.ran_step, end = z80_mcycle_end(&b->cpu);
         if (is_t1(b, p)) break;
     }
     b->at_t1 = true;
-    b->t1_pins = p;
+    b->t1_pins = p, b->t1_step = st, b->t1_end = end;
     return n;
 }
+
+uint16_t* bare_steplog(Bare* b) { return b->steplog; }
+uint8_t* bare_endlog(Bare* b) { return b->endlog; }
+void bare_set_int(Bare* b, int on) { if (on) b->pins |= Z80_INT; else b->pins &= ~Z80_INT; }
 
 }
