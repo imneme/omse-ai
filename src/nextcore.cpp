@@ -117,6 +117,10 @@ struct ZXN {
     bool dm_pending = false;            // automap_held follows automap_hold once the fetch's MREQ has risen
     int snoop = 0;                      // im2_control.vhd's state: 0, 1 after ED, 2 after CB, 3 after DD/FD
     int im_mode = 0;                    // the IM mode it has seen (NR 0xC0 b2:1)
+    bool reti_seen = false;             // the snooper saw ED 4D, for the chain's next CPU edge
+    uint16_t int_status = 0;            // each source's status (im2p:150-160), bit = source number
+    uint16_t im2_req = 0;               // hardware IM2: pending until its service ends (im2p:162-176)
+    uint8_t im2_state[14] = {0};        // im2_device.vhd: 0 idle, 1 requesting, 2 acknowledged, 3 in service
 
     // time and the beam
     uint64_t t28 = 0, cpu_clocks = 0, frame = 0;
@@ -357,6 +361,8 @@ void port_memory_change(ZXN& z, bool was_allram, bool set_top = true) {
 void nr_write(ZXN& z, int n, int v);
 void do_reset(ZXN& z, bool hard);
 inline bool locked(const ZXN& z);
+void int_raise(ZXN& z, int i, bool unq);
+inline uint16_t int_status(const ZXN& z);
 
 int nr_read(ZXN& z, int n) {
     switch (n) {
@@ -381,6 +387,18 @@ int nr_read(ZXN& z, int n) {
             return (z.l2_en ? 0x80 : 0) | (z.port7ffd & 0x08) << 3 | (z.portff & 0x3F);
         case 0xA2: return (z.nr[0xA2] & 0xDD) | 0x02;                 // b5 reads 0, b1 reads 1 (zxnext:6098-6099)
         case 0xC0: return (z.nr[0xC0] & 0xE9) | (z.im_mode << 1);     // the snooped IM mode in b2:1 (zxnext:6136-6137)
+        case 0x20: {                                                  // line, ULA, CTC 3-0 (zxnext:5895-5896)
+            const uint16_t st = int_status(z);
+            return ((st & 1) << 7) | (((st >> 11) & 1) << 6) | ((st >> 3) & 0x0F);
+        }
+        case 0xC6: return z.nr[0xC6] & 0x77;                          // (zxnext:6151-6152)
+        case 0xC8: { const uint16_t st = int_status(z); return ((st & 1) << 1) | ((st >> 11) & 1); }   // (6154-6155)
+        case 0xC9: return (int_status(z) >> 3) & 0xFF;                // CTC 7-0 (6157-6158)
+        case 0xCA: {                                                  // the UARTs (6160-6161)
+            const uint16_t st = int_status(z);
+            const int t1 = (st >> 13) & 1, r1 = (st >> 2) & 1, t0 = (st >> 12) & 1, r0 = (st >> 1) & 1;
+            return (t1 << 6) | (r1 << 5) | (r1 << 4) | (t0 << 2) | (r0 << 1) | r0;
+        }
         case 0xC4:                                                    // (zxnext:6144-6145, 6618)
             return (z.nr[0xC4] & 0x80) | (z.nr[0x22] & 2) | ((z.portff & 0x40) ? 0 : 1);
         case 0x8E:                                                    // the same layout, bit 3 = 1 (zxnext 6065-6066)
@@ -431,6 +449,31 @@ void nr_write(ZXN& z, int n, int v) {
             return;
         case 0xC0:
             z.nr[0xC0] = v & 0xE9;                                    // (zxnext:5533-5536)
+            if (!(v & 1)) {                                           // pulse mode resets the chain (im2p:96, im2_reset_n)
+                z.im2_req = 0;
+                memset(z.im2_state, 0, sizeof z.im2_state);
+            }
+            return;
+        case 0x20:                                                    // raise line (b7), ULA (b6), CTC 3-0 (b3:0)
+            if (v & 0x80) int_raise(z, 0, true);                      // regardless of enables (zxnext:1905-1906)
+            if (v & 0x40) int_raise(z, 11, true);
+            for (int c = 0; c < 4; c++) if (v & (1 << c)) int_raise(z, 3 + c, true);
+            return;
+        case 0xC6:
+            z.nr[0xC6] = v & 0x77;
+            return;
+        case 0xC8:                                                    // write 1 to clear (zxnext:1911-1914)
+            if (v & 1) z.int_status &= ~(1 << 11);
+            if (v & 2) z.int_status &= ~1;
+            return;
+        case 0xC9:
+            z.int_status &= ~((uint16_t)v << 3);
+            return;
+        case 0xCA:
+            if (v & 0x40) z.int_status &= ~(1 << 13);
+            if (v & 0x04) z.int_status &= ~(1 << 12);
+            if (v & 0x30) z.int_status &= ~(1 << 2);
+            if (v & 0x03) z.int_status &= ~(1 << 1);
             return;
         case 0x69:                                                    // (zxnext:3866, 3616-3617, 3575-3576)
             z.l2_en = v & 0x80;
@@ -560,6 +603,9 @@ void do_reset(ZXN& z, bool hard) {
     z.dm_hold = z.dm_held = z.dm_instant = z.dm_pending = false;
     z.snoop = 0;
     z.im_mode = 0;
+    z.reti_seen = false;
+    z.int_status = z.im2_req = 0;
+    memset(z.im2_state, 0, sizeof z.im2_state);
     z.nr_sel = 0x24;
     z.ula_int_disabled = false;
     z.int_req = z.int_low = false;
@@ -745,6 +791,76 @@ inline void draw_pixel(ZXN& z) {
 
 // One rising edge of the CPU clock. Returns false (and changes nothing) if a run_until_pc stop is due: the CPU is
 // about to begin T1 of an instruction's first opcode fetch at an address in the range (DESIGN.md §9.1 (5)).
+// ---- the interrupt controller (ref §6; zxnext:1887-1958). Fourteen sources by priority, the number also the vector's
+// middle bits: 0 line, 1 UART0 Rx, 2 UART1 Rx, 3-10 CTC 0-7, 11 ULA, 12 UART0 Tx, 13 UART1 Tx.
+inline bool hw_im2(const ZXN& z) { return z.nr[0xC0] & 1; }          // NR 0xC0 b0: hardware IM2 mode
+inline bool int_en(const ZXN& z, int i) {                             // im2_int_en (zxnext:1908-1909)
+    if (i == 0) return z.nr[0x22] & 2;                                // the line interrupt (NR 0x22 b1 / NR 0xC4 b1)
+    if (i == 11) return !(z.portff & 0x40);                           // the ULA (port FF b6, NR 0x22 b2, NR 0xC4 b0)
+    if (i >= 3 && i <= 10) return (z.nr[0xC5] >> (i - 3)) & 1;        // the CTC
+    if (i == 1) return z.nr[0xC6] & 0x03;                             // the UARTs (NR 0xC6)
+    if (i == 2) return z.nr[0xC6] & 0x30;
+    if (i == 12) return z.nr[0xC6] & 0x04;
+    return z.nr[0xC6] & 0x40;
+}
+// A source's request edge (im2p:118-131), or NR 0x20's (unq: the enables don't apply, zxnext:1905-1906). Status is
+// always recorded; the pulse fires in pulse mode, and in hardware IM2 mode only for the ULA while the CPU isn't in
+// IM 2 (im2p:182-194, EXCEPTION); in hardware IM2 mode the source also becomes pending for the chain.
+void int_raise(ZXN& z, int i, bool unq) {
+    const bool en = unq || int_en(z, i);
+    z.int_status |= 1 << i;
+    if (hw_im2(z) && en) z.im2_req |= 1 << i;
+    if (en && (!hw_im2(z) || (i == 11 && z.im_mode != 2))) z.int_req = true;
+}
+inline uint16_t int_status(const ZXN& z) { return z.int_status | z.im2_req; }   // o_int_status (im2p:178)
+// the daisy chain's request to the CPU: a requesting device with nothing above it in service, the CPU in IM 2
+// (im2d:150)
+inline bool im2_int(const ZXN& z) {
+    if (!hw_im2(z) || z.im_mode != 2) return false;
+    bool iei = true;
+    for (int i = 0; i < 14 && iei; i++) {
+        const int st = z.im2_state[i];
+        if (st == 1) return true;
+        iei = st == 0 ? iei : st == 1 ? (iei && z.snoop == 1) : false;
+    }
+    return false;
+}
+// what the interrupt acknowledge reads: the acknowledged device's vector, NR 0xC0 b7:5 & number & 0, when the chain
+// says so (im2_ieo low), else 0xFF (zxnext:1827-1837, 1958; im2d:155)
+uint8_t intack_data(const ZXN& z) {
+    if (!hw_im2(z)) return 0xFF;
+    bool iei = true;
+    for (int i = 0; i < 14; i++) {
+        const int st = z.im2_state[i];
+        if (st == 1 && iei && z.im_mode == 2) return (z.nr[0xC0] & 0xE0) | (i << 1);
+        iei = st == 0 ? iei : st == 1 ? (iei && z.snoop == 1) : false;
+    }
+    return iei ? 0xFF : (z.nr[0xC0] & 0xE0);
+}
+// each device's state machine, on a rising CPU edge, from the pins as they were before it (im2_device.vhd:66-104)
+void im2_edge(ZXN& z, uint64_t before) {
+    const bool reti = z.reti_seen;
+    z.reti_seen = false;
+    if (!hw_im2(z)) return;
+    const bool m1 = before & Z80_M1, iorq = before & Z80_IORQ, im2 = z.im_mode == 2;
+    bool iei = true;
+    for (int i = 0; i < 14; i++) {
+        uint8_t& st = z.im2_state[i];
+        const bool ieo = st == 0 ? iei : st == 1 ? (iei && z.snoop == 1) : false;
+        switch (st) {
+            case 0: if (((z.im2_req >> i) & 1) && !m1) st = 1; break;
+            case 1: if (m1 && iorq && iei && im2) st = 2; break;
+            case 2: if (!m1) st = 3; break;
+            default:
+                if (reti && iei && im2) {                             // RETI ends the service (im2d:123-128)
+                    st = 0;
+                    z.im2_req &= ~(1 << i);
+                }
+        }
+        iei = ieo;
+    }
+}
+
 // divMMC's entry points for a fetch from address a (zxnext:2805-2867). RST n (0x0000-0x0038): NR 0xB8 bit n enables
 // it, NR 0xB9 bit n makes it always (1) or ROM 3 only (0), NR 0xBA bit n instant (1) or delayed (0). NR 0xBB: b7
 // 0x3Dxx (instant, ROM 3), b6 the 0x1FF8-0x1FFF exit (delayed), b5:2 the tape traps 0x056A, 0x04D7, 0x0562, 0x04C6
@@ -806,6 +922,7 @@ void snoop_fetch(ZXN& z, uint8_t op) {
                 remap(z);
             }
             if ((op & 0xC7) == 0x46) z.im_mode = ((op & 0x18) == 0x18) ? 2 : ((op & 0x18) == 0x10) ? 1 : 0;
+            if (op == 0x4D) z.reti_seen = true;                       // RETI, ED 4D only (im2c:22-38, 233-234)
             z.snoop = 0;
             return;
         case 2:                                                       // after CB: this is its opcode
@@ -825,7 +942,8 @@ bool cpu_edge(ZXN& z) {
     uint64_t p = z.pins;
     const bool p3w = p3_wait_now(z);
     if (z.wait_next || p3w) p |= Z80_WAIT; else p &= ~Z80_WAIT;
-    if (z.int_low) p |= Z80_INT; else p &= ~Z80_INT;
+    im2_edge(z, saved_pins);
+    if (z.int_low || im2_int(z)) p |= Z80_INT; else p &= ~Z80_INT;     // pulse_int_n and im2_int_n (zxnext:1799)
     p = z80_tick(&z.cpu, p);
     if (z.stop_on && !z.first_edge && z80_opdone(&z.cpu)) {
         uint16_t a = Z80_GET_ADDR(p);
@@ -881,8 +999,7 @@ bool cpu_edge(ZXN& z) {
             mem_write(z, a, Z80_GET_DATA(p));
         }
     } else if ((p & Z80_IORQ) && (p & Z80_M1)) {
-        Z80_SET_DATA(p, 0xFF);                                        // INTACK: 0xFF in pulse mode (zxnext:1827-1837;
-                                                                      // hardware IM2's vector: later)
+        Z80_SET_DATA(p, intack_data(z));                              // INTACK: 0xFF, or hardware IM2's vector
     } else if ((p & Z80_IORQ) && !(p & Z80_M1)) {
         uint16_t port = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
@@ -981,13 +1098,13 @@ bool master_tick(ZXN& z) {
             }
         }
         const Timing& t2 = T(z);
-        if (z.hc == t2.int_h && z.vc == t2.int_v && !z.ula_int_disabled) z.int_req = true;
+        if (z.hc == t2.int_h && z.vc == t2.int_v && !z.ula_int_disabled) int_raise(z, 11, false);
         // the line interrupt for line N: at hc_ula 255 on cvc line N-1, the last line for N = 0, "before the line is
         // drawn" (ulat:561-583); NR 0x22 b1 enables it, NR 0x22 b0 : NR 0x23 is N (zxnext:5233-5239). In pulse mode
         // it makes the same pulse as the ULA's (zxnext:1900-1955).
         if (z.nr[0x22] & 2) {
             const int n = ((z.nr[0x22] & 1) << 8) | z.nr[0x23];
-            if (hc_ula(z) == 255 && cvc(z) == (n == 0 ? t2.vc_len - 1 : n - 1)) z.int_req = true;
+            if (hc_ula(z) == 255 && cvc(z) == (n == 0 ? t2.vc_len - 1 : n - 1)) int_raise(z, 0, false);
         }
         draw_pixel(z);
     }
