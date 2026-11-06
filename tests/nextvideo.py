@@ -71,6 +71,9 @@ class Video:
         self.nr27 = 0x00                # ULA scroll y (zxnext:4928)
         self.nr68 = 0x00                # ULA control: b7 ULA off, b6:5 blend, b3 ULA+, b2 fine x, b0 stencil
         self.nr6b = 0x00                # tilemap control (b7 enable): not modelled yet
+        self.nr6a = 0x00                # LoRes: b5 Radastan, b4 display-file XOR, b3:0 palette offset (zxnext:4972)
+        self.nr32 = 0x00                # LoRes scroll x, y (zxnext:4934-4936)
+        self.nr33 = 0x00
         # clip windows: x1, x2, y1, y2 and the write index (zxnext:4898-4920; writes zxnext:5180-5229)
         self.clip = {0x18: [0x00, 0xFF, 0x00, 0xBF], 0x19: [0x00, 0xFF, 0x00, 0xBF],
                      0x1A: [0x00, 0xFF, 0x00, 0xBF], 0x1B: [0x00, 0x9F, 0x00, 0xFF]}
@@ -172,6 +175,12 @@ class Video:
             self.port_ff = (self.port_ff & 0xC0) | (v & 0x3F)
         elif n == 0x6B:
             self.nr6b = v
+        elif n == 0x6A:
+            self.nr6a = v                                   # zxnext:5392-5396
+        elif n == 0x32:
+            self.nr32 = v
+        elif n == 0x33:
+            self.nr33 = v
 
     def nr_read(self, n):
         """What port 0x253B returns for the registers this model owns (zxnext:5842-5961)."""
@@ -293,7 +302,31 @@ class Video:
             y2 = 0xBF                                               # zxnext:6686-6690
         inside = (not border) and x1 <= phc <= x2 and y1 <= py <= y2
         clipped = not (inside or border)                            # ula:562
+        if self.nr15 & 0x80 and phc >= 0 and py >= 0 and x1 <= phc <= x2 and y1 <= py <= y2:
+            # LoRes replaces the ULA's pixel where it's enabled, inside the ULA's clip window (lores:112;
+            # zxnext:4199-4202, 6840, 6887); it's never clipped there and never the fallback (zxnext:6894, 6970)
+            return self._lores(phc, py), 0, border, False
         return index, bgnd, border, clipped
+
+    def _lores(self, phc, py):
+        """LoRes's 8-bit palette index at (phc, py), both inside the paper (lores:80-108)."""
+        x = (phc + self.nr32) & 0xFF                                # lores:82
+        y = py + self.nr33
+        if y >= 192:                                                # lores:86-87
+            y = (y - 192) & 0xFF
+        off = self.nr6a & 15
+        if self.nr6a & 0x20:                                        # Radastan: 4-bit (lores:96, 104-108)
+            dfile = (self.port_ff & 1) ^ ((self.nr6a >> 4) & 1)     # zxnext:6703
+            byte = self.bram5[(dfile << 13) | ((y >> 1) << 6) | (x >> 2)]
+            nib = (byte >> 4) if not (x & 2) else (byte & 15)
+            ulap = self.ulap_en and not (self.nr43 & 1)             # zxnext:4185
+            high = (0xC | (off & 3)) if ulap else off
+            return (high << 4) | nib
+        a = ((y >> 1) << 7) | (x >> 1)                              # lores:92-95: rows 96+ at +0x2000
+        if y >= 96:
+            a += 0x800
+        byte = self.bram5[a]
+        return ((((byte >> 4) + off) & 15) << 4) | (byte & 15)      # lores:100, 110
 
     # ------------------------------------------------------------------ Layer 2
     def _layer2(self, phc, half, py):
@@ -356,8 +389,8 @@ class Video:
         blanking before frame9 row sy (as a copper WAIT at h = 38-50 does: hc_ula 316-419 lies between
         one row's last visible sample and the next row's first, on 448- and 456-pixel lines), so each
         row is drawn wholly with the registers as they stand when it starts."""
-        if self.nr15 & 0x81 or any(n == 0x15 and v & 0x81 for _, n, v in (schedule or [])):
-            raise NotImplementedError('LoRes and sprites are not in the model yet (NR 0x15 bits 7, 0)')
+        if self.nr15 & 0x01 or any(n == 0x15 and v & 0x01 for _, n, v in (schedule or [])):
+            raise NotImplementedError('sprites are not in the model yet (NR 0x15 bit 0)')
         if self.nr6b & 0x80:
             raise NotImplementedError('the tilemap is not in the model yet (NR 0x6B bit 7)')
         pending = sorted(schedule or [])

@@ -521,5 +521,27 @@ class Probes(VideoCase):
             self.fail(f'{len(bad)} samples differ, first at ({bad[0] % w},{bad[0] // w}); pictures: {path}')
 
 
+@needs_next
+class LoRes(VideoCase):
+    """lores.vhd: 128x96 in 8 bits or Radastan's 4, in the ULA's place, inside the ULA's clip window."""
+
+    def lores_scene(self, radastan=False):
+        s = ula_scene(12)
+        data = bytes(((a * 0x3B) ^ (a >> 7)) & 0xFF for a in range(0x3800))
+        s.bram5(0, data[:0x1800]).bram5(0x2000, data[0x2000:0x3800] if not radastan else data[0x2000:0x3800])
+        s.nr(0x15, 0x80).nr(0x6A, 0x20 | 0x05 if radastan else 0x03)
+        return s
+
+    def test_lores(self):
+        self.assertFrameMatches(self.lores_scene())
+
+    def test_lores_scroll_and_clip(self):
+        s = self.lores_scene().nr(0x32, 37).nr(0x33, 150).nr(0x1C, 0x04).nr(0x1A, 20, 200, 30, 170)
+        self.assertFrameMatches(s)
+
+    def test_radastan(self):
+        self.assertFrameMatches(self.lores_scene(radastan=True))
+
+
 if __name__ == '__main__':
     unittest.main()
