@@ -124,5 +124,54 @@ class Copper(NextCase):
         self.assertEqual(zx.nr_read(0x7F), 0x11, 'copper.vhd:73-74')
 
 
+@needs_next
+class CopperAndNR02(NextCase):
+    """§9 D-7: the copper's writes reach NR 0x02 like any other (zxnext:4716-4718,
+    3769-3770, 6277-6278), though nextreg.txt says it can't clear its bits."""
+
+    def machine(self, words):
+        zx = bare(timing='48k')
+        load(zx, words)
+        return zx
+
+    def test_the_nmi_flag_sets_even_with_the_nmi_disabled(self):
+        """nmi_accept_cause is only "the NMI machine is idle or fetching"
+        (zxnext:2123): NR 0x06 gates the NMI itself (zxnext:2049), not the
+        flag. (P-11 expected the flag clear; the VHDL sets it.)"""
+        zx = bare(timing='48k')
+        self.assertEqual(zx.nr_read(0x06) & 0x08, 0x00, 'multiface NMI disabled at power-on')
+        zx.nr_write(0x02, 0x08)
+        self.assertEqual(zx.nr_read(0x02) & 0x08, 0x08, 'zxnext:3778-3784')
+        zx.nr_write(0x02, 0x00)
+        self.assertEqual(zx.nr_read(0x02) & 0x08, 0x00, 'writing 0 clears it (zxnext:3782)')
+
+    def test_the_copper_clears_the_flag(self):
+        zx = self.machine([MOVE(0x02, 0x00), NEVER])
+        zx.nr_write(0x02, 0x08)
+        zx.run_ticks(64)
+        self.assertEqual(zx.nr_read(0x02) & 0x08, 0x08, 'set, and the copper stopped')
+        zx.nr_write(0x62, RUN)
+        zx.run_ticks(64)
+        self.assertEqual(zx.nr_read(0x02) & 0x08, 0x00, 'a copper MOVE of 0 clears it (D-7)')
+
+    def test_the_copper_can_soft_reset(self):
+        zx = self.machine([MOVE(0x02, 0x01), NEVER])
+        zx.nr_write(0x57, 0x20)
+        zx.nr_write(0x62, RUN)
+        zx.run_ticks(5000)                              # the reset line is held ~1023 cycles
+        self.assertEqual(zx.nr_read(0x02) & 0x03, 0b10, 'the first soft reset (zxnext:6277)')
+        self.assertEqual(zx.nr_read(0x57), 0x01, 'MMU7 reset')
+        self.assertEqual(zx.nr_read(0x62), 0x00, 'and the copper with it')
+
+    def test_the_copper_can_hard_reset(self):
+        zx = self.machine([MOVE(0x02, 0x02), NEVER])
+        zx.nr_write(0x7F, 0x55)
+        zx.nr_write(0x62, RUN)
+        zx.run_ticks(5000)
+        self.assertEqual(zx.nr_read(0x7F), 0xFF, 'NR 0x7F resets only on a hard reset '
+                                                 '(zxnext:1210, 6278)')
+        self.assertEqual(zx.nr_read(0x02) & 0x03, 0b00, 'power-on again')
+
+
 if __name__ == '__main__':
     unittest.main()
