@@ -206,6 +206,44 @@ class RTC(NextCase):
         self.assertTrue(all(bus.write_regs(0x08, data)))
         self.assertEqual(bus.read_regs(57, pointer=0x08), list(data) + [0x87])
 
+    def test_12_hour_mode_rolls_the_date_at_midnight(self):
+        """Hours b6 = 12-hour mode, b5 = PM (p. 8); the day of week increments at
+        midnight (p. 8), so 11:59:59 PM goes to 12:00:00 AM the next day, and
+        11:59:59 AM to 12:00:00 PM the same day. (Mutant survivor 6, run 1.)"""
+        for hour, want_hour, next_day in [(0x71, 0x52, True), (0x51, 0x72, False)]:
+            with self.subTest(hour=f'{hour:02X}h'):
+                zx, bus = self.rtc()
+                bus.write_regs(0, bytes([0x59, 0x59, hour, 0x03, 0x06, 0x11, 0x26]))
+                zx.run_ticks(SECOND * 6 // 5)
+                day, date = (0x04, 0x07) if next_day else (0x03, 0x06)
+                self.assertEqual(bus.read_regs(7, pointer=0), [0x00, 0x00, want_hour, day, date, 0x11, 0x26])
+
+    def test_leap_years(self):
+        """'The end of the month date is automatically adjusted for months with
+        fewer than 31 days, including corrections for leap year' (p. 6).
+        (Mutant survivor 7, run 1.)"""
+        for year, want in [(0x24, [0x29, 0x02]), (0x23, [0x01, 0x03])]:
+            with self.subTest(year=f'{year:02X}h'):
+                zx, bus = self.rtc()
+                bus.write_regs(0, bytes([0x59, 0x59, 0x23, 0x01, 0x28, 0x02, year]))
+                zx.run_ticks(SECOND * 6 // 5)
+                self.assertEqual(bus.read_regs(7, pointer=0)[4:6], want)
+
+    def test_a_read_is_a_snapshot_from_its_start(self):
+        """'The user buffers are synchronized to the internal registers on any
+        I2C START' (p. 8). A seconds write resets the divider at its acknowledge
+        (p. 8), so the next rollover is a second later; a read whose START comes
+        just before it returns 59 seconds and the old minute, however the bytes
+        straddle the rollover. (Mutant survivor 8, run 1.)"""
+        zx, bus = self.rtc()
+        bus.write_regs(0, bytes([0x59, 0x07]))
+        done = zx.t28
+        bus.write_regs(0)                               # point at 00h, no START of a read yet
+        zx.run_ticks(done + SECOND - 8000 - zx.t28)     # the rollover comes about 4650 after
+                                                        # START's 300: inside the address byte
+        self.assertEqual(bus.read_regs(2), [0x59, 0x07], 'as at the START')
+        self.assertEqual(bus.read_regs(2, pointer=0), [0x00, 0x08], 'and then the rollover')
+
     def test_a_read_starts_where_the_pointer_was_left(self):
         """'If the register pointer is not written to before the initiation of a
         read mode the first address that is read is the last one stored' (p. 12)."""

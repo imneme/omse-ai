@@ -256,6 +256,37 @@ class Receive(NextCase):
         zx.run_ticks(P0 * 25)
         self.assertEqual(status(zx), 0x50, 'framing error only: nothing kept, no break')
 
+    def test_the_receiver_recentres_on_edges(self):
+        """An Rx edge resets the bit timer to half a bit, at most once a bit
+        (uart_rx:188-190), so a sender 8% slow or fast still lands every
+        sample mid-bit through 8E2 with alternating data. A clock-level model
+        (foil-run/probes/uart_rx_model.py) loses all four bytes at 8% without
+        the re-centring and keeps them at 3-5%. (Mutant survivor 1, run 1.)"""
+        for bit in (262, 224):                          # P = 243 +/- 8%
+            with self.subTest(bit_t28=bit):
+                zx = bare()
+                setup(zx, frame='8E2')
+                data = bytes([0x55, 0xAA, 0x5A, 0xA5])
+                zx.uart_feed(0, data, bit, '8E2')
+                zx.run_ticks(bit * 12 * 4 + 1000)
+                self.assertEqual(status(zx) & 0xC5, 0x01, 'received, no errors')
+                self.assertEqual(drain(zx, 4), data)
+
+    def test_a_low_first_stop_bit_is_a_framing_error(self):
+        """With one stop bit as with two, a 0 where the stop bit belongs sends
+        the receiver to S_ERROR (uart_rx:262-268). A 7N1 receiver hearing 8N1
+        samples the sender's bit 7 as its stop bit. (Mutant survivor 2, run 1.)"""
+        zx = bare()
+        setup(zx, frame='7N1')
+        zx.uart_feed(0, b'\x05', P0, '8N1')
+        zx.run_ticks(P0 * 12)
+        self.assertEqual(status(zx), 0x50, 'bit 7 = 0: framing error, nothing kept')
+        zx.run_ticks(10)
+        zx.uart_feed(0, b'\x85', P0, '8N1')
+        zx.run_ticks(P0 * 12)
+        self.assertEqual(status(zx) & 0xC5, 0x01, 'bit 7 = 1 is a good stop bit')
+        self.assertEqual(drain(zx, 1), b'\x05')
+
     def test_the_fifo_holds_512_and_one_more(self):
         """fifop: full at 512 (fifop:136); a byte arriving then waits in
         rx_avail_d (uart:784-800) until there's room; the next one is lost and
@@ -309,6 +340,98 @@ class Receive(NextCase):
         self.assertEqual(status(zx) & 0x01, 0x00, 'uart:385')
 
 
+def level_at(events, t, initial=1):
+    """The host's wire level at tick t from uart_tx_events' changes."""
+    level = initial
+    for when, lv in events:
+        if when > t:
+            break
+        level = lv
+    return level
+
+
+def frame_levels(byte, p, frame='8N1'):
+    """[(level, ticks)] for one frame, LSB first, for uart_feed_levels."""
+    n, par, stops = int(frame[0]), frame[1], int(frame[2])
+    bits = [(byte >> i) & 1 for i in range(n)]
+    out = [(0, p)] + [(b, p) for b in bits]
+    if par != 'N':
+        out.append(((sum(bits) & 1) ^ (par == 'O'), p))
+    return out + [(1, p * stops)]
+
+
+@needs_next
+class Lines(NextCase):
+    """The wires themselves, through ruling (i): uart_tx_events and
+    uart_feed_levels."""
+
+    def test_parity_on_transmit(self):
+        """The parity bit is the odd flag xor the data bits (uart_tx:150-157,
+        242): odd parity makes the count of ones odd, even parity even.
+        (Mutant survivor 4, run 1.)"""
+        for frame in ('8O1', '8E1', '7O2'):
+            for byte in (0x41, 0x43):
+                with self.subTest(frame=frame, byte=f'{byte:02X}h'):
+                    zx = bare()
+                    setup(zx, frame=frame)
+                    zx.uart_tx_log(0, True)
+                    zx.io_out(TX, byte)
+                    zx.run_ticks(P0 * 14)
+                    ev = zx.uart_tx_events(0)
+                    self.assertTrue(ev and ev[0][1] == 0, 'a start bit')
+                    t0 = ev[0][0]
+                    n = int(frame[0])
+                    bits = [level_at(ev, t0 + P0 * k + P0 // 2) for k in range(n + 3)]
+                    self.assertEqual(bits[0], 0, 'start')
+                    self.assertEqual(bits[1:n + 1], [(byte >> i) & 1 for i in range(n)], 'LSB first')
+                    ones = sum(bits[1:n + 2])
+                    self.assertEqual(ones & 1, 1 if frame[1] == 'O' else 0,
+                                     f'{frame[1]} parity over data and parity bit')
+                    self.assertEqual(bits[n + 2], 1, 'stop')
+
+    def test_break_holds_tx_low(self):
+        """Frame b6: the idle transmitter drives not b6 (uart_tx:239), so the
+        line stays low for as long as b6 is set, one clock behind (uart:476-481).
+        (Mutant survivor 5, run 1.)"""
+        zx = bare()
+        setup(zx)
+        zx.uart_tx_log(0, True)
+        t1 = zx.t28
+        zx.io_out(FRAME, 0x58)
+        zx.run_ticks(P0 * 20)
+        t2 = zx.t28
+        zx.io_out(FRAME, 0x18)
+        zx.run_ticks(P0)
+        ev = zx.uart_tx_events(0)
+        self.assertEqual([lv for _, lv in ev], [0, 1], 'low, then high again, nothing between')
+        self.assertTrue(t1 <= ev[0][0] <= t1 + 3 and t2 <= ev[1][0] <= t2 + 3, f'{ev} vs {t1}, {t2}')
+
+    def test_a_short_glitch_is_ignored(self):
+        """Rx goes through misc/debounce.vhd with COUNTER_SIZE 2 (uart_rx:119-129):
+        a pulse shorter than 4 clocks never reaches the receiver. A 3-tick low
+        glitch laid where a receiver without it would sample bit 0 of 0Fh
+        (start + P/2 + P: foil-run/probes/uart_rx_model.py) changes nothing.
+        (Mutant survivor 3, run 1.)"""
+        for at in (118, 121, 124):                      # ticks into bit 0
+            with self.subTest(at=at):
+                zx = bare()
+                setup(zx)
+                lv = frame_levels(0x0F, P0)
+                lv[1:2] = [(1, at), (0, 3), (1, P0 - at - 3)]
+                zx.uart_feed_levels(0, lv)
+                zx.run_ticks(P0 * 12)
+                self.assertEqual(status(zx) & 0xC5, 0x01)
+                self.assertEqual(drain(zx, 1), b'\x0f')
+
+    def test_feed_levels_carries_a_whole_frame(self):
+        """An anchor for the helper: the same frame without a glitch."""
+        zx = bare()
+        setup(zx)
+        zx.uart_feed_levels(0, frame_levels(0xA7, P0))
+        zx.run_ticks(P0 * 12)
+        self.assertEqual(drain(zx, 1), b'\xa7')
+
+
 @needs_next
 class PiUart(NextCase):
     """Rulings (a) and (f): UART 1's far end is a Raspberry Pi on fixed pins,
@@ -352,6 +475,36 @@ class PiUart(NextCase):
         zx.run_ticks(P0 * 11)
         self.assertEqual(drain(zx, 1), b'\x12')
         self.assertIs(zx.uart_rts(0), True)
+
+
+@needs_next
+class JoystickUart(NextCase):
+    """Ruling (b): NR 0Bh reroutes a UART to a joystick port only in UART mode,
+    b7 and b5 both set (joy_iomode_uart_en, zxnext:3494); b0 picks the UART
+    (zxnext:3298-3308). Then the host's line is disconnected from it."""
+
+    def talk(self, nr0b):
+        zx = bare()
+        zx.nr_write(0x0B, nr0b)
+        setup(zx)
+        zx.uart_feed(0, b'\x3C', P0)
+        zx.io_out(TX, 0xC3)
+        zx.run_ticks(P0 * 12)
+        return zx
+
+    def test_io_mode_without_uart_mode_leaves_the_uart_alone(self):
+        for nr0b in (0x80, 0x90):                       # b7 with modes 00 and 01 (Mutant survivor 9, run 1)
+            with self.subTest(nr0b=f'{nr0b:02X}h'):
+                zx = self.talk(nr0b)
+                self.assertEqual(drain(zx, 1), b'\x3C')
+                self.assertEqual([b for _, b in zx.uart_sent(0)], [0xC3])
+                self.assertIs(zx.uart_rts(0), True)
+
+    def test_uart_mode_takes_uart_0_from_the_host(self):
+        zx = self.talk(0xA0)                            # b7, b5: UART mode; b0 = 0: UART 0
+        self.assertEqual(status(zx) & 0x01, 0x00, 'Rx from the joystick pin, idle')
+        self.assertEqual(zx.uart_sent(0), [])
+        self.assertIsNone(zx.uart_rts(0), 'ruling (d): rerouted')
 
 
 @needs_next
