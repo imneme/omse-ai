@@ -464,7 +464,8 @@ bool z80_opdone(z80_t* cpu);
 // %>
 
 // the Z80N's instructions (the ZX Spectrum Next's ED extensions): the first step of each, after the
-// existing ones (z80_t.z80n turns them on; each is a Zilog's 8 T ED no-op without it)
+// existing ones. z80_t.z80n turns them on; without it the ED ones are a Zilog's 8 T no-ops, and RETN and the
+// NMI response run z80.h's own steps.
 #define Z80N_SWAPNIB_STEP   1709
 #define Z80N_MIRROR_STEP    1710
 #define Z80N_BSLA_STEP      1711
@@ -940,15 +941,15 @@ static inline uint8_t _z80n_mirror(uint8_t v) {
 
 // PIXELDN, the T80N's way: H4 H3 L7 L6 L5 H2 H1 H0 counts up as one 8-bit number. The same as the documented
 // three cases on the whole screen; where it wraps (H&1F = 1F, L&E0 = E0) it keeps H's top three bits
-// (VHDL: 5FE0 -> 4000; the documentation's rule gives 6000).
+// (VHDL: 5FE0 -> 4000; the three-case rule usually documented gives 6000).
 static inline uint16_t _z80n_pixeldn(uint16_t hl) {
     const uint8_t h = (uint8_t)(hl >> 8), l = (uint8_t)hl;
     const uint8_t c = (uint8_t)(((h & 0x18) << 3 | (l & 0xE0) >> 2 | (h & 0x07)) + 1);
     return (uint16_t)(((h & 0xE0) | (c & 0xC0) >> 3 | (c & 0x07)) << 8 | (c & 0x38) << 2 | (l & 0x1F));
 }
 
-// The flags the LDxX family leaves (VHDL: they keep LDI's I_BT, so they set flags as LDI does, though the
-// documentation says they don't): X and Y from bits 3 and 1 of n, H = N = 0, P/V = BC != 0.
+// The flags the LDxX family leaves (VHDL: they keep LDI's I_BT, so they set flags as LDI does, though they're
+// usually documented as leaving flags alone): X and Y from bits 3 and 1 of n, H = N = 0, P/V = BC != 0.
 static inline void _z80n_bt_flags(z80_t* cpu, uint8_t n) {
     cpu->f = (cpu->f & (Z80_SF|Z80_ZF|Z80_CF)) | (n & Z80_XF) | ((n & 2) ? Z80_YF : 0) | (cpu->bc ? Z80_VF : 0);
 }
