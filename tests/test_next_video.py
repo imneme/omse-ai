@@ -434,5 +434,92 @@ class Layer2(VideoCase):
                     self.assertFrameMatches(s, name=f'blend_{order}_{blend}')
 
 
+
+# ---------------------------------------------------------------------------- the probes' scenes
+
+def pv1_scene():
+    """P-V1 (next-build/probes/pv1.asm), the layer card: the same registers, Layer 2 and ULA screen, with the
+    copper changing NR 0x15 in the blanking before each 16-line band. Returns (scene, schedule)."""
+    import os
+    rom = Path(os.environ.get('OMSE_AI_ROMS', Path.home() / 'omse-ai/roms')) / '48.rom'
+    font = rom.read_bytes()[0x3D00:0x4000]
+    s = Scene()
+    for n, v in [(0x43, 0x00), (0x40, 0x00), (0x41, 0x00), (0x40, 0x07), (0x41, 0xFF), (0x40, 0x10),
+                 (0x41, 0x00), (0x40, 0x11), (0x41, 0x02), (0x40, 0x15), (0x41, 0x1F), (0x40, 0x17),
+                 (0x41, 0xE3), (0x43, 0x10), (0x40, 0xE3), (0x41, 0xE3), (0x40, 0xE0), (0x41, 0xE0),
+                 (0x40, 0x00), (0x41, 0x00), (0x40, 0xFC), (0x44, 0xFC), (0x44, 0x80), (0x43, 0x00),
+                 (0x14, 0xE3), (0x4A, 0x49), (0x15, 0x00), (0x68, 0x00), (0x70, 0x00), (0x16, 0x00),
+                 (0x17, 0x00), (0x71, 0x00), (0x1C, 0x01), (0x18, 0x00), (0x18, 0xFF), (0x18, 0x00),
+                 (0x18, 0xBF), (0x12, 0x08)]:
+        s.nr(n, v)
+    l2 = bytearray(256 * 192)
+    for y in range(192):
+        for x in range(256):
+            if y < 128:
+                if x < 128:
+                    p = 0xFC if (96 <= x < 120 and 4 <= (y & 15) < 12) else (0xE0 if ((x + y) & 15) < 6 else 0xE3)
+                else:
+                    p = 0x00 if y >= 96 else 0xE3
+            elif y < 144:
+                p = 0xE0 if (x & 15) == 0 else 0xE3
+            elif y < 160:
+                p = 0xE0 if (x & 15) == 1 else 0xE3
+            else:
+                p = 0xE3
+            l2[y * 256 + x] = p
+    s.sram(nv.L2_SRAM_BASE + 8 * 0x4000, l2)
+    bm, at = bytearray(6144), bytearray(768)
+    for row in range(24):
+        for col in range(32):
+            if row < 16 and col < 16:
+                at[row * 32 + col] = 0x28 if (row + col) & 1 else 0x38
+            else:
+                at[row * 32 + col] = 0x30 if row == 23 else 0x07
+
+    def addr(row, line, col):
+        return ((row & 0x18) << 8) | (line << 8) | ((row & 7) << 5) | col
+    for row in range(16, 20):
+        for line in range(8):
+            for col in range(0, 32, 2):
+                bm[addr(row, line, col)] = 0x80
+    texts = [(2 * b, 17, t) for b, t in enumerate(['0 SLU', '1 LSU', '2 SUL', '3 LUS', '4 USL', '5 ULS',
+                                                   '6 L+U', '7 L+U-5'])]
+    texts += [(2 * b + 1, 17, t) for b, t in enumerate(['L over U', 'L over U', 'U over L', 'L over U',
+                                                       'U over L', 'U over L', 'add, max 7', 'add, minus 5'])]
+    texts += [(20, 0, 'P-V1: one NR15 order per band'), (21, 0, 'Vernier A: red only = aligned'),
+              (22, 0, 'Vernier B: 1px off on purpose'), (23, 0, 'Photo, please. Key: soft reset')]
+    for row, col, t in texts:
+        for k, ch in enumerate(t):
+            g = font[(ord(ch) - 32) * 8:(ord(ch) - 32) * 8 + 8]
+            for line in range(8):
+                bm[addr(row, line, col + k)] = g[line]
+    s.bram5(0, bm).bram5(0x1800, at).io(0x123B, 0x02).io(0x00FE, 0x01)
+    # the copper: WAIT (16b - 1, 44), MOVE NR 0x15 <- b << 2, ..., then SLU at row 128; mode 11
+    words = [w for b in range(1, 8) for w in (0xD800 | (16 * b - 1), 0x1500 | (b << 2))]
+    words += [0xD87F, 0x1500, 0xFFFF]
+    s.nr(0x62, 0x00).nr(0x61, 0x00)
+    for w in words:
+        s.nr(0x63, w >> 8, w & 0xFF)
+    s.nr(0x62, 0xC0)
+    schedule = [(48 + 16 * b, 0x15, b << 2) for b in range(1, 8)] + [(48 + 128, 0x15, 0x00)]
+    return s, schedule
+
+
+@needs_next
+class Probes(VideoCase):
+    """The probe tapes' scenes, so the emulator's picture, the model's and the photograph can meet."""
+
+    def test_pv1_layer_card(self):
+        s, schedule = pv1_scene()
+        zx = s.machine(frames=3)
+        w, h, got = zx.frame9()
+        want = s.model().frame9(schedule)[2]
+        got = list(got)
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('pv1_layer_card', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % w},{bad[0] // w}); pictures: {path}')
+
+
 if __name__ == '__main__':
     unittest.main()

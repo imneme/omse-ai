@@ -349,26 +349,34 @@ class Video:
         return pix, True
 
     # ------------------------------------------------------------------ the mixer
-    def frame9(self):
-        """The 704 x 288 9-bit picture of a static frame, as the mixer makes it (zxnext:6843-7263)."""
-        if self.nr15 & 0x81:
+    def frame9(self, schedule=None):
+        """The 704 x 288 9-bit picture of a static frame, as the mixer makes it (zxnext:6843-7263).
+
+        schedule: optional [(sy, register, value), ...]: next-register writes made in the horizontal
+        blanking before frame9 row sy (as a copper WAIT at h = 38-50 does: hc_ula 316-419 lies between
+        one row's last visible sample and the next row's first, on 448- and 456-pixel lines), so each
+        row is drawn wholly with the registers as they stand when it starts."""
+        if self.nr15 & 0x81 or any(n == 0x15 and v & 0x81 for _, n, v in (schedule or [])):
             raise NotImplementedError('LoRes and sprites are not in the model yet (NR 0x15 bits 7, 0)')
         if self.nr6b & 0x80:
             raise NotImplementedError('the tilemap is not in the model yet (NR 0x6B bit 7)')
-        ula_pal = ((self.nr43 >> 1) & 1) << 8                       # zxnext:6732, 6888
-        l2_pal = ((self.nr43 >> 2) & 1) << 8                        # zxnext:6734, 6940
-        fallback = (self.nr4a << 1) | (((self.nr4a >> 1) | self.nr4a) & 1)   # zxnext:6897, 7121
-        trans = self.nr14
-        order = (self.nr15 >> 2) & 7
-        ula_en = not (self.nr68 & 0x80)                             # zxnext:5383
-        blend = (self.nr68 >> 5) & 3
-        stencil = self.nr68 & 1
-        # the tilemap is off: transparent, and "below" = NOT NR 0x6B bit 0 (zxnext:6770, 7016)
-        tm_transparent = True
-        tm_below = not (self.nr6b & 1)
+        pending = sorted(schedule or [])
+        tm_transparent = True                                       # the tilemap is off
         sprite_transparent = True                                   # sprites off (zxnext:6841, 7025)
         out = []
         for sy in range(H):
+            while pending and pending[0][0] <= sy:
+                _, n, v = pending.pop(0)
+                self.nr_write(n, v)
+            ula_pal = ((self.nr43 >> 1) & 1) << 8                   # zxnext:6732, 6888
+            l2_pal = ((self.nr43 >> 2) & 1) << 8                    # zxnext:6734, 6940
+            fallback = (self.nr4a << 1) | (((self.nr4a >> 1) | self.nr4a) & 1)   # zxnext:6897, 7121
+            trans = self.nr14
+            order = (self.nr15 >> 2) & 7
+            ula_en = not (self.nr68 & 0x80)                         # zxnext:5383
+            blend = (self.nr68 >> 5) & 3
+            # the tilemap is off: "below" = NOT NR 0x6B bit 0 (zxnext:6770, 7016)
+            tm_below = not (self.nr6b & 1)
             py = sy - 48
             for sx in range(W):
                 phc, half = sx // 2 - 48, sx & 1
