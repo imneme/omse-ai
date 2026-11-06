@@ -29,6 +29,8 @@ import nextref as ref                                   # noqa: E402
 from test_next_regs import Next, needs_next, NextCase, bare  # noqa: E402
 from test_next_timing import launch                      # noqa: E402
 from test_next_interrupts import main_loop, vector, CODE, F48  # noqa: E402
+from test_next_copper import load as load_copper, WAIT as copper_wait, MOVE as copper_move  # noqa: E402
+from test_next_copper import NEVER as COPPER_NEVER  # noqa: E402
 
 ZXN, Z80 = 0x6B, 0x0B
 DEC, INC, FIXED = 0, 1, 2
@@ -482,6 +484,47 @@ class Interrupts(NextCase):
         self.assertTrue(zx.run_until_pc(0x9200, max_ticks=4 * F48))
         self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'continuous mode kept the bus to the end')
 
+    def nmi_setup(self, cc):
+        """The multiface NMI raised by a copper MOVE to NR 02h mid-block (the CPU
+        can't write it then: the DMA has the bus). It needs config mode left
+        (zxnext:2061), NR 06h b3 (zxnext:2049, 5105) and the multiface enabled
+        (NR 83h b1, FFh at power-on; zxnext:2374); its ROM (SRAM page 0Ah,
+        zxnext:2989-2991) holds the handler, RETN, at 0066h."""
+        zx = machine(timing='48k')
+        zx.nr_write(0x03, 0x01)                         # leave config mode: a 48K
+        zx.nr_write(0x06, zx.nr_read(0x06) | 0x08)
+        zx.nr_write(0xCC, cc)
+        for base in (0x14000, ref.ROM_SRAM[0]):         # the multiface's ROM, and ROM 0 should it not page in
+            zx.sram[base + 0x66], zx.sram[base + 0x67] = 0xED, 0x45
+        load_copper(zx, [copper_wait(100), copper_move(0x02, 0x08), COPPER_NEVER])
+        zx.dma_log(True)
+        program(zx, 0xA000, 0xC000, BLOCK, a_mode=FIXED, b_mode=FIXED)
+        zx.nr_write(0x62, 0x40)                         # copper: run once from the start
+        return zx
+
+    def test_an_nmi_takes_the_bus_when_nr_cc_bit_7_says(self):
+        """NR CC b7 lets nmi_activated hold the DMA's delay (zxnext:1966), in any
+        interrupt mode; RETN's states keep it through the pops (im2c:238)."""
+        zx = self.nmi_setup(0x80)
+        self.assertTrue(zx.run_until_pc(0x0066, max_ticks=2 * F48), 'the NMI')
+        n = len(zx.dma_events)
+        self.assertTrue(0 < n < 2 * BLOCK, f'taken mid-block ({n} cycles done)')
+        self.assertEqual(n % 2, 0, 'between bytes')
+        self.assertFalse(zx.busak)
+        for _ in range(4000):
+            zx.run_ticks(1)
+            if len(zx.dma_events) > n:
+                break
+        self.assertGreater(len(zx.dma_events), n, 'the DMA came back')
+        self.assertEqual(zx.regs()['sp'], 0x7FF0, 'only after RETN\'s pops')
+        zx.run_ticks(4 * F48)
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'and finished the block')
+
+    def test_without_nr_cc_bit_7_the_nmi_waits_for_the_block(self):
+        zx = self.nmi_setup(0x00)
+        self.assertTrue(zx.run_until_pc(0x0066, max_ticks=4 * F48), 'the NMI, in the end')
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'continuous mode kept the bus to the end')
+
     def test_pulse_mode_never_interrupts_the_dma(self):
         zx = self.setup(0xA0, 0x01)                     # pulse mode, NR CC b0 set all the same
         self.assertTrue(zx.run_until_pc(0x9200, max_ticks=4 * F48))
@@ -490,6 +533,32 @@ class Interrupts(NextCase):
 
 @needs_next
 class Contention(NextCase):
+    MMU = [0xFF, 0xFF, 0x0A, 0x0B, 0x04, 0x05, 0x00, 0x01]
+
+    def block(self, timing, n=64, a_t=None, b_t=None):
+        """A bank-5 to page-4 block started near row 40; returns (q, v, events),
+        q the odd hc_ula of the first cycle's first clock."""
+        L, N, *_ = ref.TIMINGS[(timing, 50)]
+        zx = machine(timing=timing)
+        zx.write(0x4000, pattern(n))
+        assert zx.run_until_pc(0x8001, max_ticks=10**6)
+        now = zx.vc_ula * L + zx.hc_ula
+        zx.run_ticks(((40 * L - 30 - now) % (L * N)) * ref.TICKS_PER_PIXEL)
+        assert zx.run_until_pc(0x8001, max_ticks=10**6)
+        t0, h0, v0 = zx.t28, zx.hc_ula, zx.vc_ula
+        zx.dma_log(True)
+        program(zx, 0x4000, 0x8800, n, a_t=a_t, b_t=b_t)
+        zx.run_ticks(60000)
+        ev = zx.dma_events
+        self.assertEqual(len(ev), 2 * n)
+        self.assertEqual((ev[0][0] - t0) % (2 * ref.TICKS_PER_PIXEL), 0,
+                         'a DMA cycle starts on a CPU edge')
+        q, v = h0 + (ev[0][0] - t0) // ref.TICKS_PER_PIXEL + 1, v0   # §9.1 (11): pre-edge stamps
+        while q >= L:
+            q, v = q - L, v + 1
+        self.assertTrue(30 <= v < 180, f'the block should start near row 40 (hc {q}, row {v})')
+        self.assertEqual(zx.read(0x8800, n), pattern(n))
+        return q, v, ev
 
     def test_reads_from_bank_5_are_contended_like_the_cpus(self):
         """48K timing at 3.5 MHz: the ULA holds the CPU clock, which clocks the
@@ -497,33 +566,32 @@ class Contention(NextCase):
         last rising edge and its address already out (dma:285-299, 407-419), so
         it's checked like a T1: the CPU's contention model, event for event."""
         L, N, *_ = ref.TIMINGS[('48k', 50)]
-        mmu = [0xFF, 0xFF, 0x0A, 0x0B, 0x04, 0x05, 0x00, 0x01]
-        zx = machine(timing='48k')
-        zx.write(0x4000, pattern(64))
-        assert zx.run_until_pc(0x8001, max_ticks=10**6)
-        now = zx.vc_ula * L + zx.hc_ula
-        zx.run_ticks(((40 * L - 30 - now) % (L * N)) * ref.TICKS_PER_PIXEL)
-        assert zx.run_until_pc(0x8001, max_ticks=10**6)
-        t0, h0, v0 = zx.t28, zx.hc_ula, zx.vc_ula
-        zx.dma_log(True)
-        program(zx, 0x4000, 0x8800, 64)
-        zx.run_ticks(30000)
-        ev = zx.dma_events
-        self.assertEqual(len(ev), 128)
-        pix = (ev[0][0] - t0) // ref.TICKS_PER_PIXEL
-        self.assertEqual((ev[0][0] - t0) % (2 * ref.TICKS_PER_PIXEL), 0,
-                         'a DMA cycle starts on a CPU edge')
-        q, v = h0 + pix + 1, v0                         # §9.1 (11): the stamp's hc is pre-edge
-        while q >= L:
-            q, v = q - L, v + 1
-        self.assertTrue(30 <= v < 180, f'the block should start near row 40 (hc {q}, row {v})')
+        q, v, ev = self.block('48k')
         per = [c for i in range(64) for c in [(0x4000 + i, 3), (0x8800 + i, 3)]]
-        want = [8 * ref.Contention('48k', mmu, L, N).run(q, v, per[:j]) for j in range(128)]
+        want = [8 * ref.Contention('48k', self.MMU, L, N).run(q, v, per[:j]) for j in range(128)]
         got = [e[0] - ev[0][0] for e in ev]
         self.assertEqual(got, want, f'from hc_ula {q} row {v}')
         self.assertGreater(got[-1], 8 * 3 * 127, 'some contention')
         self.assertEqual([b[1] - a[1] for a, b in zip(ev, ev[1:])], [3] * 127,
                          'held clocks add no cpu_clocks')
+
+    def test_p3_waits_on_the_falling_edge(self):
+        """+3 timing: WAIT, not a held clock (zxula.vhd:600). The DMA samples it
+        on the falling edge (dma:139-145), so an n-clock cycle starting at odd q
+        looks at hc q + 2(n-1), one T-state off the CPU's sample: its pattern
+        runs 7..0 from q = 15 mod 16 (nextref.p3_dma_run). Each wait is a clock."""
+        L, N, *_ = ref.TIMINGS[('p3', 50)]
+        mem = ref.P3Contention('p3', self.MMU, L, N).mem
+        for a_t, b_t, r, w in [(None, None, 3, 3), (T2, T2, 2, 2), (T4, T2, 4, 2)]:
+            with self.subTest(read=r, write=w):
+                q, v, ev = self.block('p3', a_t=a_t, b_t=b_t)
+                per = [c for i in range(64) for c in [(0x4000 + i, r), (0x8800 + i, w)]]
+                want = [ref.p3_dma_run(q, v, per[:j], mem, L, N) for j in range(128)]
+                got = [e[1] - ev[0][1] for e in ev]
+                self.assertEqual(got, want, f'cpu_clocks from the first cycle, from hc_ula {q} row {v}')
+                self.assertEqual([e[0] - ev[0][0] for e in ev], [8 * c for c in want],
+                                 'a wait is a whole clock: no held clocks under +3')
+                self.assertGreater(got[-1], (r + w) * 64 - w, 'some waits')
 
 
 if __name__ == '__main__':

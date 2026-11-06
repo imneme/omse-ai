@@ -631,3 +631,30 @@ def dma_period(r, w, prescaler, m):
     while (m * (k - 2)) >> 5 < prescaler:
         k += 1
     return k + 1
+
+
+P3_DMA_WAIT = {3, 5, 7, 9, 11, 13, 15}                  # the +3 window (zxula.vhd:583) at odd hc
+
+
+def p3_dma_run(q, v, cycles, contended, line_len, lines):
+    """CPU clocks for DMA bus cycles under +3 timing at 3.5 MHz, from the odd
+    hc_ula q where the first starts. cycles: (addr, n clocks); contended(addr).
+    The DMA samples WAIT on the CPU clock's falling edge (dma:139-145), the step
+    from an odd hc to the even one after it, and tests it in READ_4/WRITE_4
+    (dma:342, 410): so an n-clock cycle's sample sees hc q + 2(n-1), and each
+    wait clock looks again 2 pixels on. WAIT is MREQ, a contended page and the
+    window (zxula.vhd:583, 600): memory only, odd hc 3..15 of each 16, hc < 256,
+    rows 0-191. One T-state off the CPU's own sample (the edge ending T2)."""
+    assert q & 1
+    total = 0
+    for addr, n in cycles:
+        k = 0
+        if addr is not None and contended(addr) and v < 192:
+            p = q + 2 * (n - 1)
+            while p + 2 * k < 256 and ((p + 2 * k) & 15) in P3_DMA_WAIT:
+                k += 1
+        total += n + k
+        q += 2 * (n + k)
+        while q >= line_len:
+            q, v = q - line_len, (v + 1) % lines
+    return total
