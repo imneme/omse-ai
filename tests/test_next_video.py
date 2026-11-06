@@ -1156,5 +1156,35 @@ class ProbeV3(VideoCase):
                          (v.nr_read(0x28), v.nr_read(0x34), nv.sprite_status(v)), 'NR 0x28, NR 0x34, status')
 
 
+@needs_next
+class ProbeV4(VideoCase):
+    """P-V4's Layer 2 card (next-build/probes/pv4_scene.py, the scene defined once): resolutions 00/01/10/11,
+    a bank range past SRAM's end, palette offsets in 640 mode, and a Y scroll past 384 reading bank + 3."""
+
+    def test_pv4_layer2_card(self):
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv4_scene.py').exists():
+            self.skipTest('needs next-build/probes/pv4_scene.py')
+        sys.path.insert(0, str(probes))
+        import pv4_model as pm
+        import pv4_scene as sc
+        s = Scene()
+        for kind, a, b in pm.writes():
+            (s.nr if kind == 'nr' else s.io)(a, b)
+        bm, at = sc.ula()
+        s.bram5(0, bm).bram5(0x1800, at)
+        s.sram(nv.L2_SRAM_BASE + sc.L2_BANK * 0x4000, sc.layer2())
+        s.nr(0x62, 0x00).nr(0x61, 0x00)
+        for w in sc.copper_words():
+            s.nr(0x63, w >> 8, w & 0xFF)
+        s.nr(0x62, 0xC0)
+        got = list(s.machine(frames=3).frame9()[2])
+        want = nv.frame9_np(s.model(), sc.schedule())[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('pv4_layer2_card', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+
+
 if __name__ == '__main__':
     unittest.main()
