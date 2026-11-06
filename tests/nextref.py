@@ -599,3 +599,35 @@ class P3Contention(Contention):
                 total += n
                 self.advance(2 * n)
         return total
+
+
+# The zxnDMA (device/dma.vhd; DESIGN.md §9.1 (16)). Clocked by the CPU clock.
+DMA_TIMING = {0b00: 4, 0b01: 3, 0b10: 2, 0b11: 4}      # timing byte bits 1:0 -> clocks (dma:310-324)
+DMA_STATUS_IDLE, DMA_STATUS_ENDED = 0x3A, 0x1A          # 00E1101T (dma:902); IDLE clears T (dma:265)
+
+
+def dma_block_bytes(length, z80_mode=False):
+    """Bytes a block moves: LOAD sets the counter to 0 (zxnDMA) or FFFF (Z80 mode),
+    WRITE_1 adds one, and WRITE_4 goes on while counter < length, unsigned
+    (dma:661-676, 361, 426). So 0 and 1 both move one byte; Z80 mode one more."""
+    if z80_mode:
+        return length + 1 if length else 1
+    return max(length, 1)
+
+
+def dma_period(r, w, prescaler, m):
+    """CPU clocks from one byte's READ_1 entry to the next, in continuous mode
+    (the bus kept), for read and write cycles of r and w clocks and m t28 per
+    clock (8, 4, 2, 1 at 3.5, 7, 14, 28 MHz). Edge E0 enters READ_1; at E1 the
+    timer is cleared (dma:309); after that it gains m a clock (dma:250-255), so
+    before edge k it holds m(k-2). WRITE_4 finishes at E(r+w) and waits if
+    prescaler > timer(13:5) (dma:424); WAITING_CYCLES leaves at the first edge
+    whose timer(13:5) >= prescaler (dma:451) for WAITING_ACK, and READ_1 follows
+    one clock later (dma:285-299)."""
+    k = r + w
+    if not prescaler or (m * (k - 2)) >> 5 >= prescaler:
+        return k
+    k += 1
+    while (m * (k - 2)) >> 5 < prescaler:
+        k += 1
+    return k + 1
