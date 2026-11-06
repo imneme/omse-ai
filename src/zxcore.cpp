@@ -327,13 +327,14 @@ static uint8_t ay_read(ZX& z, uint16_t addr) {
     return AY38910_GET_DATA(pins);
 }
 
-// The Next's rule (spi_gap clocks a transfer). The byte in flight has landed by the time the CPU latches
-// an access's data if the access began at least spi_gap - 1 clocks after it; a new transfer starts only
-// at spi_gap or more (spi_master begins on its last state or when idle).
+// The Next's rule (spi_gap clocks a transfer). spi_master loads its read register the clock after its
+// last state, so the byte in flight has landed by the time the CPU latches an access's data only if the
+// access comes spi_gap or more clocks after it, which is also when a new transfer can start (on the last
+// state or when idle). Sooner, it starts nothing and reads the last landed byte again.
 static uint8_t spi_gap_access(ZX& z, uint8_t mosi, bool rd) {
     uint64_t now = z.t - z.stalled;
     uint64_t dt = now - z.spi_begin;
-    if (dt + 1 >= (uint64_t)z.spi_gap) z.spi_done = z.div_spi;
+    if (dt >= (uint64_t)z.spi_gap) z.spi_done = z.div_spi;
     uint8_t v = z.spi_done;
     if (dt >= (uint64_t)z.spi_gap) {
         z.div_spi = z.sd.xfer(rd ? 0xFF : mosi, (z.div_cs & 3) == 2);

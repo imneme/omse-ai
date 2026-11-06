@@ -390,6 +390,23 @@ class TestSPI(unittest.TestCase):
                 Z80().out(0xE7, 0xFE).raw([0x3E, 0xFF, 0xD3, 0xEB, 0xDB, 0xEB]).run(zx)
                 self.assertEqual(zx.spi_early, early)
 
+    def test_the_nexts_early_read_rereads_the_last_byte(self):
+        # The Next's SPI master loads its read register 17 CPU clocks after a
+        # transfer begins, so an IN 15 clocks after the last access latches its
+        # data first: it starts nothing and reads the same byte again. (16 apart,
+        # INI to INI, gets the finished byte: the Lever on Melissa's real Next.)
+        # CMD0, then IN; LD E,A; IN (15 T apart) three times: R1 01 arrives
+        # with the third pair's first IN, and its second IN reads it again.
+        code = [0x3E, 0xFF, 0xD3, 0xE7] + [0x3E, 0xFF, 0xD3, 0xEB] * 10 + [0x3E, 0xFE, 0xD3, 0xE7]
+        for b in (0x40, 0, 0, 0, 0, 0x95):
+            code += [0x3E, b, 0xD3, 0xEB]                       # LD A,b; OUT (EBh),A: 18 T apart
+        code += [0x21, 0x00, 0x90] + [0xDB, 0xEB, 0x5F, 0xDB, 0xEB, 0x73, 0x23, 0x77, 0x23] * 3
+        zx = machine(card=card_image())
+        zx.spi_gap(16)
+        Z80().raw(code).run(zx)
+        self.assertEqual(zx.read(0x9000, 6).hex(' '), 'ff ff ff ff 01 01')
+        self.assertEqual(zx.spi_early, 3)
+
     def test_an_unknown_command_is_illegal(self):
         zx = machine(card=card_image())
         got = init_card(Z80()).out(0xEB, *cmd(5)).in_(3).run(zx)

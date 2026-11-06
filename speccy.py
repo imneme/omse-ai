@@ -712,8 +712,8 @@ class Speccy:
     def spi_gap(self, clocks=16):
         """The Spectrum Next's SPI rule (found by Tally on a real Next): a
         transfer takes `clocks` of the CPU's own clock (16 on the Next), and an
-        access to port EB that comes sooner starts nothing and reads the last
-        finished byte again. 0 (the default) is a classic divMMC, where every
+        access to port EB that comes sooner starts nothing and reads the same
+        byte as the access before it. 0 (the default) is a classic divMMC, where every
         access starts a transfer at once. `spi_early` counts the early ones."""
         self.lib.zx_spi_gap(self.z, clocks)
 
