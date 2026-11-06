@@ -696,6 +696,83 @@ class TestNmiAndRetn(Z80NCase):
                 self.assertEqual(cpu.regs()['pc'], 0x1234)
 
 
+class TestBit(unittest.TestCase):
+    """BIT's undocumented X and Y flags as the Next's CPU makes them (t80n_alu.vhd, ALU_Op BIT): from the register
+    for BIT n,r (as a Zilog); 0 for BIT n,(HL) and the documented DD/FD CB d 46-7E (a Zilog takes them from
+    MEMPTR); the byte's bits 3 and 5 for the undocumented DD/FD CB d 40-7F on other registers (XYbit_undoc puts the
+    byte on BusB). Melissa's Next agreed in all three places it was asked (Z80NTIME's BITF, LDPIRX2's C6 and C7).
+    Everything else BIT does is as with the flag off, tick for tick; with it off, nothing changes."""
+
+    def run_both(self, code, regs, mem):
+        res = []
+        for z80n in (True, False):
+            cpu = self.cpus[z80n]
+            for a, v in mem.items():
+                cpu.mem[a & 0xFFFF] = v
+            for i, v in enumerate(code):
+                cpu.mem[(regs['pc'] + i) & 0xFFFF] = v
+            cpu.set(regs)
+            ticks = cpu.step()
+            res.append((cpu.regs(), bytes(cpu.mem), ticks))
+        return res
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpus = {True: Bare(z80n=True), False: Bare(z80n=False)}
+
+    def test_every_bit(self):
+        rng = random.Random(21)
+        for k in range(1500):
+            op = 0x40 | rng.randrange(0x40)
+            pre = rng.choice((None, None, 0xDD, 0xFD))
+            regs = fill_regs(rng, pc=0x8000)
+            regs['wz'] = rng.randrange(0x10000)
+            d = rng.randrange(256)
+            if pre is None:
+                code = [0xCB, op]
+                at = regs['hl']
+            else:
+                code = [pre, 0xCB, d, op]
+                at = (regs['ix' if pre == 0xDD else 'iy'] + (d - 256 if d & 0x80 else d)) & 0xFFFF
+            if 0x7F00 <= at <= 0x8010:
+                continue                                    # (not over the code)
+            byte = rng.randrange(256)
+            (on, mem_on, t_on), (off, mem_off, t_off) = self.run_both(code, regs, {at: byte})
+            label = ' '.join(f'{b:02X}' for b in code)
+            self.assertEqual(t_on, t_off, label)
+            self.assertEqual(mem_on, mem_off, label)
+            for r in REGS:
+                if r != 'af':
+                    self.assertEqual(on[r], off[r], f'{label}: {r}')
+            self.assertEqual(on['af'] & ~0x28, off['af'] & ~0x28, f'{label}: all but X and Y as with the flag off')
+            if pre is None and op & 7 != 6:
+                r8 = {0: 'b', 1: 'c', 2: 'd', 3: 'e', 4: 'h', 5: 'l', 7: 'a'}[op & 7]
+                pair = {'b': 'bc', 'c': 'bc', 'd': 'de', 'e': 'de', 'h': 'hl', 'l': 'hl', 'a': 'af'}[r8]
+                v = regs[pair] >> 8 if r8 in 'bdha' else regs[pair] & 0xFF
+                want = v & 0x28                             # BIT n,r: from r, as a Zilog
+            elif pre is None or op & 7 == 6:
+                want = 0                                    # BIT n,(HL), BIT n,(IX+d): none
+            else:
+                want = byte & 0x28                          # the undocumented DDCB forms: the byte's
+            self.assertEqual(on['af'] & 0x28, want, f'{label}: X, Y with the Z80N')
+
+    def test_the_photographs_cells(self):
+        """LDPIRX2's C6 and C7, as Melissa's Next printed them (10 and 38), and Z80NTIME's BITF (10)."""
+        cpu = self.cpus[True]
+        for code, regs, mem, want in (
+                ([0xDD, 0xCB, 0x05, 0x46], {'ix': 0xBB30, 'af': 0x0000}, {0xBB35: 0x85}, 0x10),
+                ([0xDD, 0xCB, 0x05, 0x40], {'ix': 0x9040, 'af': 0x0000}, {0x9045: 0x29}, 0x38),
+                ([0xCB, 0x46], {'hl': 0xBB70, 'af': 0x0000, 'wz': 0x2900}, {0xBB70: 0x01}, 0x10)):
+            with self.subTest(code=' '.join(f'{b:02X}' for b in code)):
+                for a, v in mem.items():
+                    cpu.mem[a] = v
+                for i, v in enumerate(code):
+                    cpu.mem[0x8000 + i] = v
+                cpu.set({**fill_regs(random.Random(22)), **regs, 'pc': 0x8000})
+                cpu.step()
+                self.assertEqual(cpu.regs()['af'] & 0xFF, want)
+
+
 class TestOthersUnchanged(unittest.TestCase):
     """The flag takes only the Z80N's own opcodes: every other instruction (unprefixed, CB, DD, FD, ED) runs
     exactly as with the flag off, tick for tick."""
@@ -712,6 +789,10 @@ class TestOthersUnchanged(unittest.TestCase):
             code = code + [rng.randrange(256) for _ in range(3)]
             if code[0] in (0xDD, 0xFD) and code[1] == 0xED and code[2] in Z80N_T:
                 code[2] = 0x00                  # DD ED op is ED op (below), so not one of the others
+            if code[0] == 0xCB and 0x40 <= code[1] < 0x80 and code[1] & 7 == 6:
+                continue                        # BIT n,(HL): the Z80N's X and Y (TestBit)
+            if code[0] in (0xDD, 0xFD) and code[1] == 0xCB and 0x40 <= code[3] < 0x80:
+                code[3] = 0x06                  # BIT b,(IX+d): ditto; RLC (IX+d) instead
             res = []
             for cpu in (on, off):
                 for i, v in enumerate(code):
