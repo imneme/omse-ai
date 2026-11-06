@@ -182,6 +182,8 @@ struct ZXN {
     int int_count = 0;
     int in_latch_dt = -1;               // during an IN's io_read: ticks on to the INT that a 253Bh read registers
     uint64_t in_latch_at = 0;           // that tick, for NR 0x22 b7 (0: none)
+    bool rd_open = false;               // a read below 28 MHz, served at T1, waiting for its T2 (ldpirx_mem)
+    uint16_t rd_addr = 0;               // the address it was served from
     std::vector<IntEvent> int_log;
 
     // logs and stops
@@ -803,6 +805,7 @@ void do_reset(ZXN& z, bool hard) {
     z.ula_int_disabled = false;
     z.int_req = z.int_low = false;
     z.in_latch_at = 0;
+    z.rd_open = false;
     z.int_count = 0;
     z.int_log.clear();
     z.wait_next = false;
@@ -1747,12 +1750,20 @@ bool cpu_edge(ZXN& z) {
             Z80_SET_DATA(p, mem_read(z, a, &k));
             if (z.speed_eff == 3 && (k == K_SRAM || k == K_BRAM5)) z.wait_next = true;   // ref §1.4
             if (fetch) snoop_fetch(z, Z80_GET_DATA(p));
+            z.rd_open = !fetch && z.speed_eff < 3;                    // below 28 MHz the memory takes the address at T2
+            z.rd_addr = a;
         } else if (p & Z80_WR) {
+            z.rd_open = false;
             mem_write(z, a, Z80_GET_DATA(p));
+        } else if (z.rd_open) {                                       // the read's T2 (or a refresh, which closes it)
+            z.rd_open = false;
+            if (!(p & Z80_RFSH) && a != z.rd_addr) Z80_SET_DATA(p, mem_read(z, a));   // LDPIRX: DE's byte (Strobe)
         }
     } else if ((p & Z80_IORQ) && (p & Z80_M1)) {
+        z.rd_open = false;
         Z80_SET_DATA(p, intack_data(z));                              // INTACK: 0xFF, or hardware IM2's vector
     } else if ((p & Z80_IORQ) && !(p & Z80_M1)) {
+        z.rd_open = false;
         uint16_t port = Z80_GET_ADDR(p);
         if (p & Z80_RD) {
             // NR 0x22 b7 through 253Bh: INT as port_253b_dat held it at the falling edge in the T80N's T2, 1.5 clocks
