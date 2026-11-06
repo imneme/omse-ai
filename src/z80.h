@@ -1026,7 +1026,15 @@ static inline bool _z80_cb_action(z80_t* cpu, uint8_t z0, uint8_t z1) {
             res = val & (1<<y);
             cpu->f = (cpu->f & Z80_CF) | Z80_HF | (res ? (res & Z80_SF) : (Z80_ZF|Z80_PF));
             if (z0 == 6) {
-                cpu->f |= (cpu->wz >> 8) & (Z80_YF|Z80_XF);
+                if (!cpu->z80n) {
+                    cpu->f |= (cpu->wz >> 8) & (Z80_YF|Z80_XF);
+                }
+                else if (z1 != 6) {
+                    // the Next's T80N (t80n_alu.vhd, BIT): no MEMPTR. BIT n,(HL) and the documented DD/FD CB d 46-7E
+                    // give X = Y = 0; the undocumented DD/FD CB forms on other registers (z1 != 6) take them from
+                    // the byte (XYbit_undoc puts it on BusB). Melissa's Next agreed in all three.
+                    cpu->f |= val & (Z80_YF|Z80_XF);
+                }
             }
             else {
                 cpu->f |= val & (Z80_YF|Z80_XF);
