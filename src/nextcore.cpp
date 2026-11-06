@@ -93,7 +93,8 @@ struct ZXN {
     uint8_t border = 0;                 // port 0xFE bits 2:0 (ref §2.5)
     uint8_t keys[8] = {0};              // the keyboard matrix: half-row r (A8+r low), bit set = key down
     uint8_t fb[FB_W * FB_H];            // indexed: 0-7, +8 for BRIGHT
-    uint16_t f9[F9_W * FB_H];           // frame9: 9-bit RRRGGGBBB per 14 MHz sample
+    uint16_t f9[F9_W * FB_H];           // frame9: 9-bit RRRGGGBBB per 14 MHz sample, black while blanking
+    uint16_t f9raw[F9_W * FB_H];        // the mixer's colour before blanking (frame9(blank=False), §9.1 (14))
     uint16_t pal[2][1024];              // the palette RAMs (zxnext:6851-6960): 0 ULA/tilemap, 1 Layer 2/sprites;
                                         // address layer << 9 | second << 8 | index; data priority << 14 | RGB333
     uint8_t pal_idx = 0, pal_stored = 0;   // NR 0x40, and NR 0x44's first byte
@@ -1015,7 +1016,10 @@ inline void draw_pixel(ZXN& z) {
     if (h == 0 && v == 0 && ++z.flash_count == 16) { z.flash_count = 0; z.flash_on = !z.flash_on; }
     const Timing& t = T(z);
     int x = h - 12, y = v;
-    if (x >= 256 + FB_BORDER) x -= t.hc_len;                          // the left border wraps round from the line end
+    if (x >= 256 + FB_BORDER) {                                       // the left border wraps round from the line end:
+        x -= t.hc_len;                                                // it's the next scanline's, before vc_ula steps
+        y++;                                                          // at hc_ula 0 (Hatch Fern's PV1 finding)
+    }
     if (y >= 192 + FB_BORDER) y -= t.vc_len;
     const int fx = x + FB_BORDER, fy = y + FB_BORDER;
     if (fx < 0 || fx >= FB_W || fy < 0 || fy >= FB_H) return;
@@ -1126,6 +1130,11 @@ inline void draw_pixel(ZXN& z) {
     const bool uclip = !border && (x < uc[0] || x > uc[1] || y < uc[2] || y > uc[3]);
     const uint16_t fb9 = rgb9(z.nr[0x4A]);
     const int order = (z.nr[0x15] >> 2) & 7;
+    // blanking (zxula_timing.vhd:150-240; the mixer forces black, zxnext:7311-7315): raw hc 0-95 (Pentagon 0-63) and
+    // raw vc 0-7 (Pentagon 0-15), with the paper at raw (hactive, vactive)
+    const bool pent = z.timing == 4;
+    const int rawh = x + t.hactive, rawv = ((y + t.vactive) % t.vc_len + t.vc_len) % t.vc_len;
+    const bool blank = rawh <= (pent ? 63 : 95) || rawv <= (pent ? 15 : 7);
     for (int smp = 0; smp < 2; smp++) {
         const uint16_t urgb = urgb2[smp];
         const bool ut = (urgb >> 1) == z.nr[0x14] || uclip || (z.nr[0x68] & 0x80);
@@ -1164,7 +1173,8 @@ inline void draw_pixel(ZXN& z) {
             default:                                                  // S L U
                 out = lp ? lrgb : !lt ? lrgb : !ut ? urgb : fb9;
         }
-        z.f9[fy * F9_W + 2 * fx + smp] = out;
+        z.f9raw[fy * F9_W + 2 * fx + smp] = out;
+        z.f9[fy * F9_W + 2 * fx + smp] = blank ? 0 : out;
     }
 }
 
@@ -1882,7 +1892,7 @@ void zxn_sd_timing(ZXN* z, int ncr, int nac, int busy, int init_tries) {   // as
 }
 int zxn_spi_state(ZXN* z) { return z->spi_state; }
 uint64_t zxn_spi_count(ZXN* z) { return z->spi_count; }
-const uint16_t* zxn_frame9(ZXN* z) { return z->f9; }
+const uint16_t* zxn_frame9(ZXN* z, int blank) { return blank ? z->f9 : z->f9raw; }
 int zxn_f9_width() { return F9_W; }
 int zxn_fb_width() { return FB_W; }
 int zxn_fb_height() { return FB_H; }

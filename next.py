@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
     }
@@ -350,12 +350,13 @@ class Next:
         w, h = self.lib.zxn_fb_width(), self.lib.zxn_fb_height()
         return w, h, bytes((ctypes.c_uint8 * (w * h)).from_address(self.lib.zxn_framebuffer(self.z)))
 
-    def frame9(self):
+    def frame9(self, blank=True):
         """The visible area as 9-bit RRRGGGBBB colours (0-511), (w, h, values) with w = 704 14 MHz samples, two per
         7 MHz pixel, and h = 288; the ULA's paper pixel (px, py) is samples (96 + 2px, 48 + py) and (97 + 2px, 48 + py)
-        (DESIGN.md §9.1 (12))."""
+        (DESIGN.md §9.1 (12)). As output, black while blanking; blank=False gives the mixer's colour before it
+        (§9.1 (14))."""
         w, h = self.lib.zxn_f9_width(), self.lib.zxn_fb_height()
-        return w, h, list((ctypes.c_uint16 * (w * h)).from_address(self.lib.zxn_frame9(self.z)))
+        return w, h, list((ctypes.c_uint16 * (w * h)).from_address(self.lib.zxn_frame9(self.z, 1 if blank else 0)))
 
     def image(self, path=None, scale=2):
         """The screen as a PIL image (scaled), saved to path if given: frame9's colours, 3 bits to 8 as the Next's
