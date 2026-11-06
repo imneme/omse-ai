@@ -1,0 +1,331 @@
+"""The Next's expansion bus (zxnext.vhd; core 3.02.02), through DESIGN.md §9.1
+(19) only. Nothing is attached unless a test plugs it in.
+
+From the VHDL: NR 80h b7 bus on, b6 ROMCS replace, b5/b4 disable I/O / memory
+cycles, b3:0 copied into b7:4 on any reset (zxnext:2141-2159); NR 81h b6 ULA
+override, b5 NMI debounce off, b4 clock enable, speed forced 00 (5429-5433),
+b7 the ROMCS pin (6033); NR 86h-89h ANDed into the port enables while the bus is
+on (2351-2352); NR 8Ah propagates internal ports (2167-2175). With the bus on
+the CPU runs at the bus speed, 3.5 MHz (5705-5727). Written by Loam Fern,
+without reading the builder's code.
+"""
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import nextref as ref                                   # noqa: E402,F401
+from test_next_regs import Next, needs_next, NextCase, bare  # noqa: E402
+from test_next_timing import launch                      # noqa: E402
+from test_next_interrupts import reached                 # noqa: E402
+
+CODE = 0x8100
+F48 = 448 * 312 * 8                                     # a 48K frame in t28
+
+
+def bus_on(zx, nr80=0x80):
+    zx.nr_write(0x80, nr80)
+    zx.run_ticks(64)                                    # the effective copies wait for an idle edge
+
+
+def run_code(zx, code, end_offset=None):
+    """Load code at CODE (then JR $), launch it, run to the JR."""
+    zx.load(CODE, bytes(code) + bytes([0x18, 0xFE]))
+    launch(zx, CODE)
+    end = CODE + len(code)
+    assert zx.run_until_pc(end, max_ticks=10**6), 'never finished'
+    return end
+
+
+def io_cycles(zx):
+    return [(k, a, v) for _, k, a, v in zx.bus_events if k in ('ir', 'iw')]
+
+
+@needs_next
+class Registers(NextCase):
+
+    def test_nr80_and_the_reset_copy(self):
+        """Any reset copies b3:0 into b7:4 and keeps b3:0 (zxnext:2144-2145)."""
+        for written, after in [(0x05, 0x55), (0x08, 0x88), (0xF0, 0x00)]:
+            with self.subTest(nr80=f'{written:02X}h'):
+                zx = bare()
+                zx.nr_write(0x80, written)
+                self.assertEqual(zx.nr_read(0x80), written)
+                zx.reset()
+                zx.run_ticks(2000)
+                self.assertEqual(zx.nr_read(0x80), after)
+
+    def test_nr81_keeps_three_bits_and_no_speed(self):
+        """b6:4 stored; the speed bits are ignored in 3.02.02 (zxnext:5433); b3:2
+        read 0 (6033)."""
+        zx = bare()
+        zx.nr_write(0x81, 0x73)
+        self.assertEqual(zx.nr_read(0x81) & 0x7F, 0x70)
+
+    def test_nr81_b7_is_the_romcs_pin(self):
+        """A cartridge drives ROMCS, which zxnext uses active high (2977, 3038), and
+        NR 81h b7 reads that pin (6033)."""
+        zx = bare()
+        zx.bus_rom(bytes(16384))
+        zx.run_ticks(64)
+        self.assertEqual(zx.nr_read(0x81) & 0x80, 0x80)
+
+    def test_nr8a_is_six_bits(self):
+        zx = bare()
+        zx.nr_write(0x8A, 0xFF)
+        self.assertEqual(zx.nr_read(0x8A), 0x3F, 'zxnext:6059-6060')
+
+
+@needs_next
+class NothingAttached(NextCase):
+
+    def test_bus_off_carries_nothing(self):
+        zx = bare()
+        zx.bus_io({0x00F7: 0x12})
+        zx.bus_log(True)
+        run_code(zx, [0x3E, 0x5A, 0xD3, 0xF7, 0xDB, 0xF7, 0x32, 0x00, 0x90])
+        self.assertEqual(zx.bus_events, [], 'the bus is off')
+        self.assertEqual(zx.peek(0x9000), 0xFF, 'an unanswered port reads FFh (zxnext:1835-1837)')
+
+    def test_bus_on_with_nothing_attached_reads_ff(self):
+        zx = bare()
+        bus_on(zx)
+        self.assertEqual(zx.io_in(0x00F7), 0xFF, 'the data bus floats to FFh')
+
+
+@needs_next
+class IOCycles(NextCase):
+
+    def test_io_cycles_reach_the_connector(self):
+        """An I/O cycle no internal port answers goes to the bus (zxnext:2179),
+        and its read is the device's answer (1832-1833)."""
+        zx = bare()
+        bus_on(zx)
+        zx.bus_io({0x5AF7: 0x12})
+        zx.bus_log(True)
+        run_code(zx, [0x3E, 0x5A, 0xD3, 0xF7, 0x3E, 0x5A, 0xDB, 0xF7, 0x32, 0x00, 0x90])
+        self.assertEqual(io_cycles(zx), [('iw', 0x5AF7, 0x5A), ('ir', 0x5AF7, 0x12)])
+        self.assertEqual(zx.peek(0x9000), 0x12)
+
+    def test_internal_ports_stay_inside(self):
+        """An internally answered port isn't put on the bus (zxnext:2179) and
+        its internal answer wins (1830-1831)."""
+        zx = bare()
+        bus_on(zx)
+        zx.bus_io({0x243B: 0x99})
+        zx.bus_log(True)
+        run_code(zx, [0x01, 0x3B, 0x24, 0xED, 0x78, 0x32, 0x00, 0x90])   # LD BC,243Bh; IN A,(C)
+        self.assertEqual(io_cycles(zx), [])
+        self.assertEqual(zx.peek(0x9000), 0x80, 'the register last selected (NR 80h, by bus_on; zxnext:4544)')
+
+    def test_nr8a_propagates_port_fe_writes(self):
+        """NR 8Ah b0 shows port FE's cycles on the bus as well (zxnext:2167, 2177-2179)."""
+        for nr8a, want in [(0x00, []), (0x01, [('iw', 0x02FE, 0x02)])]:
+            with self.subTest(nr8a=nr8a):
+                zx = bare()
+                zx.nr_write(0x8A, nr8a)
+                bus_on(zx)
+                zx.bus_log(True)
+                run_code(zx, [0x3E, 0x02, 0xD3, 0xFE])
+                self.assertEqual(io_cycles(zx), want)
+
+    def test_disabling_io_cycles(self):
+        """NR 80h b5: I/O cycles don't reach the bus and reads give FFh (2179, 1832)."""
+        zx = bare()
+        bus_on(zx, 0xA0)
+        zx.bus_io({0x5AF7: 0x12})
+        zx.bus_log(True)
+        run_code(zx, [0x3E, 0x5A, 0xD3, 0xF7, 0x3E, 0x5A, 0xDB, 0xF7, 0x32, 0x00, 0x90])
+        self.assertEqual(io_cycles(zx), [])
+        self.assertEqual(zx.peek(0x9000), 0xFF)
+
+    def test_iorqula_takes_port_fe_from_the_ula(self):
+        """A device asserting IORQULA on port FE answers instead of the ULA
+        (bus_iorq_ula, zxnext:2183, 1830-1833)."""
+        zx = bare()
+        zx.bus_io({0x7FFE: 0x5A})
+        self.assertNotEqual(zx.io_in(0x7FFE), 0x5A, 'bus off: the ULA')
+        bus_on(zx)
+        self.assertEqual(zx.io_in(0x7FFE), 0x5A, 'bus on: the device')
+
+    def test_bus_port_enables_hand_ports_to_the_bus(self):
+        """While the bus is on, NR 86h-89h are ANDed into the internal port
+        enables (zxnext:2351-2352): NR 87h b2 clear takes the I2C's port 103Bh
+        (internal enable 10, 2377) away, so the device answers it."""
+        zx = bare()
+        zx.bus_io({0x103B: 0x12})
+        bus_on(zx)
+        self.assertEqual(zx.io_in(0x103B), 0xFF, 'NR 87h as at power-on: the I2C answers')
+        zx.nr_write(0x87, 0xFB)
+        zx.run_ticks(64)
+        self.assertEqual(zx.io_in(0x103B), 0x12)
+        zx.nr_write(0x80, 0x00)
+        zx.run_ticks(64)
+        self.assertEqual(zx.io_in(0x103B), 0xFF, 'bus off: NR 87h no longer counts')
+
+
+@needs_next
+class MemoryCycles(NextCase):
+
+    def test_memory_cycles_reach_the_connector(self):
+        """Memory cycles above 3FFFh always reach the bus (zxnext:2181)."""
+        zx = bare()
+        bus_on(zx)
+        zx.poke(0x9000, 0x77)
+        zx.bus_log(True)
+        run_code(zx, [0x3A, 0x00, 0x90, 0x32, 0x01, 0x90])   # LD A,(9000h); LD (9001h),A
+        ev = [(k, a, v) for _, k, a, v in zx.bus_events if k in ('mr', 'mw') and a in (0x9000, 0x9001)]
+        self.assertEqual(ev, [('mr', 0x9000, 0x77), ('mw', 0x9001, 0x77)])
+        fetches = {a for _, k, a, _ in zx.bus_events if k == 'mr'}
+        self.assertTrue({CODE, CODE + 3} <= fetches, 'opcode fetches too')
+
+    def test_disabling_memory_cycles(self):
+        zx = bare()
+        bus_on(zx, 0x90)
+        zx.bus_log(True)
+        run_code(zx, [0x3A, 0x00, 0x90])
+        self.assertEqual([e for e in zx.bus_events if e[1] in ('mr', 'mw')], [], 'NR 80h b4 (2181)')
+        bus_on(zx, 0x80)
+        zx.bus_log(True)
+        zx.run_ticks(1000)
+        self.assertTrue([e for e in zx.bus_events if e[1] == 'mr'], 'and back on, the parked loop\'s fetches')
+
+    def test_the_rom_area_shows_only_on_the_plain_rom_path(self):
+        """0000h-3FFFh reaches the bus only when sram_mem_hide_n is set: the plain
+        ROM (override "111", zxnext:3016), not config mode's ROM or MMU RAM
+        ("110", 3009), nor divMMC or Layer 2 overlays (3040-3066)."""
+        for setup, shown in [('config', False), ('rom', True), ('ram', False)]:
+            with self.subTest(setup):
+                zx = bare()
+                if setup != 'config':
+                    zx.nr_write(0x03, 0x01)             # leave config mode: a 48K
+                if setup == 'ram':
+                    zx.nr_write(0x50, 0x10)
+                bus_on(zx)
+                zx.bus_log(True)
+                run_code(zx, [0x3A, 0x05, 0x00])        # LD A,(0005h)
+                seen = any(k == 'mr' and a == 0x0005 for _, k, a, _ in zx.bus_events)
+                self.assertEqual(seen, shown)
+
+
+@needs_next
+class Cartridge(NextCase):
+
+    def cart(self, size):
+        data = bytes((i * 13 + 7) & 0xFF for i in range(size))
+        zx = bare()
+        zx.nr_write(0x03, 0x01)                         # the plain ROM path: config mode off
+        zx.bus_rom(data)
+        return zx, data
+
+    def read(self, zx, addrs):
+        code = []
+        for i, a in enumerate(addrs):
+            code += [0x3A, a & 0xFF, a >> 8, 0x32, i, 0x90]  # LD A,(a); LD (9000h+i),A
+        run_code(zx, code)
+        return [zx.peek(0x9000 + i) for i in range(len(addrs))]
+
+    def test_a_cartridge_replaces_the_rom_while_the_bus_is_on(self):
+        """ROMCS with the bus on and memory enabled: 0000h-3FFFh reads come from the
+        bus (sram_romcs, zxnext:2977, 3038, 3066-3073; cpu_di 1812-1813)."""
+        zx, data = self.cart(16384)
+        addrs = [0x0005, 0x2005, 0x3FFF]
+        rom = self.read(zx, addrs)
+        bus_on(zx)
+        self.assertEqual(self.read(zx, addrs), [data[a] for a in addrs])
+        self.assertNotEqual(rom, [data[a] for a in addrs], 'bus off: the Next\'s own ROM')
+
+    def test_an_8k_cartridge_is_mirrored(self):
+        zx, data = self.cart(8192)
+        bus_on(zx)
+        self.assertEqual(self.read(zx, [0x0005, 0x2005]), [data[5], data[5]])
+
+    def test_romcs_replace_reads_divmmc_banks_14_and_15(self):
+        """NR 80h b6: the cartridge's area comes from SRAM pages 1Eh/1Fh
+        (divMMC banks 14 and 15) by A13, read-only (zxnext:3066-3073, 1810-1813)."""
+        zx, data = self.cart(16384)
+        zx.sram[0x3C005] = 0xA1
+        zx.sram[0x3E005] = 0xB2
+        bus_on(zx, 0xC0)
+        self.assertEqual(self.read(zx, [0x0005, 0x2005]), [0xA1, 0xB2])
+        run_code(zx, [0x3E, 0x55, 0x32, 0x05, 0x00])    # LD A,55h; LD (0005h),A
+        self.assertEqual(zx.sram[0x3C005], 0xA1, 'read-only')
+
+    def test_memory_disabled_ignores_romcs(self):
+        """sram_pre_romcs_n needs memory cycles enabled (zxnext:2977)."""
+        zx, data = self.cart(16384)
+        rom = self.read(zx, [0x0005])
+        bus_on(zx, 0x90)
+        self.assertEqual(self.read(zx, [0x0005]), rom)
+        bus_on(zx, 0x80)
+        self.assertEqual(self.read(zx, [0x0005]), [data[5]], 'memory cycles on: the cartridge')
+
+
+@needs_next
+class Lines(NextCase):
+
+    def test_the_bus_runs_at_3_5_mhz(self):
+        """With the bus on, cpu_speed copies the bus speed, 00 (zxnext:5719-5725)."""
+        zx = bare(speed=3)
+        self.assertEqual(zx.speed, 3)
+        bus_on(zx)
+        self.assertEqual(zx.speed, 0)
+        self.assertEqual(zx.nr_read(0x07), 0x03, 'NR 07h: effective 00, selection 11 (5810)')
+        zx.nr_write(0x80, 0x00)
+        zx.run_ticks(64)
+        self.assertEqual(zx.speed, 3)
+
+    def test_wait_lengthens_the_next_bus_cycle(self):
+        """The bus's WAIT is ORed into the CPU's (zxnext:1798): n waits on the
+        next bus cycle, an opcode fetch here, make that NOP 4 + n T-states."""
+        zx = bare()
+        bus_on(zx)
+        zx.load(CODE, bytes([0x00] * 8 + [0x18, 0xFE]))
+        launch(zx, CODE)
+        self.assertTrue(zx.run_until_pc(CODE + 2, max_ticks=10**6))
+        c0 = zx.cpu_clocks
+        zx.bus_wait(3)
+        self.assertTrue(zx.run_until_pc(CODE + 3, max_ticks=10**5))
+        c1 = zx.cpu_clocks
+        self.assertTrue(zx.run_until_pc(CODE + 4, max_ticks=10**5))
+        self.assertEqual((c1 - c0, zx.cpu_clocks - c1), (7, 4))
+
+    def im1(self, c4):
+        zx = bare()
+        zx.nr_write(0xC4, c4)
+        zx.load(CODE, bytes([0xF3, 0xED, 0x56, 0xFB, 0x18, 0xFE]))   # DI; IM 1; EI; JR $
+        launch(zx, CODE)
+        self.assertTrue(zx.run_until_pc(CODE + 4, max_ticks=10**6))
+        return zx
+
+    def test_a_device_interrupt(self):
+        """With the bus on and NR C4h b7 (reset 1), the CPU's INT is the bus's INT
+        line (zxnext:1799)."""
+        zx = self.im1(0x80)                             # the ULA's interrupt off
+        zx.bus_lines(int_=True)
+        self.assertFalse(zx.run_until_pc(0x0038, max_ticks=2 * F48), 'bus off: not heard')
+        bus_on(zx)
+        self.assertTrue(reached(zx, 0x0038, 10**5))
+
+    def test_the_next_s_own_interrupt_comes_round_the_bus(self):
+        """With the bus on the CPU hears only the bus's INT line, and top4 drives
+        that line with the Next's own interrupt (top4:1967, 1988, 752, 1925), so
+        the ULA's frame interrupt still arrives with nothing attached."""
+        zx = self.im1(0x81)
+        bus_on(zx)
+        self.assertTrue(reached(zx, 0x0038, 2 * F48))
+
+    def test_a_device_nmi(self):
+        """nmi_assert_expbus: bus on, memory enabled, the line held (zxnext:2047),
+        and not in config mode (2061)."""
+        zx = bare()
+        zx.nr_write(0x03, 0x01)
+        zx.bus_lines(nmi=True)
+        self.assertFalse(zx.run_until_pc(0x0066, max_ticks=F48), 'bus off: not heard')
+        bus_on(zx)
+        self.assertTrue(reached(zx, 0x0066, 10**5))
+
+
+if __name__ == '__main__':
+    unittest.main()
