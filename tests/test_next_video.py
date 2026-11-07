@@ -206,19 +206,38 @@ class ModelSense(unittest.TestCase):
                 bad = [i for i, x in enumerate(slow) if x is not None and x != fast[i]]
                 self.assertEqual(bad[:5], [], f'{len(bad)} samples differ between the two paths')
 
-    def test_sprite_budget_by_hand(self):
-        """The cycle counts written in budget_cut_slots and budget_boundary_slots, against the model."""
-        def last_x(slots, timing, idx):
+    def test_the_measured_rule_by_hand(self):
+        """The cycle counts in budget_cut_slots and budget_deadline_slots, against the model."""
+        def last(slots, timing='p3'):
             v = budget_scene(slots, timing).model()
             owners = [None] * 320
-            nv._sprite_line(v, 100, owners)
-            return max(x for x in range(320) if owners[x] == idx)
-        self.assertEqual(last_x(budget_cut_slots(), 'p3', 77), 172 + 40)
-        self.assertEqual(last_x(budget_cut_slots(), '48k', 77), 172 + 8)
-        for d, over, last in ((0, 0, 319), (1, 1, 319), (2, 1, 318)):
-            v = budget_scene(budget_boundary_slots(d)).model()
-            self.assertEqual(nv._sprite_line(v, 100)[1], over, f'd={d}')
-            self.assertEqual(last_x(budget_boundary_slots(d), 'p3', 127), last, f'd={d}')
+            over = nv._sprite_line(v, 100, owners)[1]
+            return max(o for o in owners if o is not None), over
+        self.assertEqual(last(budget_cut_slots()), (72, 1))           # 64 + 8: nine strip sprites, as on PV2
+        self.assertEqual(last(budget_cut_slots(), '48k'), (72, 1))    # the deadline is the same on 48K timing
+        for e in (-1, 0, 1):                                          # the sixth 1x is slot 31 + e
+            want = (31 + e, 0) if e < 1 else (30 + e, 1)
+            self.assertEqual(last(budget_deadline_slots(e)), want, f'e={e}')
+
+    def test_the_model_draws_what_her_next_drew(self):
+        """Melissa's photos: PV2's strip stops after sprite 104 (whc 191); PV5's strips after 28, 78 and 104;
+        PV6's rows draw 0, 2, 2, 3, 2, 2, 2 small squares (readings-sitting2/3/4)."""
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv6_scene.py').exists():
+            self.skipTest('needs next-build/probes')
+        sys.path.insert(0, str(probes))
+        import pv2_model, pv5_model, pv6_model, pv6_scene
+        owners = [None] * 320
+        nv._sprite_line(pv2_model.scene_model(), 200, owners)
+        self.assertEqual(max(o for o in owners if o is not None and o >= 96), 104)
+        cuts = pv5_model.cuts(pv5_model.scene_model())
+        self.assertEqual({k: c[0] for k, c in cuts.items()}, {'A': 104, 'B': 28, 'C': 78})
+        v6, counts = pv6_model.scene_model(), []
+        for wvc, row in pv6_scene.plan():
+            owners = [None] * 320
+            nv._sprite_line(v6, wvc, owners)
+            counts.append(sum(1 for x in pv6_scene.X1 if owners[x + 4] is not None))
+        self.assertEqual(counts, [0, 2, 2, 3, 2, 2, 2])
 
     def test_sprite_scenes_can_see_what_they_test(self):
         """Each sprite-survivor scene against the same scene with its behaviour taken away: the pictures
@@ -253,6 +272,15 @@ class ModelSense(unittest.TestCase):
             self.assertEqual(max(x for x in range(320) if owners[x] == idx), last, f'sprite {idx}')
             x = [490, 0x1D0, 400, 460][idx]
             self.assertNotEqual((x >> 4) & 0x1F, 0x1F, 'a 1x mask would stop it at once')
+
+    def test_numpy_matches_the_reading_with_sprites_rewritten_mid_frame(self):
+        s, sched, _ = multiplex_scene()
+        v = s.model()
+        rows = sorted({r + d for r, _, _ in sched for d in (-1, 0, 1, 2)} | {60, 150})
+        want = v.frame9(sched, rows=set(rows))[2]
+        got = nv.frame9_np(s.model(), sched)[2]
+        for r in rows:
+            self.assertEqual(got[r * nv.W:(r + 1) * nv.W], want[r * nv.W:(r + 1) * nv.W], f'row {r}')
 
     def test_power_on_picture_is_black(self):
         self.assertEqual(set(nv.Video().frame9()[2]), {0}, '§9.1 (13): palette RAMs start all zero')
@@ -832,51 +860,47 @@ def budget_scene(slots, timing='p3'):
 
 
 def budget_cut_slots():
-    """Forty sprites on the row but off the right (x 330: S_QUALIFY and one S_PROCESS cycle each, sprites:855),
-    24 invisible (S_QUALIFY only), then sixteen 8x-wide overlapping sprites, a palette step each: the line's
-    time runs out in the fourteenth (cycle 2 + 80 + 24, then 129 each: sprite 77 gets 41 of its 128 cycles
-    on 128K/+3 timing, 9 on 48K)."""
-    out = [[330 & 0xFF, 100, 0x01, 0x80 | i] for i in range(40)]
-    out += [[40, 100, 0x00, i] for i in range(24)]
+    """64 invisible slots, then sixteen 8x-wide overlapping sprites, a palette step each (PV2's strip shape).
+    By the measured rule (whole sprites by SPRITE_DEADLINE, then stop) the first nine draw whole: the tenth
+    would finish at cycle 2 + 64 + 10 x 129 = 1356 > 1282, so it and all after it are dropped."""
+    out = [[0, 0, 0x00, 0x00]] * 64
     out += [[16 + 12 * i, 100, i << 4, 0xC0 | (20 + i), 0x18] for i in range(16)]
     return out
 
 
-def budget_boundary_slots(d):
-    """114 invisible slots (cycles 2-115), thirteen full 8x sprites (129 each), and in slot 127 one at
-    x 290 - d running to whc 319 (30 + d cycles): its last pixel is cycle 1823 + d and the machine idles at
-    1824 + d. d = 0 fits exactly; d = 1 is overtime though that pixel, in cycle 1824 itself, still lands;
-    d = 2 loses it (sprites:470-501, 531-537, 977). The drawn sprites must come last: invisible slots after
-    them would spend the time in S_QUALIFY instead."""
-    out = [[0, 0, 0x00, 0x00]] * 114
-    out += [[8 + 14 * i, 100, i << 4, 0xC0 | (30 + i), 0x18] for i in range(13)]
-    out.append([(290 - d) & 0xFF, 100, 0xF1, 0xC0 | 50, 0x18])
+def budget_deadline_slots(e):
+    """17 + e invisible slots, nine 8x sprites (129 cycles each) and six 1x (17 each): the sixth 1x finishes at
+    cycle 2 + 17 + e + 1161 + 102 = 1282 + e. e = -1 and 0 draw it; e = +1 drops it and sets status bit 1."""
+    out = [[0, 0, 0x00, 0x00]] * (17 + e)
+    out += [[8 * i, 100, i << 4, 0xC0 | (30 + i), 0x18] for i in range(9)]
+    out += [[200 + 18 * j, 100, (j + 9) << 4, 0x80 | (40 + j)] for j in range(6)]
     return out
 
 
 @needs_next
 class SpriteBudget(VideoCase):
-    """The renderer's time: one line of 28 MHz cycles from line reset to line reset (4 x 456 on 128K/+3
-    timing, 4 x 448 on 48K and Pentagon); one cycle per sprite qualified and one per pixel processed; what
-    doesn't fit is never drawn, and port 0x303B bit 1 says so (sprites:517-537, 826-866, 951-995)."""
+    """The renderer's time, as measured on Melissa's Next (PV2, PV5, PV6): one cycle per sprite qualified and
+    one per pixel; a drawn sprite is drawn only if it can finish by SPRITE_DEADLINE (1282 cycles after the
+    line reset, about whc 319), and the first that can't stops the line and sets port 0x303B bit 1.
+    (sprites.vhd as read cuts mid-sprite at the line reset instead; her Next doesn't.)"""
 
-    def test_line_runs_out_mid_sprite(self):
+    def test_line_drops_the_sprite_that_cannot_finish(self):
         for timing in ('p3', '48k'):
             with self.subTest(timing=timing):
                 self.assertFrameMatches(budget_scene(budget_cut_slots(), timing), name=f'budget_cut_{timing}')
 
-    def test_the_boundary_to_the_cycle(self):
-        for d in (0, 1, 2):
-            with self.subTest(d=d):
-                self.assertFrameMatches(budget_scene(budget_boundary_slots(d)), name=f'budget_boundary_{d}')
+    def test_the_deadline_to_the_cycle(self):
+        for e in (-1, 0, 1):
+            with self.subTest(e=e):
+                self.assertFrameMatches(budget_scene(budget_deadline_slots(e)), name=f'budget_deadline_{e}')
 
-    def test_status_says_overtime_and_clears_on_read(self):
-        for d, want in ((0, 0x01), (1, 0x03), (2, 0x03)):
-            with self.subTest(d=d):
-                s = budget_scene(budget_boundary_slots(d))
+    def test_status_says_a_sprite_was_dropped_and_clears_on_read(self):
+        for e, want in ((-1, 0x01), (0, 0x01), (1, 0x03)):
+            with self.subTest(e=e):
+                s = budget_scene(budget_deadline_slots(e))
                 self.assertEqual(nv.sprite_status(s.model()), want)
                 zx = s.machine()
-                self.assertEqual(zx.io_in(0x303B), want, 'sprites:977, 990-991')
+                self.assertEqual(zx.io_in(0x303B), want, 'measured: bit 1 when a sprite is dropped')
                 self.assertEqual(zx.io_in(0x303B), 0x00, 'sprites:986-988: a read clears it')
 
 
@@ -897,6 +921,36 @@ def wrap_sprites():
             [0x1D0 & 0xFF, 70, 0x11, 0xC0 | 5, 0x10],
             [400 & 0xFF, 100, 0x21, 0xC0 | 6, 0x18],
             [460 & 0xFF, 130, 0x31, 0xC0 | 7, 0x18]]
+
+
+def multiplex_scene():
+    """Sixteen sprites, each reused four times down the screen by copper writes to the nextreg mirror
+    (NR 0x34 then NR 0x35-0x37: x, y, palette). Each reuse is written at frame row last + 1 (WAIT a row
+    after the sprite's last visible row) and starts two rows later, the demo's margin. Returns (scene,
+    schedule, copper words). After the last band, band 0's attributes go back for the next frame."""
+    s = sprite_scene(0x01, [[24 + 14 * i, 40, (i << 4) & 0xF0, 0x80 | (i % 8)] for i in range(16)])
+    sched, words = [], []
+    y = 40
+    for band in range(1, 4):
+        last = y + 15 + 16                                   # frame row of the sprites' last visible row
+        r = last + 1                                         # write after it
+        y_new = r + 2 - 16                                   # first visible frame row r + 2 (wvc = frame - 16)
+        words.append(0x8000 | (44 << 9) | (r - 49))          # WAIT (r - 49, 44): lands before frame row r
+        for i in range(16):
+            x = (30 + 14 * i + 7 * band) & 0xFF
+            pal = ((i + 3 * band) << 4) & 0xF0
+            for n, val in ((0x34, i), (0x35, x), (0x36, y_new), (0x37, pal)):
+                words.append((n << 8) | val)
+                sched.append((r, n, val))
+        y = y_new
+    r = y + 15 + 16 + 1                                      # after the last band: band 0 back, for the
+    words.append(0x8000 | (44 << 9) | (r - 49))              # next frame (mode 11 restarts the list at the top)
+    for i in range(16):
+        for n, val in ((0x34, i), (0x35, 24 + 14 * i), (0x36, 40), (0x37, (i << 4) & 0xF0)):
+            words.append((n << 8) | val)
+            sched.append((r, n, val))
+    words.append(0xFFFF)
+    return s, sched, words
 
 
 @needs_next
@@ -1073,6 +1127,25 @@ class SpriteMirror(VideoCase):
         self.check(s)
 
 
+@needs_next
+class SpriteMultiplex(VideoCase):
+    """Copper-multiplexed sprites: attribute writes mid-frame reach the sprites from the row after they land,
+    because each row's sprites are drawn during the line before (sprites:539)."""
+
+    def test_copper_moves_sprites_down_the_screen(self):
+        s, sched, words = multiplex_scene()
+        s.nr(0x62, 0x00).nr(0x61, 0x00)
+        for w in words:
+            s.nr(0x63, w >> 8, w & 0xFF)
+        s.nr(0x62, 0xC0)
+        got = list(s.machine(frames=3).frame9()[2])
+        want = nv.frame9_np(s.model(), sched)[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('sprite_multiplex', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+
+
 def ulap_scene(seed=8):
     s = ula_scene(seed)
     s.io(0xBF3B, 0x40).io(0xFF3B, 0x01)                     # ULA+ on (zxnext:4489-4490)
@@ -1207,6 +1280,54 @@ class ProbeV4(VideoCase):
         if bad:
             path = self._save_diff('pv4_layer2_card', got, want, bad)
             self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+
+
+@needs_next
+class ProbeV5(VideoCase):
+    """P-V5's budget ruler (next-build/probes/pv5_scene.py, the scene defined once): three strips at 8x, 4x
+    and 2x, with all 128 slots written, cut where the sprite renderer's line runs out."""
+
+    def test_pv5_budget_ruler(self):
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv5_scene.py').exists():
+            self.skipTest('needs next-build/probes/pv5_scene.py')
+        sys.path.insert(0, str(probes))
+        import pv5_model as pm
+        s = Scene()
+        for kind, a, b in pm.writes():
+            (s.nr if kind == 'nr' else s.io)(a, b)
+        zx, v = s.machine(frames=2), s.model()
+        got = list(zx.frame9()[2])
+        want = nv.frame9_np(v)[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('pv5_budget_ruler', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+        self.assertEqual(zx.io_in(0x303B), nv.sprite_status(v))
+
+
+@needs_next
+class ProbeV6(VideoCase):
+    """P-V6's deadline card (next-build/probes/pv6_scene.py, the scene defined once): a skip-or-stop row and
+    six rows of wide blocks then four 1x sprites, all 128 slots written."""
+
+    def test_pv6_deadline_card(self):
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv6_scene.py').exists():
+            self.skipTest('needs next-build/probes/pv6_scene.py')
+        sys.path.insert(0, str(probes))
+        import pv6_model as pm
+        s = Scene()
+        for kind, a, b in pm.writes():
+            (s.nr if kind == 'nr' else s.io)(a, b)
+        zx, v = s.machine(frames=2), s.model()
+        got = list(zx.frame9()[2])
+        want = nv.frame9_np(v)[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('pv6_deadline_card', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+        self.assertEqual(zx.io_in(0x303B), nv.sprite_status(v))
 
 
 if __name__ == '__main__':
