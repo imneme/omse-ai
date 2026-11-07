@@ -6,6 +6,7 @@ samples at, counted as Fuse counts an IN: its fetch (4) and operand read (3),
 then the I/O cycle's first T-state and two more, so 10 T after the IN begins
 for a port whose high byte isn't contended. Every read must match.
 """
+import ctypes
 import sys
 import unittest
 from pathlib import Path
@@ -39,18 +40,19 @@ def ref_float(scr, t, model):
     return 0xFF
 
 
-def screen_bytes():
-    """A screen whose every byte differs from its neighbours and is never FFh."""
-    return bytes(((o * 7) + 3) % 255 for o in range(0x1800)) + bytes(((o * 13) + 1) % 255 for o in range(0x300))
+def screen_bytes(k=0):
+    """A screen whose every byte differs from its neighbours and is never FFh
+    (and, for another k, differs from the first screen's byte at every place)."""
+    return bytes(((o * 7) + 3 + k) % 255 for o in range(0x1800)) + bytes(((o * 13) + 1 + k) % 255 for o in range(0x300))
 
 
 N = 580                                                 # reads: XOR A; IN A,(FFh); LD (HL),A; INC HL; LD B,0
 BODY = bytes([0xAF, 0xDB, 0xFF, 0x77, 0x23, 0x06, 0x00])   # 35 T, odd, so every phase of 8 comes round
 
 
-def program():
-    """EI; HALT (to INT); DI; a delay to just before the screen; then N reads into 9000h."""
-    head = bytes([0xFB, 0x76, 0xF3, 0x01, 0x12, 0x02,          # EI; HALT; DI; LD BC,530
+def program(setup=b''):
+    """Setup; EI; HALT (to INT); DI; a delay to just before the screen; then N reads into 9000h."""
+    head = bytes(setup) + bytes([0xFB, 0x76, 0xF3, 0x01, 0x12, 0x02,          # EI; HALT; DI; LD BC,530
                   0x0B, 0x78, 0xB1, 0x20, 0xFB,                 # DEC BC; LD A,B; OR C; JR NZ
                   0x21, 0x00, 0x90])                            # LD HL,9000h
     s = 0x8000 + len(head)
@@ -117,6 +119,39 @@ class Floating48(unittest.TestCase):
     def test_off_reads_ff(self):
         _, _, got = self.run_reads(floating=False)
         self.assertEqual(set(got), {0xFF})
+
+
+@unittest.skipUnless(have_128(), 'needs the 128K ROMs (128-0.rom, 128-1.rom)')
+class Floating128(unittest.TestCase):
+    def run_reads(self, screen7=False):
+        # page in ROM 1 and choose the screen (LD BC,7FFDh; LD A,10h or 18h; OUT (C),A)
+        code, s, e = program([0x01, 0xFD, 0x7F, 0x3E, 0x18 if screen7 else 0x10, 0xED, 0x79])
+        zx = Speccy(model=128)
+        snap = OUT / 'floating128.sna'
+        zx.save_sna(snap)
+        d = bytearray(snap.read_bytes())
+        d[27 + 0x4000:27 + 0x4000 + len(code)] = code                 # bank 2, at 8000h
+        d[49179:49181] = (0x8000).to_bytes(2, 'little')               # PC
+        snap.write_bytes(bytes(d))
+        zx.load_sna(snap)
+        scr5, scr7 = screen_bytes(), screen_bytes(100)
+        ctypes.memmove(zx.lib.zx_bank(zx.z, 5), scr5, len(scr5))
+        ctypes.memmove(zx.lib.zx_bank(zx.z, 7), scr7, len(scr7))
+        _, doc0 = measure(zx, s, e)
+        return scr7 if screen7 else scr5, doc0, zx.read(0x9000, N)
+
+    def check(self, screen7):
+        scr, doc0, got = self.run_reads(screen7)
+        want = bytes(ref_float(scr, doc0 + 35 * i + 4 + 10, 128) for i in range(N))
+        bad = [(i, got[i], want[i]) for i in range(N) if got[i] != want[i]]
+        self.assertEqual(bad[:5], [], f'{len(bad)} of {N} reads differ (index, got, want)')
+        self.assertGreater(sum(b != 0xFF for b in got), N // 5, 'too few reads saw the screen to mean anything')
+
+    def test_reads_follow_the_ulas_fetches(self):
+        self.check(screen7=False)
+
+    def test_the_shadow_screen(self):
+        self.check(screen7=True)
 
 
 @unittest.skipUnless(have_128(), 'needs the 128K ROMs (128-0.rom, 128-1.rom)')
