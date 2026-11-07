@@ -2131,14 +2131,14 @@ uint8_t intack_data(const ZXN& z) {
     }
     return iei ? 0xFF : (z.nr[0xC0] & 0xE0);
 }
-// each device's state machine, on a rising CPU edge, from the pins as they were before it (im2_device.vhd:66-104)
+// each device's state machine, on a rising CPU edge, from the pins as they were before it (im2_device.vhd:91-132)
 void im2_edge(ZXN& z, uint64_t before) {
     const bool reti = z.reti_seen;
     z.reti_seen = false;
     if (!hw_im2(z)) return;
     const bool m1 = before & Z80_M1, iorq = before & Z80_IORQ, im2 = z.im_mode == 2;
-    // reti_decode: S_ED_T4, which lasts until the edge that consumes reti_seen (im2c:183-184), so a requesting
-    // device still passes IEI on that edge though the snooper has moved on (im2d:96-101)
+    // reti_decode: S_ED_T4, which lasts until the edge that consumes reti_seen (im2c:171-173, 233-234), so a requesting
+    // device still passes IEI on that edge though the snooper has moved on (im2d:141-144)
     const bool decode = z.snoop == 1 || reti;
     bool iei = true;
     for (int i = 0; i < 14; i++) {
