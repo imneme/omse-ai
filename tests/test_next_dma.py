@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import nextref as ref                                   # noqa: E402
 from test_next_regs import Next, needs_next, NextCase, bare  # noqa: E402
 from test_next_timing import launch                      # noqa: E402
-from test_next_interrupts import main_loop, vector, CODE, F48  # noqa: E402
+from test_next_interrupts import main_loop, vector, reached, CODE, F48  # noqa: E402
 from test_next_copper import load as load_copper, WAIT as copper_wait, MOVE as copper_move  # noqa: E402
 from test_next_copper import NEVER as COPPER_NEVER  # noqa: E402
 
@@ -674,6 +674,107 @@ class Interrupts(NextCase):
         zx = self.setup(0xA0, 0x01)                     # pulse mode, NR CC b0 set all the same
         self.assertTrue(zx.run_until_pc(0x9200, max_ticks=4 * F48))
         self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'the IM2 devices are held in reset (im2p:105)')
+
+
+SLED = 0x8200                                           # main line: NOPs, so a freeze ends an instruction
+
+
+@needs_next
+class AtTheRelease(NextCase):
+    """The T80N's input synchroniser samples INT and NMI on every clock under
+    CEN (t80n:1651-1670; CEN is tied high, t80na:146), not under ClkEn, so
+    while the DMA holds the bus a pending interrupt is already seen. The edge
+    that drops BUSAK starts the next M-cycle in the same branch, and at an
+    instruction's end that branch takes the interrupt or NMI cycle
+    (t80n:1738-1770). So no main-line instruction runs between the release and
+    the acknowledge: the address pushed is the PC the CPU was frozen at.
+    (TX-1696's logo on Melissa's Next; Kelp's reading.)"""
+
+    def machine(self, c0=0xA1, cc=0x01, di=False, nmi=False):
+        zx = bare(timing='48k')
+        if nmi:
+            zx.nr_write(0x03, 0x01)                     # out of config mode for the NMI (zxnext:2061)
+            zx.nr_write(0x06, zx.nr_read(0x06) | 0x08)
+            for base in (0x14000, ref.ROM_SRAM[0]):
+                zx.sram[base + 0x66], zx.sram[base + 0x67] = 0xED, 0x45   # RETN
+        else:
+            zx.nr_write(0x03, 0x00)                     # boot ROM off
+        zx.nr_write(0xC0, c0)
+        zx.nr_write(0xCC, cc)
+        head = [0xF3, 0x3E, 0x90, 0xED, 0x47, 0xED, 0x5E] + ([] if di else [0xFB])   # DI; LD I,90h; IM 2; EI
+        zx.load(CODE, bytes(head + [0xC3, SLED & 0xFF, SLED >> 8]))
+        zx.load(SLED, bytes([0x00] * 3000 + [0xC3, SLED & 0xFF, SLED >> 8]))
+        zx.load(0x9200, ISR)
+        vector(zx, 0x90, (c0 & 0xE0) | 11 << 1, 0x9200)
+        zx.poke(0x9800, 0)
+        launch(zx, CODE)
+        self.assertTrue(zx.run_until_pc(SLED, max_ticks=10**6))
+        if not di and not nmi:
+            self.assertTrue(zx.run_until_pc(0x9200, max_ticks=2 * F48), 'a first interrupt, DMA idle')
+            self.assertTrue(zx.run_until_pc(SLED + 1, SLED + 2999, max_ticks=F48), 'back in the sled')
+        zx.dma_log(True)
+        return zx
+
+    def frozen_pc(self, zx):
+        for _ in range(20000):
+            zx.run_ticks(8)
+            if zx.busak:
+                return zx.regs()['pc']
+        self.fail('the DMA never took the bus')
+
+    def pushed(self, zx):
+        sp = zx.regs()['sp']
+        return zx.peek(sp) | zx.peek(sp + 1) << 8
+
+    def test_an_im2_interrupt_is_acknowledged_at_the_release(self):
+        zx = self.machine()
+        program(zx, 0xA000, 0xC000, BLOCK, a_mode=FIXED, b_mode=FIXED)
+        pc = self.frozen_pc(zx)
+        self.assertTrue(reached(zx, 0x9200, 2 * F48), 'the ULA\'s handler')
+        self.assertTrue(0 < len(zx.dma_events) < 2 * BLOCK, 'mid-block')
+        self.assertEqual(self.pushed(zx), pc, 'no NOP ran between the release and the acknowledge')
+
+    def nmi_block(self, cc):
+        zx = self.machine(cc=cc, nmi=True)
+        load_copper(zx, [copper_wait(100), copper_move(0x02, 0x08), COPPER_NEVER])
+        program(zx, 0xA000, 0xC000, BLOCK, a_mode=FIXED, b_mode=FIXED)
+        zx.nr_write(0x62, 0x40)
+        return zx
+
+    def test_an_nmi_that_breaks_the_burst_is_taken_at_the_release(self):
+        zx = self.nmi_block(0x80)                       # NR CC b7: the NMI breaks the transfer
+        pc = self.frozen_pc(zx)
+        self.assertTrue(reached(zx, 0x0066, 2 * F48))
+        self.assertTrue(0 < len(zx.dma_events) < 2 * BLOCK, 'mid-block')
+        self.assertEqual(self.pushed(zx), pc)
+
+    def test_an_nmi_during_the_freeze_is_taken_when_the_block_ends(self):
+        """Without NR CC b7 the transfer runs on; the NMI's edge, caught during
+        the freeze (NMI_s, t80n:1664-1668), is taken as the bus comes back."""
+        zx = self.nmi_block(0x00)
+        pc = self.frozen_pc(zx)
+        self.assertTrue(reached(zx, 0x0066, 4 * F48))
+        self.assertEqual(len(zx.dma_events), 2 * BLOCK, 'after the block')
+        self.assertEqual(self.pushed(zx), pc)
+
+    def test_with_di_nothing_is_taken_and_the_dma_waits(self):
+        """With interrupts off the CPU never acknowledges, so an enabled source's
+        request stays (im2d:104-118) and im2_dma_int keeps the DMA in START_DMA
+        (zxnext:1966; dma:269-275): after a frame's interrupt the transfer never
+        starts, the CPU runs on through its NOPs, and no handler runs. With the
+        source's NR CC bit clear the same transfer runs."""
+        for cc, runs in [(0x01, False), (0x00, True)]:
+            with self.subTest(cc=cc):
+                zx = self.machine(cc=cc, di=True)
+                zx.run_ticks(F48 * 6 // 5)              # a frame's interrupt is requesting now
+                pc = zx.regs()['pc']
+                program(zx, 0xA000, 0xC000, BLOCK, a_mode=FIXED, b_mode=FIXED)
+                zx.run_ticks(F48 // 2)
+                self.assertEqual(bool(zx.dma_events), runs)
+                if not runs:
+                    self.assertNotEqual(zx.regs()['pc'], pc, 'the CPU ran')
+                    self.assertFalse(reached(zx, 0x9200, F48), 'no handler')
+                    self.assertEqual(zx.dma_events, [], 'still no DMA cycle')
 
 
 @needs_next
