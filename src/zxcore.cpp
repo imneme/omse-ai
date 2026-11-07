@@ -471,8 +471,10 @@ static inline void beam(ZX& z) {
 
 // One T-state of the clock: the AY, the counters, the INT pin, the frame.
 static inline void advance(ZX& z) {
-    if (z.ay_record && z.model == 128 && (z.t & 1) == 0) {
-        if (ay38910_tick(&z.ay)) z.ay_samples.push_back(z.ay.sample);
+    if (z.model == 128 && (z.t & 1) == 0) {
+        // Recording observes the chip; it must not start its clock or DC
+        // filter. A held level has already settled before capture begins.
+        if (ay38910_tick(&z.ay) && z.ay_record) z.ay_samples.push_back(z.ay.sample);
     }
 
     z.t++;

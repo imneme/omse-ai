@@ -138,11 +138,16 @@ def notes_text(notes, per_channel=True):
     return '\n'.join(lines)
 
 
-def write_ay_wav(zx, path, trim=True):
+def write_ay_wav(zx, path, trim=True, *, raw=False):
     """The AY samples collected while recording (zx.record_ay()), as a WAV.
-    trim: drop the silence before the first sound (setup time, loading)."""
+    trim: drop the silence before the first sound (setup time, loading).
+    raw: preserve the chip's existing DC-adjusted samples, without the
+    causal rest controller. No second high-pass is applied in either mode.
+    """
     import array
+    import sys
     import wave
+    from zxaudio import BiasController, pcm16
     n = zx.lib.zx_ay_samples_len(zx.z)
     buf = (ctypes.c_float * max(n, 1))()
     zx.lib.zx_ay_samples_get(zx.z, buf)
@@ -152,7 +157,11 @@ def write_ay_wav(zx, path, trim=True):
         first = next((i for i, x in enumerate(xs) if abs(x - quiet) > 0.01), 0)
         xs = xs[max(0, first - 2205):]
         n = len(xs)
-    out = array.array('h', (max(-32000, min(32000, int(x * 32000))) for x in xs))
+    controller = BiasController(zx.lib.zx_ay_rate(), centered=True)
+    out = array.array('h', (pcm16(x * 32000, limit=32000) for x in
+                           (xs if raw else controller.process(xs))))
+    if sys.byteorder != 'little':
+        out.byteswap()
     with wave.open(str(path), 'wb') as w:
         w.setnchannels(1)
         w.setsampwidth(2)

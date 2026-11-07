@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include "audio_bias.h"
 
 namespace nextaudio {
 
@@ -129,6 +130,13 @@ struct Audio {
     uint64_t acc = 0;
     uint64_t sumL = 0, sumR = 0, nsum = 0;
     std::vector<int16_t> outbuf;
+    std::vector<int16_t> rawbuf;               // paired queue; either read consumes the same interval
+    zxaudio::Bias bias[2];
+    double hold_ms = 250, release_ms = 250, attack_ms = 2;
+
+    void reset_bias() {
+        for (auto& b : bias) b.configure(rate > 0 ? rate : 48000, hold_ms, release_ms, attack_ms);
+    }
 
     void reset_psgs() {
         for (auto& y : ym) y.reset();
@@ -170,8 +178,11 @@ struct Audio {
             acc += (uint64_t)rate;
             if (acc >= 1750000) {
                 acc -= 1750000;
-                outbuf.push_back((int16_t)(point ? L * 5 : sumL * 5 / nsum));  // 0-5998 to 0-29990
-                outbuf.push_back((int16_t)(point ? R * 5 : sumR * 5 / nsum));
+                const int16_t l = (int16_t)(point ? L * 5 : sumL * 5 / nsum);  // raw scaling unchanged
+                const int16_t r = (int16_t)(point ? R * 5 : sumR * 5 / nsum);
+                rawbuf.push_back(l); rawbuf.push_back(r);
+                outbuf.push_back(zxaudio::pcm16(bias[0].step(l)));
+                outbuf.push_back(zxaudio::pcm16(bias[1].step(r)));
                 sumL = sumR = nsum = 0;
             }
         }
