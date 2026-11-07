@@ -99,7 +99,7 @@ class Lines(NextCase):
     def test_both_lines_idle_high(self):
         zx = bare()
         self.assertEqual((zx.io_in(SCL), zx.io_in(SDA)), (0xFF, 0xFF),
-                         'released, pulled up, nothing pulling down (no RTC by default)')
+                         'released, pulled up, nothing pulling down (an idle DS1307 pulls nothing low)')
 
     def test_bit_0_pulls_low_or_releases(self):
         for port in (SCL, SDA):
@@ -151,10 +151,10 @@ class RTC(NextCase):
         return zx, Bus(zx)
 
     def test_no_rtc_no_acknowledge(self):
-        zx = bare()
+        zx = bare(rtc=False)                            # ruling (18) j: the RTC is on by default; rtc=False has none
         bus = Bus(zx)
         bus.start()
-        self.assertFalse(bus.write(0xD0), 'nothing at 68h by default (ruling 18)')
+        self.assertFalse(bus.write(0xD0), 'nothing at 68h on a board with no RTC (ruling 18 j)')
         bus.stop()
 
     def test_detached_again(self):
