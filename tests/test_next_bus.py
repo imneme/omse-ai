@@ -180,6 +180,23 @@ class IOCycles(NextCase):
                 want = [('iw', port, v)] if name == 'none' else []
                 self.assertEqual(io_cycles(zx), want)
 
+    def test_dffd_stays_inside_on_its_own_decode(self):
+        """DFFDh also matches the AY's partial decode (port_fffd: A15:14 = 11, A2
+        = 1, A1:0 = 01; zxnext:2606, 2537), so the sweep can't tell port_dffd
+        (2555) from it. With the AY's enable off (NR 84h b0, internal enable 16,
+        2387), DFFD's own decode must still keep the write inside; with DFFD's
+        enable off too (NR 82h b2, 2359) nothing claims it and it reaches the bus.
+        (The last bus survivor, run 2.)"""
+        for nr82, inside in [(0xFF, True), (0xFB, False)]:
+            with self.subTest(nr82=f'{nr82:02X}h'):
+                zx = bare()
+                zx.nr_write(0x84, 0xFE)
+                zx.nr_write(0x82, nr82)
+                bus_on(zx)
+                zx.bus_log(True)
+                run_code(zx, [0x01, 0xFD, 0xDF, 0x3E, 0x00, 0xED, 0x79])
+                self.assertEqual(io_cycles(zx), [] if inside else [('iw', 0xDFFD, 0x00)])
+
     def test_nr8a_b1_propagates_7ffd(self):
         """NR 8Ah b1: a 7FFD write shows on the connector (zxnext:2168, 2177-2179)
         and pages as well. (Mutant survivor 5, run 1.)"""
