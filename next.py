@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_bus_rom': ([P, ctypes.c_char_p, I], None), 'zxn_bus_io_clear': ([P], None), 'zxn_bus_io_add': ([P, I, I, I], None), 'zxn_bus_lines': ([P, I, I, I], None), 'zxn_bus_wait': ([P, I], None), 'zxn_bus_logging': ([P, I], None), 'zxn_bus_log_len': ([P], I), 'zxn_bus_log_get': ([P, I, U64P], None), 'zxn_uart_feed': ([P, I, ctypes.c_char_p, I, U64, I, I, I], None), 'zxn_uart_sent_len': ([P, I], I), 'zxn_uart_sent_get': ([P, I, I, U64P], None), 'zxn_uart_sent_clear': ([P, I], None), 'zxn_uart_cts': ([P, I, I], None), 'zxn_uart_feed_levels': ([P, I, ctypes.c_char_p, U64P, I], None), 'zxn_uart_tx_logging': ([P, I, I], None), 'zxn_uart_tx_log_len': ([P, I], I), 'zxn_uart_tx_log_get': ([P, I, I, U64P], None), 'zxn_uart_rts': ([P, I], I), 'zxn_i2c_rtc': ([P, I, I, I, I, I, I, I, I], None), 'zxn_i2c_logging': ([P, I], None), 'zxn_i2c_log_len': ([P], I), 'zxn_i2c_log_get': ([P, I, U64P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_nr_peek': ([P, I], I), 'zxn_bus_rom': ([P, ctypes.c_char_p, I], None), 'zxn_bus_io_clear': ([P], None), 'zxn_bus_io_add': ([P, I, I, I], None), 'zxn_bus_lines': ([P, I, I, I], None), 'zxn_bus_wait': ([P, I], None), 'zxn_bus_logging': ([P, I], None), 'zxn_bus_log_len': ([P], I), 'zxn_bus_log_get': ([P, I, U64P], None), 'zxn_uart_feed': ([P, I, ctypes.c_char_p, I, U64, I, I, I], None), 'zxn_uart_sent_len': ([P, I], I), 'zxn_uart_sent_get': ([P, I, I, U64P], None), 'zxn_uart_sent_clear': ([P, I], None), 'zxn_uart_cts': ([P, I, I], None), 'zxn_uart_feed_levels': ([P, I, ctypes.c_char_p, U64P, I], None), 'zxn_uart_tx_logging': ([P, I, I], None), 'zxn_uart_tx_log_len': ([P, I], I), 'zxn_uart_tx_log_get': ([P, I, I, U64P], None), 'zxn_uart_rts': ([P, I], I), 'zxn_i2c_rtc': ([P, I, I, I, I, I, I, I, I], None), 'zxn_i2c_logging': ([P, I], None), 'zxn_i2c_log_len': ([P], I), 'zxn_i2c_log_get': ([P, I, U64P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
         'zxn_audio_capture': ([P, I], None), 'zxn_audio_take': ([P, U16P, I], I), 'zxn_audio_cap_len': ([P], I),
@@ -329,6 +329,11 @@ class Next:
         return self.lib.zxn_slot_page(self.z, i)
 
     # registers and ports, as the CPU sees them (side effects included), taking no time
+    def nr_peek(self, n):
+        """Read Next register n without touching the 0x243B selection or anything else (§9.1 (20)): for watching a
+        running program that polls 253Bh itself."""
+        return self.lib.zxn_nr_peek(self.z, n)
+
     def nr_read(self, n):
         return self.lib.zxn_nr_read(self.z, n)
 
