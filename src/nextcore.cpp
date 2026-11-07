@@ -2260,7 +2260,15 @@ bool cpu_edge(ZXN& z) {
     // pulse_int_n and im2_int_n; or, with the bus's INT path open, the bus line as top4 reads it back, carrying the
     // Next's own INT through o_zxn_bus_inten and a device's (zxnext:1799; top4:752, 1967, 1988; ruling (19) b)
     if (bus_int_path(z) ? z.bus_int_seen : (z.int_low || im2_int(z))) p |= Z80_INT; else p &= ~Z80_INT;
-    if (dma_bus) p = dma_pins(z);                                     // the CPU frozen, the bus the DMA's
+    if (dma_bus) {                                                    // the CPU frozen, the bus the DMA's
+        // The T80N samples INT and NMI on every edge, BusAck or not (t80n:1651-1670), so when the bus comes back at an
+        // instruction's end it takes a waiting interrupt at once. z80.h tracks them only in a tick (step_to): keep its
+        // state current through the freeze the same way, or it wakes stale and runs one more instruction first.
+        const uint64_t rising_nmi = (p ^ z.cpu.pins) & p & Z80_NMI;
+        z.cpu.int_bits = ((z.cpu.int_bits | rising_nmi) & Z80_NMI) | (p & Z80_INT);
+        z.cpu.pins = (z.cpu.pins & ~(uint64_t)(Z80_INT | Z80_NMI)) | (p & (Z80_INT | Z80_NMI));
+        p = dma_pins(z);
+    }
     else {
         if (z.float_in == 2) {                                        // z80.h takes the IN's byte on this edge
             const uint8_t d = floating_latch(z, z.float_port);
