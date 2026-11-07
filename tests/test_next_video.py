@@ -1209,5 +1209,29 @@ class ProbeV4(VideoCase):
             self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
 
 
+@needs_next
+class ProbeV5(VideoCase):
+    """P-V5's budget ruler (next-build/probes/pv5_scene.py, the scene defined once): three strips at 8x, 4x
+    and 2x, with all 128 slots written, cut where the sprite renderer's line runs out."""
+
+    def test_pv5_budget_ruler(self):
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv5_scene.py').exists():
+            self.skipTest('needs next-build/probes/pv5_scene.py')
+        sys.path.insert(0, str(probes))
+        import pv5_model as pm
+        s = Scene()
+        for kind, a, b in pm.writes():
+            (s.nr if kind == 'nr' else s.io)(a, b)
+        zx, v = s.machine(frames=2), s.model()
+        got = list(zx.frame9()[2])
+        want = nv.frame9_np(v)[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('pv5_budget_ruler', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+        self.assertEqual(zx.io_in(0x303B), nv.sprite_status(v))
+
+
 if __name__ == '__main__':
     unittest.main()
