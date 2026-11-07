@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tests'))
 from speccy import Speccy                               # noqa: E402
-from test_contention import measure, have_128, OUT      # noqa: E402
+from test_contention import measure, have_128, OUT, Ref    # noqa: E402
 
 TIMING = {48: (14335, 224), 128: (14361, 228)}          # contention start, T a line
 
@@ -78,6 +78,41 @@ class Floating48(unittest.TestCase):
         bad = [(i, got[i], want[i]) for i in range(N) if got[i] != want[i]]
         self.assertEqual(bad[:5], [], f'{len(bad)} of {N} reads differ (index, got, want)')
         self.assertGreater(sum(b != 0xFF for b in got), N // 5, 'too few reads saw the screen to mean anything')
+
+    def test_a_contended_high_byte(self):
+        # LD A,40h; IN A,(FFh) reads port 40FF, whose high byte is contended: C:1 on all
+        # four T-states of the I/O cycle, and the sample is taken after the fourth hold.
+        # A hold always ends at position 6 of the 8; with INC DE in the body, the INs arrive
+        # so that reads alternate between a held fourth T-state (sampling the attribute beat)
+        # and an unheld one (sampling idle): LD (HL),A; INC HL; INC DE; LD B,0; LD C,0.
+        body = bytes([0x3E, 0x40, 0xDB, 0xFF, 0x77, 0x23, 0x13, 0x06, 0x00, 0x0E, 0x00])
+        n = 360
+        zx = Speccy()
+        scr = screen_bytes()
+        zx.write(0x4000, scr)
+        head, s, _ = program()
+        head = head[:s - 0x8000]
+        code = head + body * n
+        e = 0x8000 + len(code)
+        zx.write(0x8000, code + bytes([0x18, 0xFE]))
+        zx.type('RANDOMIZE USR 32768')
+        zx.press('ENTER')
+        _, doc0 = measure(zx, s, e)
+        zx.release('ENTER')
+        got = zx.read(0x9000, n)
+        ref = Ref(48)
+        t, want = doc0, []
+        for _ in range(n):
+            t += 7 + 4 + 3                                  # LD A,40h; the IN's fetch and operand
+            for phase in range(4):
+                t += ref.delay(t)
+                if phase == 3:
+                    want.append(ref_float(scr, t, 48))      # sampled after the last hold
+                t += 1
+            t += 7 + 6 + 6 + 7 + 7                          # LD (HL),A; INC HL; INC DE; LD B,0; LD C,0
+        bad = [(i, got[i], want[i]) for i in range(n) if got[i] != want[i]]
+        self.assertEqual(bad[:5], [], f'{len(bad)} of {n} reads differ (index, got, want)')
+        self.assertGreater(sum(b != 0xFF for b in got), n // 5)
 
     def test_off_reads_ff(self):
         _, _, got = self.run_reads(floating=False)
