@@ -97,14 +97,16 @@ class Bus:
 class Lines(NextCase):
 
     def test_both_lines_idle_high(self):
-        zx = bare()
-        self.assertEqual((zx.io_in(SCL), zx.io_in(SDA)), (0xFF, 0xFF),
-                         'released, pulled up, nothing pulling down (no RTC by default)')
+        for rtc in (False, 'host'):
+            with self.subTest(rtc=rtc):
+                zx = bare(rtc=rtc)
+                self.assertEqual((zx.io_in(SCL), zx.io_in(SDA)), (0xFF, 0xFF),
+                                 'released, pulled up; an idle DS1307 pulls nothing down')
 
     def test_bit_0_pulls_low_or_releases(self):
         for port in (SCL, SDA):
             with self.subTest(port=f'{port:04X}h'):
-                zx = bare()
+                zx = bare(rtc=False)
                 got = []
                 for v in (0x00, 0xFF, 0xFE, 0x01):
                     zx.io_out(port, v)
@@ -113,13 +115,13 @@ class Lines(NextCase):
                 self.assertEqual(got, [0xFE, 0xFF, 0xFE, 0xFF], 'only bit 0 counts (zxnext:3196, 3207)')
 
     def test_the_lines_are_independent(self):
-        zx = bare()
+        zx = bare(rtc=False)
         zx.io_out(SCL, 0)
         zx.run_ticks(16)
         self.assertEqual((zx.io_in(SCL), zx.io_in(SDA)), (0xFE, 0xFF))
 
     def test_a_reset_releases_both(self):
-        zx = bare()
+        zx = bare(rtc=False)
         zx.io_out(SCL, 0)
         zx.io_out(SDA, 0)
         zx.reset()
@@ -127,7 +129,7 @@ class Lines(NextCase):
         self.assertEqual((zx.io_in(SCL), zx.io_in(SDA)), (0xFF, 0xFF), 'zxnext:3193-3194, 3204-3205')
 
     def test_events_record_each_change(self):
-        zx = bare()
+        zx = bare(rtc=False)
         zx.run_ticks(100)
         zx.i2c_log(True)
         writes = []
@@ -146,16 +148,20 @@ class Lines(NextCase):
 class RTC(NextCase):
 
     def rtc(self, when=WHEN):
-        zx = bare()
-        zx.i2c_rtc(when)
+        zx = bare(rtc=when)                             # ruling (18) j: a set start
         return zx, Bus(zx)
 
     def test_no_rtc_no_acknowledge(self):
-        zx = bare()
+        zx = bare(rtc=False)
         bus = Bus(zx)
         bus.start()
-        self.assertFalse(bus.write(0xD0), 'nothing at 68h by default (ruling 18)')
+        self.assertFalse(bus.write(0xD0), 'rtc=False: no device at 68h (ruling (18) j)')
         bus.stop()
+
+    def test_attached_later_at_a_set_time(self):
+        zx = bare(rtc=False)
+        zx.i2c_rtc(WHEN)
+        self.assertEqual(Bus(zx).read_regs(3, pointer=0), [0x30, 0x45, 0x13])
 
     def test_detached_again(self):
         zx, bus = self.rtc()
@@ -250,6 +256,103 @@ class RTC(NextCase):
         zx, bus = self.rtc()
         bus.write_regs(0x05)
         self.assertEqual(bus.read_regs(2), [0x11, 0x26], 'month, year')
+
+
+def bcd(b):
+    return (b >> 4) * 10 + (b & 15)
+
+
+def as_datetime(r):
+    """Registers 00h-06h (p. 8, Table 2) as a datetime, the year as 20xx (ruling (18) j)."""
+    h = r[2]
+    hour = (bcd(h & 0x1F) % 12 + (12 if h & 0x20 else 0)) if h & 0x40 else bcd(h & 0x3F)
+    try:
+        return datetime.datetime(2000 + bcd(r[6]), bcd(r[5] & 0x1F), bcd(r[4]), hour, bcd(r[1]), bcd(r[0] & 0x7F))
+    except ValueError:
+        return None                                     # not a date: the test says so
+
+
+@needs_next
+class DefaultRTC(NextCase):
+    """Ruling (18) j (Melissa: "on by default is nice so you get good timestamps
+    on files... the time is time of starting the program plus emulated time, not
+    actual host time after start"): Next(rtc='host') is the default."""
+
+    def test_on_by_default_at_the_hosts_clock(self):
+        before = datetime.datetime.now()
+        zx = bare()
+        after = datetime.datetime.now()
+        r = Bus(zx).read_regs(7, pointer=0)
+        self.assertEqual(r[0] & 0x80, 0, 'running: CH clear')
+        t = as_datetime(r)
+        self.assertIsNotNone(t, f'registers {r} are no date')
+        slack = datetime.timedelta(seconds=5)
+        self.assertTrue(before - slack <= t <= after + slack, f'{t} against {before}..{after}')
+
+    def test_it_never_rereads_the_host(self):
+        """Host time passing without emulated time moves nothing."""
+        import time
+        zx = bare()
+        bus = Bus(zx)
+        t1 = as_datetime(bus.read_regs(7, pointer=0))
+        self.assertIsNotNone(t1, 'a date')
+        time.sleep(3.5)
+        t2 = as_datetime(bus.read_regs(7, pointer=0))
+        self.assertLessEqual((t2 - t1).total_seconds(), 1, 'only the transactions\' few ms of emulated time')
+
+    def test_the_signature_and_zeroed_ram(self):
+        """3Eh = 5Ah 'Z', 3Fh = 58h 'X' (rtcsig.asm:144-148), the rest of RAM
+        zero, for every way a DS1307 gets attached."""
+        for how in ('default', 'set start', 'attached later'):
+            with self.subTest(how):
+                if how == 'default':
+                    zx = bare()
+                elif how == 'set start':
+                    zx = bare(rtc='2000-01-01')
+                else:
+                    zx = bare(rtc=False)
+                    zx.i2c_rtc(None)
+                r = Bus(zx).read_regs(56, pointer=0x08)
+                self.assertEqual(r[-2:], [0x5A, 0x58])
+                self.assertEqual(r[:-2], [0] * 54)
+
+    def test_nextzxos_reads_the_signature_round_the_wrap(self):
+        """rtcsig.asm:104-142 points at 3Eh and reads ten bytes: the signature,
+        then 00h-07h after the wrap (p. 7)."""
+        zx = bare(rtc='2026-11-07T09:08:07')
+        r = Bus(zx).read_regs(10, pointer=0x3E)
+        self.assertEqual(r[:2], [0x5A, 0x58])
+        self.assertEqual([r[2], r[3], r[4], r[6], r[7], r[8]], [0x07, 0x08, 0x09, 0x07, 0x11, 0x26])
+
+    def test_a_set_start_is_exact_and_moves_with_emulated_time(self):
+        for rtc, want in [('1990-01-01T00:00', [0x00, 0x00, 0x00, 0x01, 0x01, 0x90]),
+                          ('2000-01-01', [0x00, 0x00, 0x00, 0x01, 0x01, 0x00]),
+                          (datetime.datetime(2026, 11, 7, 9, 0, 0), [0x00, 0x00, 0x09, 0x07, 0x11, 0x26])]:
+            with self.subTest(rtc=str(rtc)):
+                zx = bare(rtc=rtc)
+                bus = Bus(zx)
+                r = bus.read_regs(7, pointer=0)
+                self.assertEqual([r[0], r[1], r[2], r[4], r[5], r[6]], want, 'exactly the start; year mod 100')
+                zx.run_ticks(SECOND * 3 + SECOND // 2)
+                self.assertEqual(bus.read_regs(1, pointer=0), [0x03], 'three and a half emulated seconds on')
+
+    def test_the_year_is_two_digits(self):
+        """Stored mod 100 (ruling (18) j): 2099 rolls over to 00."""
+        zx = bare(rtc='2099-12-31T23:59:59')
+        bus = Bus(zx)
+        zx.run_ticks(SECOND * 6 // 5)
+        r = bus.read_regs(7, pointer=0)
+        self.assertEqual([r[0], r[1], r[2], r[4], r[5], r[6]], [0x00, 0x00, 0x00, 0x01, 0x01, 0x00])
+
+    def test_attached_later_at_the_hosts_clock(self):
+        zx = bare(rtc=False)
+        before = datetime.datetime.now()
+        zx.i2c_rtc(None)
+        after = datetime.datetime.now()
+        t = as_datetime(Bus(zx).read_regs(7, pointer=0))
+        self.assertIsNotNone(t, 'a date')
+        slack = datetime.timedelta(seconds=5)
+        self.assertTrue(before - slack <= t <= after + slack)
 
 
 if __name__ == '__main__':
