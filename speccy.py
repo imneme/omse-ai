@@ -166,7 +166,7 @@ def _load_lib():
         'zx_sd_log_len': ([P], I), 'zx_sd_log_get': ([P, ctypes.POINTER(ctypes.c_uint64)], None),
         'zx_sd_log_clear': ([P], None),
         'zx_spi_gap': ([P, I], None), 'zx_spi_early': ([P], U64), 'zx_spi_early_at': ([P, I], I),
-        'zx_contention': ([P, I], None), 'zx_contention_on': ([P], I), 'zx_stalled': ([P], U64),
+        'zx_floating_bus': ([P, I], None), 'zx_contention': ([P, I], None), 'zx_contention_on': ([P], I), 'zx_stalled': ([P], U64),
     }
     for name, (args, res) in sigs.items():
         f = getattr(lib, name)
@@ -589,6 +589,11 @@ class Speccy:
         return bytes(buf[:n])
 
     # -- contention -----------------------------------------------------------
+    def floating_bus(self, on=True):
+        """Reads from a port nobody answers see what the ULA is fetching (on by
+        default, as a real 48K or 128): docs/contention.md says how and when."""
+        self.lib.zx_floating_bus(self.z, 1 if on else 0)
+
     def contention(self, on=True):
         """The ULA's contention, as a real 48K or 128 has it: on by default. While
         the ULA reads the screen, the CPU waits to reach contended memory
