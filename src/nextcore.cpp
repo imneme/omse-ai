@@ -2626,6 +2626,7 @@ void zxn_slot_desc(ZXN* z, int i, int write, int* out) {
 // as through ports 0x243B/0x253B (DESIGN.md §9.1's API table): the selection is left at n (Loam's bus foil)
 int zxn_nr_read(ZXN* z, int n) { z->nr_sel = n & 0xFF; return nr_read(*z, n & 0xFF); }
 void zxn_nr_write(ZXN* z, int n, int v) { z->nr_sel = n & 0xFF; nr_write(*z, n & 0xFF, v); }
+int zxn_nr_peek(ZXN* z, int n) { return nr_read(*z, n & 0xFF); }    // §9.1 (20): the selection untouched
 int zxn_io_in(ZXN* z, int port) { return io_read(*z, port & 0xFFFF); }
 void zxn_set_keys(ZXN* z, const uint8_t* rows) { memcpy(z->keys, rows, 8); }
 uint8_t* zxn_framebuffer(ZXN* z) { return z->fb; }
