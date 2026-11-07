@@ -230,6 +230,8 @@ struct ZXN {
     bool int_low = false;
     int int_count = 0;
     int in_latch_dt = -1;               // during an IN's io_read: ticks on to the INT that a 253Bh read registers
+    int float_in = 0;                   // an IN the floating bus answers, at 3.5 MHz: 1 after its IORQ edge, 2 once
+    uint16_t float_port = 0;            // z80.h's waiting step has run (it takes the byte on the next edge)
     uint64_t in_latch_at = 0;           // that tick, for NR 0x22 b7 (0: none)
     bool rd_open = false;               // a read below 28 MHz, served at T1, waiting for its T2 (ldpirx_mem)
     uint16_t rd_addr = 0;               // the address it was served from
@@ -1087,11 +1089,10 @@ inline bool locked(const ZXN& z) { return (z.port7ffd & 0x20) && !((z.nr[0x8F] &
 // The floating bus on port 0xFF (ref §2.5; 48K and 128K timing only): inside the 256 x 192 area, the ULA's latest
 // fetch: the bitmap byte from slot 9, the attribute from slot B, the next bitmap from slot D, the next attribute from
 // slot F of each 16-pixel group (each held to the next odd slot; slot 0 still holds the group's last attribute);
-// 0xFF in slots 1-8 and in the border. PROVISIONAL: which cell a group fetches is my reading of ref §2.5's slots
-// (group g fetches cells 2g and 2g+1 of line vc_ula); ula.vhd 218-345 and a probe settle it.
-uint8_t floating_bus(const ZXN& z) {
+// 0xFF in slots 1-8 and in the border (zxula.vhd:308-345, 573). Group g's are cells 2g and 2g+1 of row vc_ula: the
+// shift register shows the slot-9 byte from slot C and the slot-D byte from the next group's slot 4 (zxula:368-401).
+uint8_t floating_bus_at(const ZXN& z, int h, int v) {
     if (z.timing == 3 || z.timing == 4) return 0xFF;                  // +3 has its own port; Pentagon none (later)
-    int h = hc_ula(z), v = vc_ula(z);
     int slot = h & 15;
     if (slot == 0) h -= 1;                                            // slot 0: the previous group's attribute
     if (h < 0 || h >= 256 || v >= 192 || (slot >= 1 && slot <= 8)) return 0xFF;
@@ -1101,6 +1102,9 @@ uint8_t floating_bus(const ZXN& z) {
     if (attr) return scr[0x1800 + (v >> 3) * 32 + col];
     return scr[((v & 0xC0) << 5) | ((v & 7) << 8) | ((v & 0x38) << 2) | col];
 }
+uint8_t floating_bus(const ZXN& z) { return floating_bus_at(z, hc_ula(z), vc_ula(z)); }
+// port 0xFF reads the floating bus unless NR 0x08 b2 and port enable 0 make it the Timex register (zxnext:2772)
+inline bool floats(const ZXN& z, uint16_t port) { return (port & 0xFF) == 0xFF && !((z.nr[0x08] & 4) && port_en(z, 0)); }
 
 inline bool dma_port_decode(const ZXN& z, uint16_t port);       // port_dma (next_dma_bus.inc)
 inline bool dma_port(const ZXN& z, uint16_t port);
@@ -1205,7 +1209,7 @@ uint8_t io_read(ZXN& z, uint16_t port) {
         return v;
     }
     if ((port & 0xFF) == 0xFF)                                        // always answered (ref §5.1): the Timex register with
-        return ((z.nr[0x08] & 4) && port_en(z, 0)) ? z.portff : floating_bus(z);   // NR 0x08 b2 and enable 0 (2772)
+        return floats(z, port) ? floating_bus(z) : z.portff;          // NR 0x08 b2 and enable 0 (2772)
     if ((port & 0xFF) == 0xEB && port_en(z, 11)) {                    // the read register as the CPU latches it, an edge
         uint8_t v = z.spi_rx;                                         // after the strobe: a byte due by then has landed
         for (int i = 0; i < z.spi_npend; i++)                         // (spi_master:155-175)
@@ -1366,11 +1370,28 @@ inline void classify(ZXN& z, uint64_t p) {
 }
 // wait_s (zxula.vhd 582-583): slots with hc_ula(3:0) in 3-14 (decided a slot early: hc_adj = hc + 1), in the
 // 256 x 192 area; only at 3.5 MHz, not with NR 0x08 bit 6, not in Pentagon timing (zxnext 4422).
-inline bool wait_s(const ZXN& z) {
+inline bool wait_s_at(const ZXN& z, int h, int v) {
     if (z.speed_eff != 0 || z.eff_cd || z.timing == 4) return false;
-    int h = hc_ula(z), v = vc_ula(z);
     int adj = ((h & 15) + 1) & 15;
     return adj >= 4 && h < 256 && v < 192;
+}
+inline bool wait_s(const ZXN& z) { return wait_s_at(z, hc_ula(z), vc_ula(z)); }
+
+// The byte an IN takes from the floating bus at 3.5 MHz. The T80N latches DI on CLK_n's falling edge in TState 3,
+// the fourth T-state of its I/O cycle (t80na:214-221; the IOWait T-state, t80n:1781-1783), and cpu_di is the ULA's
+// register combinationally (zxnext:1830-1832, 4454). z80.h takes the byte at that T-state's rising edge, half a clock
+// early, so this is called there: the clock falls at the first odd slot from this T-state's own where the ULA isn't
+// holding it (a port in a contended page is checked on every I/O T-state, zxnext:4430; zxula:595), and the latch
+// sees the register as that slot left it, the counter from before the edge.
+uint8_t floating_latch(const ZXN& z, uint16_t port) {
+    const Timing& t = T(z);
+    const bool ck = z.contention && z.timing != 3 && contended_page(z, port);
+    int h = hc_ula(z) + 1, v = vc_ula(z);                             // the rising edge: hc_ula steps to h (odd)
+    while (ck && wait_s_at(z, h, v)) {
+        h += 2;
+        if (h >= t.hc_len) { h -= t.hc_len; v = (v + 1) % t.vc_len; }
+    }
+    return floating_bus_at(z, h, v);
 }
 
 // +3 timing's form (zxula.vhd 597-600): WAIT while MREQ is low on a contended page, in the window wait_s gives +3
@@ -2240,7 +2261,18 @@ bool cpu_edge(ZXN& z) {
     // Next's own INT through o_zxn_bus_inten and a device's (zxnext:1799; top4:752, 1967, 1988; ruling (19) b)
     if (bus_int_path(z) ? z.bus_int_seen : (z.int_low || im2_int(z))) p |= Z80_INT; else p &= ~Z80_INT;
     if (dma_bus) p = dma_pins(z);                                     // the CPU frozen, the bus the DMA's
-    else p = z80_tick(&z.cpu, p);
+    else {
+        if (z.float_in == 2) {                                        // z80.h takes the IN's byte on this edge
+            const uint8_t d = floating_latch(z, z.float_port);
+            Z80_SET_DATA(p, d);
+            if (z.io_logging && !z.io_log.empty() && z.io_log.back().port == z.float_port && !z.io_log.back().write)
+                z.io_log.back().value = d;
+            z.float_in = 0;
+        } else if (z.float_in == 1 && !(p & Z80_WAIT)) {
+            z.float_in = 2;                                           // its waiting step runs now (z80.h's _wait)
+        }
+        p = z80_tick(&z.cpu, p);
+    }
     if (!dma_bus && z.stop_on && !z.first_edge && z80_opdone(&z.cpu)) {
         uint16_t a = Z80_GET_ADDR(p);
         if (a >= z.stop_lo && a <= z.stop_hi) {
@@ -2327,6 +2359,10 @@ bool cpu_edge(ZXN& z) {
             z.in_latch_dt = (3 * per + 1) / 2 - 1;
             uint8_t v = io_read(z, port);
             z.in_latch_dt = -1;
+            if (z.speed_eff == 0 && floats(z, port)) {                // taken two edges on (floating_latch)
+                z.float_in = 1;
+                z.float_port = port;
+            }
             if (bus_io_visible(z, port)) bus_cycle(z, 2, port, v);
             Z80_SET_DATA(p, v);
             if (z.io_logging) z.io_log.push_back({z.t28, z.cpu_clocks, port, v, 0});
