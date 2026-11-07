@@ -242,7 +242,7 @@ It began as OMSE, Melissa O'Neill's emulator. The beam-racing ULA, the timing an
 
 ## Limits
 
-- **Contention is a first cut.** Memory and I/O contention are modelled (on by default; `contention(False)` turns it off), in whole T-states and without the floating bus: docs/contention.md says exactly what's finessed.
+- **Contention is a first cut.** Memory and I/O contention are modelled (on by default; `contention(False)` turns it off), in whole T-states, and so is the floating bus (on by default; `floating_bus(False)` turns it off): docs/contention.md says how, and exactly what's finessed.
 - **TAP and SNA only**, and SD-card images on a divMMC. No TZX, `.z80` or floppy images.
 - **Snapshots don't hold the divMMC** (SNA has no room): loading one power-cycles the interface.
 - **Typing is for the 48K editor** (on a 48K, or in 48 BASIC on a 128). 128 BASIC takes plain keystrokes only.
