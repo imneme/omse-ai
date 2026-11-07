@@ -115,7 +115,7 @@ struct ZXN {
     uint64_t spr_t = 0;                 // the renderer has run every cycle before this master tick
     uint64_t spr_swap_at = 0;           // the tick line_reset_re starts the next line's render (0: none due)
     int spr_state = 0;                  // SP_IDLE, SP_START, SP_QUALIFY, SP_PROCESS
-    int spr_idx = 0, spr_vcount = 0;    // spr_cur_index; spr_cur_vcount, the wide line being rendered
+    int spr_idx = 0, spr_vcount = 0, spr_cyc = 0;   // spr_cyc: the cycle since line_reset_re (START = 1)    // spr_cur_index; spr_cur_vcount, the wide line being rendered
     int sc_hcount = 0, sc_addr = 0, sc_delta = 0, sc_wc = 0, sc_wd = 0, sc_pal = 0, sc_wrap = 0;   // the sprite
     bool sc_h4 = false, sc_half = false;                                                         // being drawn
     bool sa_rt = false, sa_h = false, sa_vis = false, sa_rot = false, sa_xm = false, sa_ym = false;  // the anchor
@@ -1564,6 +1564,11 @@ void spr_cycle(ZXN& z) {
             break;
         case SP_QUALIFY: {
             const bool draw = spr_qualify(z, z.spr_idx);
+            if (draw && z.spr_cyc + 1 + 128 / z.sc_wd > 1282) {      // PV5/PV6: whole sprites by cycle 1282, then stop
+                z.spr_status |= 2;
+                z.spr_state = SP_IDLE;
+                break;
+            }
             z.spr_idx = (z.spr_idx + 1) & 0x7F;
             z.spr_state = draw ? SP_PROCESS : z.spr_idx == 0 ? SP_IDLE : SP_QUALIFY;
             break;
@@ -1575,6 +1580,7 @@ void spr_cycle(ZXN& z) {
             break;
         default: break;
     }
+    z.spr_cyc++;
 }
 void spr_catch_up_to(ZXN& z, uint64_t t) {
     while (z.spr_t < t && z.spr_state != SP_IDLE) { spr_cycle(z); z.spr_t++; }
@@ -1593,6 +1599,7 @@ void spr_swap(ZXN& z) {
     const int d = ((z.vc - (t.vactive - 34)) % t.vc_len + t.vc_len) % t.vc_len;
     z.spr_vcount = (d - 2 + 1) & 0x1FF;
     z.spr_state = SP_START;
+    z.spr_cyc = 1;
     z.spr_swap_at = 0;
 }
 // the sprite pixel at paper (x, y) (sprites.vhd:1000-1068): sprites on (NR 0x15 b0), inside the clip window
