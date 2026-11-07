@@ -685,6 +685,8 @@ class Video:
                 out.append(rgb)
         if blank:
             out = [0 if (b and x is not None) else x for x, b in zip(out, blank_mask(self))]
+        else:                                   # the mixer's colour wherever a line exists, 0 where none does
+            out = [0 if (x is not None and no_line(self, i // W)) else x for i, x in enumerate(out)]
         return W, H, out
 
 
@@ -720,6 +722,10 @@ def frame9_np(v, schedule=None, blank=True):
         start = stop
     if blank:
         out = np.where(np.array(blank_mask(v)).reshape(H, W), 0, out)
+    else:
+        for sy in range(H):
+            if no_line(v, sy):
+                out[sy] = 0
     return W, H, out.ravel().tolist()
 
 
@@ -964,26 +970,44 @@ def _frame_np(v, spr_v=None):
 
 # ---------------------------------------------------------------------------- blanking (§9.1 (14))
 
-TIMING = {  # first paper pixel's raw hc (c_min_hactive), last horizontal-blank raw hc, lines, first paper line, last vertical-blank line
-    '48k': (128, 95, {50: (312, 64), 60: (264, 40)}, 7),
-    '128k': (136, 95, {50: (311, 64), 60: (264, 40)}, 7),
-    'p3': (136, 95, {50: (311, 64), 60: (264, 40)}, 7),
-    'pentagon': (128, 63, {50: (320, 80)}, 15),
-}   # ulat:147-312 (the timings), 154-168 and 184-204 (blanking); NEXT-MACHINE §2.2
+TIMING = {  # c_min_hactive, c_max_hblank, {hz: (lines, c_min_vactive, c_hdmi_ymin, c_hdmi_ymax)}, c_max_vblank
+    '48k': (128, 95, {50: (312, 64, 16, 303), 60: (264, 40, 16, 255)}, 7),
+    '128k': (136, 95, {50: (311, 64, 16, 303), 60: (264, 40, 16, 255)}, 7),
+    'p3': (136, 95, {50: (311, 64, 16, 303), 60: (264, 40, 16, 255)}, 7),
+    'pentagon': (128, 63, {50: (320, 80, 24, 311)}, 15),
+}   # zxula_timing.vhd:147-312 (the timings and HDMI's window), 351-356 (blank_n); NEXT-MACHINE §2.2
+# HDMI's x window (c_hdmi_xmin/xmax) covers every frame9 column at every timing (frame9 stops 8 pixels short of
+# its right edge), so only its y window matters here.
+
+
+def frame_vc(v, sy):
+    """The raw vc that frame9 row sy shows: the paper's first line is row 48 at every rate (§9.1 (12), ruling
+    Sat 7 Nov), so vc = sy - 48 + c_min_vactive, unwrapped; outside 0..lines-1 the row has no line."""
+    _, _, lines_by_hz, _ = TIMING[v.timing]
+    lines, first, _, _ = lines_by_hz[v.hz]
+    return sy - 48 + first
+
+
+def no_line(v, sy):
+    lines = TIMING[v.timing][2][v.hz][0]
+    vc = frame_vc(v, sy)
+    return vc < 0 or vc >= lines
 
 
 def blank_mask(v):
-    """True where frame9's sample is inside blanking, so the Next outputs black (zxnext:7311-7315).
-    Raw hc = phc + c_min_hactive and raw vc = (py + first paper line) mod lines (the blank signal travels the
-    pipeline beside the pixels, zxnext:6789-6792, 7274-7287)."""
+    """True where frame9's sample is black on the Next's HDMI output (§9.1 (14), ruling Sat 7 Nov: frame9 is
+    the HDMI picture): inside blanking (zxula_timing:351-356, zxnext:7311-7315; the blank signal travels the
+    pipeline beside the pixels, zxnext:6789-6792, 7274-7287), outside HDMI's y window (c_hdmi_ymin/ymax), or on
+    a row with no line. Raw hc = phc + c_min_hactive; raw vc from frame_vc."""
     cmin, hb_end, lines_by_hz, vb_end = TIMING[v.timing]
-    lines, first = lines_by_hz[v.hz]
+    lines, first, ymin, ymax = lines_by_hz[v.hz]
     out = []
     for sy in range(H):
-        raw_vc = (sy - 48 + first) % lines
+        vc = frame_vc(v, sy)
+        row_black = vc < 0 or vc >= lines or vc < ymin or vc > ymax or vc <= vb_end
         for sx in range(W):
             raw_hc = sx // 2 - 48 + cmin
-            out.append(raw_vc <= vb_end or raw_hc <= hb_end)
+            out.append(row_black or raw_hc <= hb_end)
     return out
 
 
