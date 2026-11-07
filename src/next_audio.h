@@ -122,7 +122,10 @@ struct Audio {
     uint16_t L = 0, R = 0;                      // the mixer's output (audio_mixer:73-86)
     bool capturing = false;                     // every enable's (L, R), for tests
     std::vector<uint16_t> cap;
-    int rate = 0;                               // resampled output: a box filter over the enables
+    int rate = 0;                               // resampled output: a box filter over the enables...
+    bool point = false;                         // ...or, true, the mixer's value at each output instant, as the
+                                                // Next's HDMI encoder takes it (hdmidataencoder.v:198-205, its
+                                                // averaging commented out): ultrasonics fold into the band
     uint64_t acc = 0;
     uint64_t sumL = 0, sumR = 0, nsum = 0;
     std::vector<int16_t> outbuf;
@@ -167,8 +170,8 @@ struct Audio {
             acc += (uint64_t)rate;
             if (acc >= 1750000) {
                 acc -= 1750000;
-                outbuf.push_back((int16_t)(sumL * 5 / nsum));      // 0-5998 to 0-29990
-                outbuf.push_back((int16_t)(sumR * 5 / nsum));
+                outbuf.push_back((int16_t)(point ? L * 5 : sumL * 5 / nsum));  // 0-5998 to 0-29990
+                outbuf.push_back((int16_t)(point ? R * 5 : sumR * 5 / nsum));
                 sumL = sumR = nsum = 0;
             }
         }

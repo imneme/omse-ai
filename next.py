@@ -59,7 +59,7 @@ def _load_lib():
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
         'zxn_audio_capture': ([P, I], None), 'zxn_audio_take': ([P, U16P, I], I), 'zxn_audio_cap_len': ([P], I),
-        'zxn_audio_rate': ([P, I], None), 'zxn_audio_out_len': ([P], I),
+        'zxn_audio_rate': ([P, I], None), 'zxn_audio_point': ([P, I], None), 'zxn_audio_out_len': ([P], I),
         'zxn_audio_out': ([P, ctypes.POINTER(ctypes.c_int16), I], I),
         'zxn_audio_level': ([P, ctypes.POINTER(ctypes.c_int)], None),
         'zxn_ay_chan': ([P, I, ctypes.POINTER(ctypes.c_int)], None), 'zxn_ay_env': ([P, I], I),
@@ -586,6 +586,12 @@ class Next:
         buf = (ctypes.c_int16 * max(n, 1))()
         n = self.lib.zxn_audio_out(self.z, buf, n)
         return np.frombuffer(buf, np.int16, n).reshape(-1, 2).copy()
+
+    def audio_hdmi(self, on=True):
+        """From now on, audio() takes the mixer's value at each output instant, as the Next's HDMI encoder does
+        (hdmidataencoder.v:198-205, its averaging commented out), so ultrasonic tones and fast noise fold into the
+        band as they do on a real Next heard over HDMI; off (the default) is a box filter, nearer the analogue jack."""
+        self.lib.zxn_audio_point(self.z, 1 if on else 0)
 
     def audio_level(self):
         """The mixer's (L, R) now, 0-5998 each."""

@@ -445,6 +445,36 @@ class Resampled(NextCase):
         f = np.argmax(np.abs(np.fft.rfft(x))) * 48000 / len(x)
         self.assertAlmostEqual(f, 1_750_000 / (16 * 124), delta=15, msg='the tone where the AY puts it')
 
+    def test_hdmi_takes_the_mixer_as_it_stands(self):
+        """The Next's HDMI encoder takes the mixer's value at each 48 kHz instant (hdmidataencoder.v:198-205: the
+        averaging is commented out), so an ultrasonic tone folds into the audio band nearly whole. Found on Melissa's
+        real Next, 6 Nov: CHEZ's period-1 hi-hats came through HDMI 1.5 dB brighter above 4 kHz than audio()'s box
+        filter made them. audio_hdmi(True) makes audio() sample like that encoder."""
+        def tone(period, hdmi):
+            zx = bare()
+            zx.nr_write(0x06, zx.nr_read(0x06) | 1)
+            ay(zx, 0, period)
+            ay(zx, 1, 0)
+            ay(zx, 7, 0xFE)
+            ay(zx, 8, 15)
+            zx.audio_hdmi(hdmi)
+            zx.audio(48000)
+            zx.run_ticks(28_000_000 // 5)
+            x = zx.audio(48000)[:, 0].astype(float)
+            x -= x.mean()
+            X = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+            f = np.fft.rfftfreq(len(x), 1 / 48000)
+            return X, f
+        X, f = tone(109, False)                            # about 1 kHz: in band, the box barely touches it
+        ref = X.max()
+        alias = 48000 - 1_750_000 / (16 * 3)               # period 3: 36,458 Hz, folding to 11,542 Hz
+        near = lambda f: (f > alias - 60) & (f < alias + 60)
+        Xp, f = tone(3, True)
+        Xb, _ = tone(3, False)
+        self.assertAlmostEqual(f[np.argmax(Xp)], alias, delta=60, msg='point-sampled, the tone lands at 48k - f')
+        self.assertGreater(Xp[near(f)].max() / ref, 0.9, 'HDMI: the fold comes through whole')
+        self.assertLess(Xb[near(f)].max() / ref, 0.4, 'the box filter weakens it (sinc(f / 48k) = 0.29)')
+
 
 if __name__ == '__main__':
     unittest.main()
