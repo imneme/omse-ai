@@ -715,3 +715,35 @@ class Gaps(NextCase):
         self.assertEqual(len(reads), n)
         self.assertEqual(zx.peek(0xA100), 0x3B)
         self.assertEqual(zx.io_in(0x6B), 0x1A)
+
+
+@needs_next
+class FrozenInterrupts(NextCase):
+    """The T80N samples INT and NMI on every edge, frozen or not (t80n:1651-1670: INT_s <= not INT_n under CEN, which
+    BusAck doesn't gate). So when the DMA gives the bus back at an instruction's end, the CPU's next M-cycle is the
+    interrupt acknowledge at once: the main line makes no progress per interruption. (TX-1696's DMA'd sprite
+    patterns, clean on Melissa's Next, landed late on ours because it ran one main-line instruction each time.)"""
+
+    def test_the_interrupt_is_taken_at_once_when_the_bus_comes_back(self):
+        zx = bare()
+        zx.nr_write(0xC0, 0xA1)                         # hardware IM2
+        zx.nr_write(0xCC, 0x01)                         # the ULA's interrupt delays the DMA
+        program(zx, regs(30000, src=0xC000, dst=DST, b_inc=2) + [0xBB, 0x01])   # read mask: the status
+        main = [0xF3, 0x3E, 0x90, 0xED, 0x47, 0xED, 0x5E, 0x21, 0, 0, 0xFB, 0x3E, 0x87, 0xD3, 0x6B] + [0x23] * 300 + [0x18, 0xFE]
+        zx.load(CODE, bytes(main))                      # DI; LD I,90h; IM 2; LD HL,0; EI; OUT (6Bh),87h; INC HL...
+        zx.poke(0x90B6, 0x00)
+        zx.poke(0x90B7, 0x92)
+        isr = [0xF5, 0xD5, 0xED, 0x5B, 0x00, 0x93, 0xDB, 0x6B, 0x12, 0x13, 0x7D, 0x12, 0x13,
+               0xED, 0x53, 0x00, 0x93, 0xD1, 0xF1, 0xFB, 0xED, 0x4D]
+        zx.load(0x9200, bytes(isr))                     # record (status, L) at (9300h)++, then EI; RETI
+        zx.poke(0x9300, 0x10)
+        zx.poke(0x9301, 0x93)
+        launch(zx, CODE)
+        assert zx.run_until_pc(CODE, max_ticks=10**6)
+        zx.run_ticks(8 * (6 * 30000 + 4000))
+        n = ((zx.peek(0x9301) << 8 | zx.peek(0x9300)) - 0x9310) // 2
+        recs = [(zx.peek(0x9310 + 2 * i), zx.peek(0x9311 + 2 * i)) for i in range(n)]
+        during = [l for s, l in recs if s == 0x3B]      # taken while the block was still under way
+        self.assertGreaterEqual(len(during), 2, f'interruptions during the block: {recs}')
+        self.assertEqual(during, [1] * len(during),
+                         'L at each interruption: only the first INC HL (before the grant) ever ran')
