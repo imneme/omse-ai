@@ -43,9 +43,10 @@ LOOP = bytes([0xF3, 0x18, 0xFE])                        # DI; JR $ (on itself)
 class Scene:
     """A list of writes, applied identically to a machine and to the model."""
 
-    def __init__(self, palette='zero', timing='p3'):
+    def __init__(self, palette='zero', timing='p3', hz=50):
         self.palette = palette
         self.timing = timing
+        self.hz = hz
         self.ops = []
 
     def nr(self, n, *vals):
@@ -70,7 +71,7 @@ class Scene:
         return self
 
     def model(self):
-        v = nv.Video(palette=self.palette, timing=self.timing)
+        v = nv.Video(palette=self.palette, timing=self.timing, hz=self.hz)
         for op in self.ops:
             kind = op[0]
             if kind == 'nr':
@@ -86,6 +87,8 @@ class Scene:
         kw = {} if self.palette == 'zero' else {'palette': self.palette}
         if self.timing != 'p3':
             kw['timing'] = self.timing
+        if self.hz != 50:
+            kw['hz'] = self.hz
         zx = Next(boot='bare', **kw)
         zx.load(PARK, LOOP)
         zx.set_regs(pc=PARK, sp=0x7FF0)
@@ -170,8 +173,8 @@ class VideoCase(unittest.TestCase):
         return str(path)
 
 
-def ula_scene(palette_seed=1, salt=0, border=5):
-    s = Scene()
+def ula_scene(palette_seed=1, salt=0, border=5, timing='p3', hz=50):
+    s = Scene(timing=timing, hz=hz)
     write_palette(s, 0b000, unique_palette(palette_seed))
     bm, at = address_bitmap(salt)
     s.bram5(0x0000, bm).bram5(0x1800, at).io(0x00FE, border)
@@ -335,6 +338,128 @@ class Blanking(VideoCase):
         zx = s.machine()
         self.assertEqual(list(zx.frame9()[2]), nv.frame9_np(s.model())[2])
         self.assertEqual(list(zx.frame9(blank=False)[2]), nv.frame9_np(s.model(), blank=False)[2])
+
+
+@needs_next
+class FrameWindow(VideoCase):
+    """§9.1 (12) and (14), ruling Sat 7 Nov (Ratio, from Hatch's 60 Hz note): frame9 is the HDMI picture. The paper
+    stays at row 48 + py at both rates, so frame9 row r shows raw vc = r - 48 + c_min_vactive (unwrapped). Black
+    outside HDMI's y window (zxula_timing:147-312: c_hdmi_ymin/ymax 16-303 at 50 Hz, 16-255 at 60 Hz, 24-311 for
+    Pentagon), in blanking, and where no line exists; blank=False gives the mixer's colour wherever a line exists
+    and 0 where none does. Written from the ruling and zxula_timing.vhd, not from the core."""
+
+    def rows_of(self, f):
+        return [f[r * nv.W:(r + 1) * nv.W] for r in range(nv.H)]
+
+    def check_rows(self, rows, black_rows, colour_rows, colour, first_col=0, what=''):
+        for r in black_rows:
+            self.assertEqual(set(rows[r]), {0}, f'{what}: row {r} should be black')
+        for r in colour_rows:
+            self.assertEqual(set(rows[r][first_col:]), {colour}, f'{what}: row {r} should be the border colour')
+
+    def border_colour(self, scene):
+        v = scene.model()
+        return nv.frame9_np(v, blank=False)[2][100 * nv.W]      # row 100's first sample: border, a line at every rate
+
+    def test_60hz_is_hdmis_240_lines(self):
+        """+3 timing at 60 Hz: rows 24-263 (vc 16-255) are the picture, rows 0-23 and 264-287 black."""
+        s = ula_scene(border=6, hz=60)
+        zx = s.machine()
+        got = list(zx.frame9()[2])
+        b = self.border_colour(s)
+        rows = self.rows_of(got)
+        self.check_rows(rows, list(range(0, 24)) + list(range(264, 288)), [24, 47, 240, 263], b, first_col=16,
+                        what='60 Hz')
+        self.assertEqual(got, nv.frame9_np(s.model())[2], 'and every sample as the model')
+
+    def test_60hz_unblanked_has_lines_only_where_they_exist(self):
+        """blank=False at 60 Hz: rows 8-271 are vc 0-263 (the mixer's colour, the border above and below the
+        paper); rows 0-7 and 272-287 have no line and are 0."""
+        s = ula_scene(border=3, hz=60)
+        zx = s.machine()
+        got = list(zx.frame9(blank=False)[2])
+        b = self.border_colour(s)
+        rows = self.rows_of(got)
+        self.check_rows(rows, list(range(0, 8)) + list(range(272, 288)), [8, 15, 16, 23, 264, 271], b,
+                        what='60 Hz, blank=False')
+        self.assertEqual(got, nv.frame9_np(s.model(), blank=False)[2], 'and every sample as the model')
+
+    def test_48k_60hz(self):
+        """48K timing at 60 Hz: the same 240-line window (zxula_timing:282-300), with 32 px of left blanking."""
+        s = ula_scene(border=5, timing='48k', hz=60)
+        zx = s.machine()
+        got = list(zx.frame9()[2])
+        b = self.border_colour(s)
+        rows = self.rows_of(got)
+        self.check_rows(rows, list(range(0, 24)) + list(range(264, 288)), [24, 263], b, first_col=32, what='48K 60 Hz')
+        self.assertEqual(set(rows[100][:32]), {0}, '48K: 32 px of left blanking')
+        self.assertEqual(got, nv.frame9_np(s.model())[2])
+
+    def test_50hz_shows_all_288_rows(self):
+        """+3 and 48K timing at 50 Hz: HDMI's window is vc 16-303, exactly rows 0-287."""
+        for timing, first in (('p3', 16), ('48k', 32)):
+            with self.subTest(timing=timing):
+                s = ula_scene(border=4, timing=timing)
+                zx = s.machine()
+                got = list(zx.frame9()[2])
+                b = self.border_colour(s)
+                self.check_rows(self.rows_of(got), [], [0, 287], b, first_col=first, what=f'{timing} 50 Hz')
+                self.assertEqual(got, nv.frame9_np(s.model())[2])
+
+    def test_pentagon_window_ends_at_row_279(self):
+        """Pentagon: HDMI vc 24-311 is rows 0-279 (vc = r + 32); rows 280-287 are vc 312-319, lines outside
+        HDMI's window: black on screen, the border with blank=False. No left blanking (hblank ends at hc 63)."""
+        s = ula_scene(border=2, timing='pentagon')
+        zx = s.machine()
+        got, raw = list(zx.frame9()[2]), list(zx.frame9(blank=False)[2])
+        b = self.border_colour(s)
+        self.check_rows(self.rows_of(got), list(range(280, 288)), [0, 279], b, what='Pentagon')
+        self.check_rows(self.rows_of(raw), [], [280, 287], b, what='Pentagon, blank=False')
+        self.assertEqual(got, nv.frame9_np(s.model())[2])
+        self.assertEqual(raw, nv.frame9_np(s.model(), blank=False)[2])
+
+    def test_no_stale_rows_after_switching_to_60hz(self):
+        """A machine at 50 Hz with a bright border, switched to 60 Hz (NR 0x05 b2, zxnext:5740-5747, 6607) with another
+        border: nothing of the 50 Hz frames survives in rows 0-23 or 264-287."""
+        s50 = ula_scene(border=7)
+        zx = s50.machine()
+        old = self.border_colour(s50)
+        zx.nr_write(0x05, (zx.nr_read(0x05) & ~0x04) | 0x04)
+        zx.run_frames(2)                                # the switch lands at a frame sync; 50 Hz frames end in border 7
+        zx.io_out(0x00FE, 1)                            # only then the new border, so stale rows would show the old
+        zx.run_frames(3)
+        s60 = ula_scene(border=1, hz=60)
+        new = self.border_colour(s60)
+        self.assertNotEqual(old, new)
+        got, raw = list(zx.frame9()[2]), list(zx.frame9(blank=False)[2])
+        edges = [s for r in list(range(0, 24)) + list(range(264, 288)) for s in got[r * nv.W:(r + 1) * nv.W]]
+        self.assertNotIn(old, edges, 'no sample of the 50 Hz border survives in rows 0-23 or 264-287')
+        # (not the whole frame: border 7 and paper 7 share a palette entry, so the old colour is in the paper)
+        self.check_rows(self.rows_of(got), list(range(0, 24)) + list(range(264, 288)), [24, 263], new, first_col=16,
+                        what='after the switch')
+        self.check_rows(self.rows_of(raw), list(range(0, 8)) + list(range(272, 288)), [8, 23, 264, 271], new,
+                        what='after the switch, blank=False')
+        self.assertEqual(got, nv.frame9_np(s60.model())[2])
+
+    def test_layer2_320x256_at_60hz(self):
+        """Layer 2 at 320x256 spans vc 8-263 at 60 Hz: its rows 0-7 and 248-255 fall outside HDMI's window, so
+        the screen shows its rows 8-247 (frame9 rows 24-263), each in its own colour."""
+        s = Scene(hz=60)
+        pal = unique_palette(3)                                  # none transparent
+        write_palette(s, 0b001, pal)
+        mem = bytearray(81920)
+        for x in range(320):
+            for y in range(256):
+                mem[x * 256 + y] = y                           # each Layer 2 row its own index
+        s.sram(nv.L2_SRAM_BASE + 8 * 0x4000, mem)
+        s.nr(0x70, 0x10).nr(0x18, 0, 159, 0, 255).io(0x123B, 0x02)
+        zx = s.machine()
+        got = list(zx.frame9()[2])
+        rows = self.rows_of(got)
+        self.check_rows(rows, list(range(0, 24)) + list(range(264, 288)), [], 0, what='L2 320 at 60 Hz')
+        for y in (8, 100, 247):
+            self.assertEqual(rows[16 + y][32 + 2 * 50], pal[y], f'Layer 2 row {y} on frame9 row {16 + y}')
+        self.assertEqual(got, nv.frame9_np(s.model())[2])
 
 
 @needs_next
