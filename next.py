@@ -342,6 +342,34 @@ class Next:
         self.lib.zxn_io_out(self.z, port, v)
 
     # the keyboard and the border
+    # ---- the keyboard by name (§9.1 (17)): speccy.py's names over set_keys; set_keys itself replaces the lot
+    def _keyname(self, n):
+        from zxkeys import ROWS, ALIASES
+        k = str(n).upper().replace(' ', '') if n != ' ' else 'SPACE'
+        k = ALIASES.get(k, k) or k
+        for r, row in enumerate(ROWS):
+            if k in row:
+                return k, r, row.index(k)
+        raise KeyError(f'no Spectrum key called {n!r}')
+
+    def _apply_keys(self):
+        rows = [0] * 8
+        for k in self._keys_down:
+            _, r, b = self._keyname(k)
+            rows[r] |= 1 << b
+        self.set_keys(rows)
+
+    def press(self, *names):
+        """Hold keys by speccy.py's names ('A', '0', 'ENTER', 'SPACE', 'CS', 'SS', and zxkeys' aliases)."""
+        self._keys_down = getattr(self, '_keys_down', set()) | {self._keyname(n)[0] for n in names}
+        self._apply_keys()
+
+    def release(self, *names):
+        """Let go of keys by name, or of every key held with no names."""
+        down = getattr(self, '_keys_down', set())
+        self._keys_down = set() if not names else down - {self._keyname(n)[0] for n in names}
+        self._apply_keys()
+
     def set_keys(self, rows):
         """The keyboard matrix: 8 half-row bytes (row r is read with A8+r low; bit set = key down)."""
         self.lib.zxn_set_keys(self.z, bytes(rows))
