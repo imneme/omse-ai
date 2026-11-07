@@ -1204,7 +1204,8 @@ uint8_t io_read(ZXN& z, uint16_t port) {
         }
         return v;
     }
-    if ((port & 0xFF) == 0xFF) return floating_bus(z);                // always answered (ref §5.1)
+    if ((port & 0xFF) == 0xFF)                                        // always answered (ref §5.1): the Timex register with
+        return ((z.nr[0x08] & 4) && port_en(z, 0)) ? z.portff : floating_bus(z);   // NR 0x08 b2 and enable 0 (2772)
     if ((port & 0xFF) == 0xEB && port_en(z, 11)) {                    // the read register as the CPU latches it, an edge
         uint8_t v = z.spi_rx;                                         // after the strobe: a byte due by then has landed
         for (int i = 0; i < z.spi_npend; i++)                         // (spi_master:155-175)
