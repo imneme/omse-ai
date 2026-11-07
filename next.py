@@ -166,6 +166,20 @@ def next_firmware_state(mode, st, divmmc_rom, mf_rom):
     return regs, st
 
 
+_RGB9 = None
+
+
+def _rgb9_table():
+    """9-bit RRRGGGBBB to 24-bit RGB, each channel widened as the Next's video output does: (512, 3) uint8."""
+    global _RGB9
+    if _RGB9 is None:
+        import numpy as np
+        v = np.arange(512)
+        ch = np.stack([v >> 6, (v >> 3) & 7, v & 7], 1)
+        _RGB9 = (ch << 5 | ch << 2 | ch >> 1).astype(np.uint8)
+    return _RGB9
+
+
 class Next:
     """One Spectrum Next. boot='bare' is the power-on state (config mode, the boot ROM's area reading 0xFF unless
     boot_rom= gives bytes); timing/hz/speed are in effect from the start (DESIGN.md §9.1 (1))."""
@@ -398,14 +412,21 @@ class Next:
         w, h = self.lib.zxn_f9_width(), self.lib.zxn_fb_height()
         return w, h, list((ctypes.c_uint16 * (w * h)).from_address(self.lib.zxn_frame9(self.z, 1 if blank else 0)))
 
+    def frame9_array(self, blank=True):
+        """frame9's values as a numpy array of shape (h, w), uint16 (a copy of the frame buffer, no Python list)."""
+        import numpy as np
+        w, h = self.lib.zxn_f9_width(), self.lib.zxn_fb_height()
+        buf = (ctypes.c_uint16 * (w * h)).from_address(self.lib.zxn_frame9(self.z, 1 if blank else 0))
+        return np.ctypeslib.as_array(buf).reshape(h, w).copy()
+
     def image(self, path=None, scale=2):
         """The screen as a PIL image (scaled), saved to path if given: frame9's colours, 3 bits to 8 as the Next's
-        video output widens them."""
+        video output widens them (v << 5 | v << 2 | v >> 1 a channel), through a 512-entry table."""
         from PIL import Image
-        w, h, f9 = self.frame9()
-        e = lambda v: v << 5 | v << 2 | v >> 1
-        rgb = bytes(c for v in f9 for c in (e(v >> 6), e((v >> 3) & 7), e(v & 7)))
-        im = Image.frombytes('RGB', (w, h), rgb).resize((w // 2 * scale, h * scale), Image.NEAREST)
+        f = self.frame9_array()
+        h, w = f.shape
+        rgb = _rgb9_table()[f]
+        im = Image.frombytes('RGB', (w, h), rgb.tobytes()).resize((w // 2 * scale, h * scale), Image.NEAREST)
         if path:
             im.save(path)
         return im
