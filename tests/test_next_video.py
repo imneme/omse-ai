@@ -1233,5 +1233,29 @@ class ProbeV5(VideoCase):
         self.assertEqual(zx.io_in(0x303B), nv.sprite_status(v))
 
 
+@needs_next
+class ProbeV6(VideoCase):
+    """P-V6's deadline card (next-build/probes/pv6_scene.py, the scene defined once): a skip-or-stop row and
+    six rows of wide blocks then four 1x sprites, all 128 slots written."""
+
+    def test_pv6_deadline_card(self):
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv6_scene.py').exists():
+            self.skipTest('needs next-build/probes/pv6_scene.py')
+        sys.path.insert(0, str(probes))
+        import pv6_model as pm
+        s = Scene()
+        for kind, a, b in pm.writes():
+            (s.nr if kind == 'nr' else s.io)(a, b)
+        zx, v = s.machine(frames=2), s.model()
+        got = list(zx.frame9()[2])
+        want = nv.frame9_np(v)[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('pv6_deadline_card', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
+        self.assertEqual(zx.io_in(0x303B), nv.sprite_status(v))
+
+
 if __name__ == '__main__':
     unittest.main()
