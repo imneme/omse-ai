@@ -994,21 +994,31 @@ LINE_HC = {'48k': 448, '128k': 456, 'p3': 456, 'pentagon': 448}   # c_max_hc + 1
 
 def sprite_budget(v):
     """28 MHz cycles from one line reset to the next: whc reaches 511 once a line (ulat:476-490, sprites:517),
-    and CLK_28 is four CLK_7 periods in every video mode (one PLL, zxnext_top_issue2:938-941)."""
+    and CLK_28 is four CLK_7 periods in every video mode (one PLL, zxnext_top_issue2:938-941). Only a
+    backstop now: SPRITE_DEADLINE comes first."""
     return 4 * LINE_HC[v.timing]
+
+
+# Measured on Melissa's Next, not read from the VHDL (probes/readings-sitting3-pv5.md, readings-sitting4-pv6.md):
+# her Next draws whole sprites only. A drawn sprite qualified at cycle c is drawn if c + 1 + its width
+# (16 << xscale) <= SPRITE_DEADLINE; the first that isn't stops the line (nothing more is drawn) and sets status
+# bit 1. PV6 put the deadline at 1281-1283 cycles from line_reset_re = "01", so about whc 319: the line's
+# sprites are done when the display reaches the sprite area's right edge. A sprite crossing whc 320 is charged
+# its full width (not yet measured).
+SPRITE_DEADLINE = 1282
 
 
 def sprite_lines(v):
     """The sprites' line buffers for wvc 0..255: 256 lists of 320 entries, each None or an 8-bit index, as
     the renderer draws them in the line before (spr_cur_vcount = vcounter + 1, sprites:539), sprite 0 to 127
     (sprites:841-866), later writers winning unless NR 0x15 bit 6 puts sprite 0 on top (sprites:972), and
-    within the line's time (sprite_budget; what doesn't fit is never drawn, sprites:831-832)."""
+    whole sprites only, by SPRITE_DEADLINE (measured on her Next; what doesn't fit stops the line)."""
     return [_sprite_line(v, row)[0] for row in range(256)]
 
 
 def sprite_status(v):
-    """Port 0x303B after one whole frame since the last read (sprites:974-995): bit 1 if any line ran out of
-    time (sprites:977), bit 0 if a sprite pixel was written over another (sprites:991). The engine renders
+    """Port 0x303B after one whole frame since the last read (sprites:974-995): bit 1 if any line dropped a
+    sprite that couldn't finish (SPRITE_DEADLINE), bit 0 if a sprite pixel was written over another (sprites:991). The engine renders
     row wvc + 1 in every line of the frame, wvc running from -2 (ulat:494-505), so rows 511, 0, 1, ..."""
     lines = TIMING[v.timing][2][v.hz][0]
     over = coll = 0
@@ -1021,10 +1031,10 @@ def sprite_status(v):
 def _sprite_line(v, wvc, owners=None):
     """One sprite row: (320 entries, overtime, collision). Cycle 0 has line_reset_re = "01" (sprites:519-537),
     S_START is cycle 1 (sprites:831-832, 898-900), sprite 0 qualifies in cycle 2; each sprite spends one cycle
-    in S_QUALIFY and, if drawn, one per S_PROCESS pixel (sprites:844-866, 951-956). Line buffers write on the
-    inverted clock and swap at the next line reset (sprites:470-501, 531-537), so a cycle up to and including
-    the budget's lands; overtime if the machine is not idle at the next reset (sprites:977). owners, if
-    given (320 entries), records which sprite wrote each pixel, for tests and diagnosis."""
+    in S_QUALIFY and, if drawn, one per S_PROCESS pixel (sprites:844-866, 951-956). A drawn sprite that can't
+    finish by SPRITE_DEADLINE isn't drawn and stops the line, overtime (measured, not the VHDL's mid-sprite cut
+    at the line reset; that stays as a backstop). owners, if given (320 entries), records which sprite wrote
+    each pixel, for tests and diagnosis."""
     zero_on_top = (v.nr15 >> 6) & 1
     trans = v.nr4b
     budget = sprite_budget(v)
@@ -1093,6 +1103,8 @@ def _sprite_line(v, wvc, owners=None):
         delta = {(1, 1): -16, (1, 0): -1, (0, 1): 16, (0, 0): 1}[(xme, rot)]      # sprites:817-820
         step = 8 >> xs                                                            # sprites:907-915
         wrap = (0x1F << xs) & 0x1F                                                # sprites:919-927
+        if t + (16 << xs) > SPRITE_DEADLINE:                                      # measured: whole sprites
+            return line, 1, collision                                             # only, then stop
         hc, count = x, 0
         while True:                                                               # S_PROCESS: a cycle,
             if t > budget:                                                        # then the exit test

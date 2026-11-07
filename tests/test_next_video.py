@@ -206,19 +206,38 @@ class ModelSense(unittest.TestCase):
                 bad = [i for i, x in enumerate(slow) if x is not None and x != fast[i]]
                 self.assertEqual(bad[:5], [], f'{len(bad)} samples differ between the two paths')
 
-    def test_sprite_budget_by_hand(self):
-        """The cycle counts written in budget_cut_slots and budget_boundary_slots, against the model."""
-        def last_x(slots, timing, idx):
+    def test_the_measured_rule_by_hand(self):
+        """The cycle counts in budget_cut_slots and budget_deadline_slots, against the model."""
+        def last(slots, timing='p3'):
             v = budget_scene(slots, timing).model()
             owners = [None] * 320
-            nv._sprite_line(v, 100, owners)
-            return max(x for x in range(320) if owners[x] == idx)
-        self.assertEqual(last_x(budget_cut_slots(), 'p3', 77), 172 + 40)
-        self.assertEqual(last_x(budget_cut_slots(), '48k', 77), 172 + 8)
-        for d, over, last in ((0, 0, 319), (1, 1, 319), (2, 1, 318)):
-            v = budget_scene(budget_boundary_slots(d)).model()
-            self.assertEqual(nv._sprite_line(v, 100)[1], over, f'd={d}')
-            self.assertEqual(last_x(budget_boundary_slots(d), 'p3', 127), last, f'd={d}')
+            over = nv._sprite_line(v, 100, owners)[1]
+            return max(o for o in owners if o is not None), over
+        self.assertEqual(last(budget_cut_slots()), (72, 1))           # 64 + 8: nine strip sprites, as on PV2
+        self.assertEqual(last(budget_cut_slots(), '48k'), (72, 1))    # the deadline is the same on 48K timing
+        for e in (-1, 0, 1):                                          # the sixth 1x is slot 31 + e
+            want = (31 + e, 0) if e < 1 else (30 + e, 1)
+            self.assertEqual(last(budget_deadline_slots(e)), want, f'e={e}')
+
+    def test_the_model_draws_what_her_next_drew(self):
+        """Melissa's photos: PV2's strip stops after sprite 104 (whc 191); PV5's strips after 28, 78 and 104;
+        PV6's rows draw 0, 2, 2, 3, 2, 2, 2 small squares (readings-sitting2/3/4)."""
+        probes = Path.home() / 'next-build/probes'
+        if not (probes / 'pv6_scene.py').exists():
+            self.skipTest('needs next-build/probes')
+        sys.path.insert(0, str(probes))
+        import pv2_model, pv5_model, pv6_model, pv6_scene
+        owners = [None] * 320
+        nv._sprite_line(pv2_model.scene_model(), 200, owners)
+        self.assertEqual(max(o for o in owners if o is not None and o >= 96), 104)
+        cuts = pv5_model.cuts(pv5_model.scene_model())
+        self.assertEqual({k: c[0] for k, c in cuts.items()}, {'A': 104, 'B': 28, 'C': 78})
+        v6, counts = pv6_model.scene_model(), []
+        for wvc, row in pv6_scene.plan():
+            owners = [None] * 320
+            nv._sprite_line(v6, wvc, owners)
+            counts.append(sum(1 for x in pv6_scene.X1 if owners[x + 4] is not None))
+        self.assertEqual(counts, [0, 2, 2, 3, 2, 2, 2])
 
     def test_sprite_scenes_can_see_what_they_test(self):
         """Each sprite-survivor scene against the same scene with its behaviour taken away: the pictures
@@ -841,51 +860,47 @@ def budget_scene(slots, timing='p3'):
 
 
 def budget_cut_slots():
-    """Forty sprites on the row but off the right (x 330: S_QUALIFY and one S_PROCESS cycle each, sprites:855),
-    24 invisible (S_QUALIFY only), then sixteen 8x-wide overlapping sprites, a palette step each: the line's
-    time runs out in the fourteenth (cycle 2 + 80 + 24, then 129 each: sprite 77 gets 41 of its 128 cycles
-    on 128K/+3 timing, 9 on 48K)."""
-    out = [[330 & 0xFF, 100, 0x01, 0x80 | i] for i in range(40)]
-    out += [[40, 100, 0x00, i] for i in range(24)]
+    """64 invisible slots, then sixteen 8x-wide overlapping sprites, a palette step each (PV2's strip shape).
+    By the measured rule (whole sprites by SPRITE_DEADLINE, then stop) the first nine draw whole: the tenth
+    would finish at cycle 2 + 64 + 10 x 129 = 1356 > 1282, so it and all after it are dropped."""
+    out = [[0, 0, 0x00, 0x00]] * 64
     out += [[16 + 12 * i, 100, i << 4, 0xC0 | (20 + i), 0x18] for i in range(16)]
     return out
 
 
-def budget_boundary_slots(d):
-    """114 invisible slots (cycles 2-115), thirteen full 8x sprites (129 each), and in slot 127 one at
-    x 290 - d running to whc 319 (30 + d cycles): its last pixel is cycle 1823 + d and the machine idles at
-    1824 + d. d = 0 fits exactly; d = 1 is overtime though that pixel, in cycle 1824 itself, still lands;
-    d = 2 loses it (sprites:470-501, 531-537, 977). The drawn sprites must come last: invisible slots after
-    them would spend the time in S_QUALIFY instead."""
-    out = [[0, 0, 0x00, 0x00]] * 114
-    out += [[8 + 14 * i, 100, i << 4, 0xC0 | (30 + i), 0x18] for i in range(13)]
-    out.append([(290 - d) & 0xFF, 100, 0xF1, 0xC0 | 50, 0x18])
+def budget_deadline_slots(e):
+    """17 + e invisible slots, nine 8x sprites (129 cycles each) and six 1x (17 each): the sixth 1x finishes at
+    cycle 2 + 17 + e + 1161 + 102 = 1282 + e. e = -1 and 0 draw it; e = +1 drops it and sets status bit 1."""
+    out = [[0, 0, 0x00, 0x00]] * (17 + e)
+    out += [[8 * i, 100, i << 4, 0xC0 | (30 + i), 0x18] for i in range(9)]
+    out += [[200 + 18 * j, 100, (j + 9) << 4, 0x80 | (40 + j)] for j in range(6)]
     return out
 
 
 @needs_next
 class SpriteBudget(VideoCase):
-    """The renderer's time: one line of 28 MHz cycles from line reset to line reset (4 x 456 on 128K/+3
-    timing, 4 x 448 on 48K and Pentagon); one cycle per sprite qualified and one per pixel processed; what
-    doesn't fit is never drawn, and port 0x303B bit 1 says so (sprites:517-537, 826-866, 951-995)."""
+    """The renderer's time, as measured on Melissa's Next (PV2, PV5, PV6): one cycle per sprite qualified and
+    one per pixel; a drawn sprite is drawn only if it can finish by SPRITE_DEADLINE (1282 cycles after the
+    line reset, about whc 319), and the first that can't stops the line and sets port 0x303B bit 1.
+    (sprites.vhd as read cuts mid-sprite at the line reset instead; her Next doesn't.)"""
 
-    def test_line_runs_out_mid_sprite(self):
+    def test_line_drops_the_sprite_that_cannot_finish(self):
         for timing in ('p3', '48k'):
             with self.subTest(timing=timing):
                 self.assertFrameMatches(budget_scene(budget_cut_slots(), timing), name=f'budget_cut_{timing}')
 
-    def test_the_boundary_to_the_cycle(self):
-        for d in (0, 1, 2):
-            with self.subTest(d=d):
-                self.assertFrameMatches(budget_scene(budget_boundary_slots(d)), name=f'budget_boundary_{d}')
+    def test_the_deadline_to_the_cycle(self):
+        for e in (-1, 0, 1):
+            with self.subTest(e=e):
+                self.assertFrameMatches(budget_scene(budget_deadline_slots(e)), name=f'budget_deadline_{e}')
 
-    def test_status_says_overtime_and_clears_on_read(self):
-        for d, want in ((0, 0x01), (1, 0x03), (2, 0x03)):
-            with self.subTest(d=d):
-                s = budget_scene(budget_boundary_slots(d))
+    def test_status_says_a_sprite_was_dropped_and_clears_on_read(self):
+        for e, want in ((-1, 0x01), (0, 0x01), (1, 0x03)):
+            with self.subTest(e=e):
+                s = budget_scene(budget_deadline_slots(e))
                 self.assertEqual(nv.sprite_status(s.model()), want)
                 zx = s.machine()
-                self.assertEqual(zx.io_in(0x303B), want, 'sprites:977, 990-991')
+                self.assertEqual(zx.io_in(0x303B), want, 'measured: bit 1 when a sprite is dropped')
                 self.assertEqual(zx.io_in(0x303B), 0x00, 'sprites:986-988: a read clears it')
 
 
