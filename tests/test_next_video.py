@@ -254,6 +254,15 @@ class ModelSense(unittest.TestCase):
             x = [490, 0x1D0, 400, 460][idx]
             self.assertNotEqual((x >> 4) & 0x1F, 0x1F, 'a 1x mask would stop it at once')
 
+    def test_numpy_matches_the_reading_with_sprites_rewritten_mid_frame(self):
+        s, sched, _ = multiplex_scene()
+        v = s.model()
+        rows = sorted({r + d for r, _, _ in sched for d in (-1, 0, 1, 2)} | {60, 150})
+        want = v.frame9(sched, rows=set(rows))[2]
+        got = nv.frame9_np(s.model(), sched)[2]
+        for r in rows:
+            self.assertEqual(got[r * nv.W:(r + 1) * nv.W], want[r * nv.W:(r + 1) * nv.W], f'row {r}')
+
     def test_power_on_picture_is_black(self):
         self.assertEqual(set(nv.Video().frame9()[2]), {0}, '§9.1 (13): palette RAMs start all zero')
 
@@ -899,6 +908,36 @@ def wrap_sprites():
             [460 & 0xFF, 130, 0x31, 0xC0 | 7, 0x18]]
 
 
+def multiplex_scene():
+    """Sixteen sprites, each reused four times down the screen by copper writes to the nextreg mirror
+    (NR 0x34 then NR 0x35-0x37: x, y, palette). Each reuse is written at frame row last + 1 (WAIT a row
+    after the sprite's last visible row) and starts two rows later, the demo's margin. Returns (scene,
+    schedule, copper words). After the last band, band 0's attributes go back for the next frame."""
+    s = sprite_scene(0x01, [[24 + 14 * i, 40, (i << 4) & 0xF0, 0x80 | (i % 8)] for i in range(16)])
+    sched, words = [], []
+    y = 40
+    for band in range(1, 4):
+        last = y + 15 + 16                                   # frame row of the sprites' last visible row
+        r = last + 1                                         # write after it
+        y_new = r + 2 - 16                                   # first visible frame row r + 2 (wvc = frame - 16)
+        words.append(0x8000 | (44 << 9) | (r - 49))          # WAIT (r - 49, 44): lands before frame row r
+        for i in range(16):
+            x = (30 + 14 * i + 7 * band) & 0xFF
+            pal = ((i + 3 * band) << 4) & 0xF0
+            for n, val in ((0x34, i), (0x35, x), (0x36, y_new), (0x37, pal)):
+                words.append((n << 8) | val)
+                sched.append((r, n, val))
+        y = y_new
+    r = y + 15 + 16 + 1                                      # after the last band: band 0 back, for the
+    words.append(0x8000 | (44 << 9) | (r - 49))              # next frame (mode 11 restarts the list at the top)
+    for i in range(16):
+        for n, val in ((0x34, i), (0x35, 24 + 14 * i), (0x36, 40), (0x37, (i << 4) & 0xF0)):
+            words.append((n << 8) | val)
+            sched.append((r, n, val))
+    words.append(0xFFFF)
+    return s, sched, words
+
+
 @needs_next
 class SpriteSurvivors(VideoCase):
     """Behaviours Speccy-Zone's sprite mutants showed the suite missing (10 real of 24 on 64d9b75), as scenes.
@@ -1071,6 +1110,25 @@ class SpriteMirror(VideoCase):
         upload_half(s, 0, 0x17)
         s.nr(0x35, 160).nr(0x36, 100).nr(0x37, 0x00).nr(0x38, 0x80 | 3)   # sprite 3 by nextreg
         self.check(s)
+
+
+@needs_next
+class SpriteMultiplex(VideoCase):
+    """Copper-multiplexed sprites: attribute writes mid-frame reach the sprites from the row after they land,
+    because each row's sprites are drawn during the line before (sprites:539)."""
+
+    def test_copper_moves_sprites_down_the_screen(self):
+        s, sched, words = multiplex_scene()
+        s.nr(0x62, 0x00).nr(0x61, 0x00)
+        for w in words:
+            s.nr(0x63, w >> 8, w & 0xFF)
+        s.nr(0x62, 0xC0)
+        got = list(s.machine(frames=3).frame9()[2])
+        want = nv.frame9_np(s.model(), sched)[2]
+        bad = [i for i in range(len(want)) if got[i] != want[i]]
+        if bad:
+            path = self._save_diff('sprite_multiplex', got, want, bad)
+            self.fail(f'{len(bad)} samples differ, first at ({bad[0] % nv.W},{bad[0] // nv.W}); {path}')
 
 
 def ulap_scene(seed=8):

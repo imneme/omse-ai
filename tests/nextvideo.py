@@ -529,13 +529,20 @@ class Video:
         blanking before frame9 row sy (as a copper WAIT at h = 38-50 does: hc_ula 316-419 lies between
         one row's last visible sample and the next row's first, on 448- and 456-pixel lines), so each
         row is drawn wholly with the registers as they stand when it starts."""
-        pending = sorted(schedule or [])
-        spr_lines = None
-        out = []
+        import copy
+        pending = sorted(schedule or [], key=lambda e: e[0])    # stable: same-row writes keep their order
+        spr_pending = list(pending)
+        spr_state = copy.deepcopy(self) if pending else self   # render-time state: sprites are drawn in
+        spr_lines = None                                        # the line before, so a write before row r
+        out = []                                                # reaches them from row r + 1 (sprites:539)
         for sy in range(H):
             while pending and pending[0][0] <= sy:
                 _, n, v = pending.pop(0)
                 self.nr_write(n, v)
+            while spr_pending and spr_pending[0][0] <= sy - 1:
+                _, n, v = spr_pending.pop(0)
+                spr_state.nr_write(n, v)
+                spr_lines = None
             if rows is not None and sy not in rows:
                 out.extend([None] * W)
                 continue
@@ -550,7 +557,7 @@ class Video:
             tm_pal = 0x200 | (((self.nr6b >> 4) & 1) << 8)          # zxnext:6733, 6888
             stencil = self.nr68 & 1
             if self.nr15 & 1 and spr_lines is None:
-                spr_lines = sprite_lines(self)
+                spr_lines = sprite_lines(spr_state)
             spr_win = sprite_window(self)
             spr_pal = 0x200 | (((self.nr43 >> 3) & 1) << 8)          # zxnext:6735, 6940
             py = sy - 48
@@ -694,26 +701,29 @@ def frame9_np(v, schedule=None, blank=True):
     splits the frame into row segments, each drawn with the registers as they stand."""
     np = _np()
     import copy
-    pending = sorted(schedule or [])
+    pending = sorted(schedule or [], key=lambda e: e[0])    # stable: same-row writes keep their order
+    spr_pending = list(pending)
     out = np.zeros((H, W), dtype=np.int32)
     cur = copy.deepcopy(v)
+    spr_cur = copy.deepcopy(v) if pending else cur      # render-time: each write a row later (Video.frame9)
+    bounds = sorted({r for r, _, _ in pending} | {r + 1 for r, _, _ in pending} | {H})
     start = 0
-    while True:
-        stop = pending[0][0] if pending else H
-        if stop > start:
-            out[start:stop] = _frame_np(cur)[start:stop]
-        if not pending:
-            break
-        while pending and pending[0][0] <= stop:
+    for stop in bounds:
+        while pending and pending[0][0] <= start:
             _, n, val = pending.pop(0)
             cur.nr_write(n, val)
+        while spr_pending and spr_pending[0][0] <= start - 1:
+            _, n, val = spr_pending.pop(0)
+            spr_cur.nr_write(n, val)
+        if stop > start:
+            out[start:min(stop, H)] = _frame_np(cur, spr_cur)[start:min(stop, H)]
         start = stop
     if blank:
         out = np.where(np.array(blank_mask(v)).reshape(H, W), 0, out)
     return W, H, out.ravel().tolist()
 
 
-def _frame_np(v):
+def _frame_np(v, spr_v=None):
     np = _np()
     sy, sx = np.mgrid[0:H, 0:W]
     phc, half, py = sx // 2 - 48, sx & 1, sy - 48
@@ -908,7 +918,7 @@ def _frame_np(v):
     S = np.zeros_like(phc)
     if v.nr15 & 1:
         buf = np.full((256, 320), -1, dtype=np.int32)
-        for i, line in enumerate(sprite_lines(v)):
+        for i, line in enumerate(sprite_lines(spr_v or v)):
             buf[i] = [-1 if q is None else q for q in line]
         xs_, xe_, ys_, ye_, ymax = sprite_window(v)
         whc, wvc = phc + 32, py + 32
