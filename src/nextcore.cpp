@@ -2295,7 +2295,8 @@ bool cpu_edge(ZXN& z) {
             if (z.bus_eff_en && bus_mem_visible(z, a, false)) bus_cycle(z, 0, a, Z80_GET_DATA(p));
             if (z.speed_eff == 3 && (k == K_SRAM || k == K_BRAM5)) z.wait_next = true;   // ref §1.4
             if (fetch) snoop_fetch(z, Z80_GET_DATA(p));
-            z.rd_open = !fetch && z.speed_eff < 3;                    // below 28 MHz the memory takes the address at T2
+            z.rd_open = !fetch && z.speed_eff < 2;                    // below 14 MHz the memory takes the address at T2
+                                                                      // (LDPIRX3 on Melissa's Next, Strobe's reading)
             z.rd_addr = a;
         } else if (p & Z80_WR) {
             z.rd_open = false;
