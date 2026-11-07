@@ -102,6 +102,33 @@ class Enables(NextCase):
 
 
 @needs_next
+class TimexPortReadback(NextCase):
+    """Port FFh reads the Timex register only with port enable 0 (NR 82h b0)
+    and NR 08h b2 both set; otherwise it's port_ff_dat_ula, the floating bus in
+    48K/128K timing and FFh at +3 (zxnext:2772, 4454, 2356, 5119). Writes need
+    the enable too (2673). Scree found it: the Multiface saves port FF by
+    reading it, so a wrong read restored the wrong screen mode."""
+
+    def machine(self, nr08_b2, nr82_b0):
+        zx = bare()
+        zx.io_out(0x00FF, 0x05)                         # with the enable on (power-on NR 82h = FFh)
+        zx.run_ticks(16)
+        zx.nr_write(0x08, (zx.nr_read(0x08) & 0x7F) | nr08_b2 << 2)
+        zx.nr_write(0x82, 0xFE | nr82_b0)
+        zx.run_ticks(16)
+        return zx
+
+    def test_both_set_reads_the_timex_register(self):
+        self.assertEqual(self.machine(1, 1).io_in(0x00FF), 0x05)
+
+    def test_without_nr08_b2_it_is_the_floating_bus(self):
+        self.assertEqual(self.machine(0, 1).io_in(0x00FF), 0xFF, '+3 timing: FFh (zxnext:4454)')
+
+    def test_without_the_port_enable_it_is_the_floating_bus(self):
+        self.assertEqual(self.machine(1, 0).io_in(0x00FF), 0xFF, 'the register holds 05h, unread')
+
+
+@needs_next
 class Joysticks(NextCase):
     """§9 D-13: port 0x1F answers only while a joystick is Kempston 1 or MD 1."""
 
