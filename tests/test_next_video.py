@@ -425,13 +425,16 @@ class FrameWindow(VideoCase):
         zx = s50.machine()
         old = self.border_colour(s50)
         zx.nr_write(0x05, (zx.nr_read(0x05) & ~0x04) | 0x04)
-        zx.io_out(0x00FE, 1)
-        zx.run_frames(4)
+        zx.run_frames(2)                                # the switch lands at a frame sync; 50 Hz frames end in border 7
+        zx.io_out(0x00FE, 1)                            # only then the new border, so stale rows would show the old
+        zx.run_frames(3)
         s60 = ula_scene(border=1, hz=60)
         new = self.border_colour(s60)
         self.assertNotEqual(old, new)
         got, raw = list(zx.frame9()[2]), list(zx.frame9(blank=False)[2])
-        self.assertNotIn(old, got, 'no sample of the 50 Hz border survives on screen')
+        edges = [s for r in list(range(0, 24)) + list(range(264, 288)) for s in got[r * nv.W:(r + 1) * nv.W]]
+        self.assertNotIn(old, edges, 'no sample of the 50 Hz border survives in rows 0-23 or 264-287')
+        # (not the whole frame: border 7 and paper 7 share a palette entry, so the old colour is in the paper)
         self.check_rows(self.rows_of(got), list(range(0, 24)) + list(range(264, 288)), [24, 263], new, first_col=16,
                         what='after the switch')
         self.check_rows(self.rows_of(raw), list(range(0, 8)) + list(range(272, 288)), [8, 23, 264, 271], new,
