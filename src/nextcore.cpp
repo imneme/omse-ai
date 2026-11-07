@@ -2137,10 +2137,13 @@ void im2_edge(ZXN& z, uint64_t before) {
     z.reti_seen = false;
     if (!hw_im2(z)) return;
     const bool m1 = before & Z80_M1, iorq = before & Z80_IORQ, im2 = z.im_mode == 2;
+    // reti_decode: S_ED_T4, which lasts until the edge that consumes reti_seen (im2c:183-184), so a requesting
+    // device still passes IEI on that edge though the snooper has moved on (im2d:96-101)
+    const bool decode = z.snoop == 1 || reti;
     bool iei = true;
     for (int i = 0; i < 14; i++) {
         uint8_t& st = z.im2_state[i];
-        const bool ieo = st == 0 ? iei : st == 1 ? (iei && z.snoop == 1) : false;
+        const bool ieo = st == 0 ? iei : st == 1 ? (iei && decode) : false;
         switch (st) {
             case 0: if (((z.im2_req >> i) & 1) && !m1) st = 1; break;
             case 1: if (m1 && iorq && iei && im2) st = 2; break;
