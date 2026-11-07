@@ -1914,6 +1914,7 @@ int zxn_audio_take(ZXN* z, uint16_t* out, int max) {
     return n;
 }
 int zxn_audio_cap_len(ZXN* z) { return (int)z->audio.cap.size(); }
+void zxn_audio_point(ZXN* z, int on) { z->audio.point = on != 0; }   // HDMI's sampling (hdmidataencoder.v)
 void zxn_audio_rate(ZXN* z, int rate) {
     if (rate != z->audio.rate) { z->audio.rate = rate; z->audio.acc = 0; z->audio.sumL = z->audio.sumR = z->audio.nsum = 0; }
 }
