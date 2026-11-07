@@ -1056,7 +1056,7 @@ void do_reset(ZXN& z, bool hard) {
     z.pins = z80_init(&z.cpu);
     z.cpu.z80n = true;                                                // the Z80N's instructions (Strobe Fern's z80.h)
     z.stackless_retn = false;
-    z.nr[0x80] = (z.nr[0x80] & 0x0F) | (z.nr[0x80] & 0x0F) << 4;     // any reset: b7:4 <- b3:0 (zxnext:2140-2145)
+    // (NR 0x80's b7:4 <- b3:0 is the soft branch's copy above; a hard reset's 00h needs none)
     z.bus_eff_en = z.nr[0x80] & 0x80; z.bus_eff_dis_io = z.nr[0x80] & 0x20; z.bus_eff_dis_mem = z.nr[0x80] & 0x10;
     z.bus_wait_left = 0;
     z.bus_inten = z.bus_int_q = z.bus_int_seen = false;
