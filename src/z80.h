@@ -1001,7 +1001,7 @@ static inline uint8_t _z80_srl(z80_t* cpu, uint8_t val) {
 // The flag also gives five documented instructions the T80N's undocumented flags where it leaves a Zilog (the
 // places the core's idle t80n_complete.vhd fixes): BIT's X and Y (_z80_cb_action), INI/IND/OUTI/OUTD and
 // repeats (_z80n_bdec_flags), CPI/CPD and repeats, LD A,I/R and IN r,(C) (their flag helpers). Melissa's Next
-// agreed in every place it was asked (Z80NTIME, LDPIRX2, Z80NFLAG).
+// agreed in every place it was asked (Z80NTIME, LDPIRX2, Z80NFLAG, and Z80NFLG2 from F = FF).
 
 // the first step of each Z80N instruction, by its opcode after ED (0: not one)
 static inline uint16_t _z80n_first_step(uint8_t op) {

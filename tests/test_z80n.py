@@ -807,8 +807,8 @@ class TestT80NFlags(unittest.TestCase):
       LD A,I and LD A,R: X and Y are left as they were (t80n.vhd's Special_LD sets S Z H P N only);
       IN r,(C) and IN (C): X and Y are left as they were (its F update sets S Z P H N only).
     Melissa's Next agreed in all five cells Z80NFLAG asked (sitting 5: INI 22, OUTI 22, CPI BE, LD A,I 00,
-    IN A,(C) 04). Those cells began from F = 00, so "left as they were", and INI's carry, rest on the VHDL; the
-    random cells here begin from any F. Everything else is as with the flag off, tick for tick; off, nothing
+    IN A,(C) 04), and in all five of Z80NFLG2's, which begin from F = FF and settle "left as they were" (not
+    cleared) and the borrow (sitting 8: OUTI from B 00 BB, from B 80 3E, LD A,I 69, LD A,R 29, IN A,(C) 6D). Everything else is as with the flag off, tick for tick; off, nothing
     changes."""
 
     @classmethod
@@ -865,13 +865,20 @@ class TestT80NFlags(unittest.TestCase):
             self.assertEqual(on['af'] & 0xFF, want, f'{label}: F with the Z80N')
 
     def test_the_photographs_cells(self):
-        """Z80NFLAG's five cells as Melissa's Next printed them (the T80N column), and as a Zilog (the flag off)."""
+        """Z80NFLAG's and Z80NFLG2's cells as Melissa's Next printed them (the T80N column), and as a Zilog (the flag
+        off)."""
         cells = (  # code, regs, mem, io, T80N's F, a Zilog's F
             ([0xED, 0xA2], {'hl': 0xBB90, 'bc': 0x253B, 'af': 0x0000}, {}, {0x253B: 0xD0}, 0x22, 0x33),
             ([0xED, 0xA3], {'hl': 0xBBF0, 'bc': 0x253B, 'af': 0x0000}, {0xBBF0: 0x90}, {}, 0x22, 0x33),
             ([0xED, 0xA1], {'hl': 0xBBA0, 'bc': 0x0002, 'af': 0x1000}, {0xBBA0: 0x28}, {}, 0xBE, 0xB6),
             ([0xED, 0x57], {'ir': 0x2800, 'af': 0x0000}, {}, {}, 0x00, 0x28),
-            ([0xED, 0x78], {'bc': 0x253B, 'af': 0x0000}, {}, {0x253B: 0x28}, 0x04, 0x2C))
+            ([0xED, 0x78], {'bc': 0x253B, 'af': 0x0000}, {}, {0x253B: 0x28}, 0x04, 0x2C),
+            # Z80NFLG2, from F = FF (sitting 8)
+            ([0xED, 0xA3], {'hl': 0xBBF0, 'bc': 0x00FE, 'af': 0x00FF}, {0xBBF0: 0x07}, {}, 0xBB, 0xAC),
+            ([0xED, 0xA3], {'hl': 0xBBE0, 'bc': 0x80FE, 'af': 0x00FF}, {0xBBE0: 0x07}, {}, 0x3E, 0x28),
+            ([0xED, 0x57], {'ir': 0x0000, 'af': 0x00FF}, {}, {}, 0x69, 0x41),
+            ([0xED, 0x5F], {'ir': 0x0003, 'af': 0x00FF}, {}, {}, 0x29, 0x01),
+            ([0xED, 0x78], {'bc': 0x253B, 'af': 0x00FF}, {}, {0x253B: 0x00}, 0x6D, 0x45))
         for code, regs, mem, io, t80n, zilog in cells:
             for z80n, want in ((True, t80n), (False, zilog)):
                 with self.subTest(code=f'ED {code[1]:02X}', z80n=z80n):
