@@ -414,8 +414,9 @@ class Next:
     def frame9(self, blank=True):
         """The visible area as 9-bit RRRGGGBBB colours (0-511), (w, h, values) with w = 704 14 MHz samples, two per
         7 MHz pixel, and h = 288; the ULA's paper pixel (px, py) is samples (96 + 2px, 48 + py) and (97 + 2px, 48 + py)
-        (DESIGN.md §9.1 (12)). As output, black while blanking; blank=False gives the mixer's colour before it
-        (§9.1 (14))."""
+        (DESIGN.md §9.1 (12)). The HDMI picture: black while blanking or outside HDMI's window (at 60 Hz rows 0-23
+        and 264-287, on the Pentagon rows 280-287); blank=False gives the mixer's colour before it wherever a line
+        exists, and 0 where none does; row r is vc r - 48 + c_min_vactive, unwrapped (§9.1 (14))."""
         w, h = self.lib.zxn_f9_width(), self.lib.zxn_fb_height()
         return w, h, list((ctypes.c_uint16 * (w * h)).from_address(self.lib.zxn_frame9(self.z, 1 if blank else 0)))
 

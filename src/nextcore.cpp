@@ -1656,7 +1656,10 @@ inline void draw_pixel(ZXN& z) {
         y++;                                                          // at hc_ula 0 (Hatch Fern's PV1 finding)
     }
     if (y >= 192 + FB_BORDER) y -= t.vc_len;
-    const int fx = x + FB_BORDER, fy = y + FB_BORDER;
+    // the picture's row is the raw line, unwrapped (§9.1 (14), Hatch Fern's mapping, Tally's ruling): row r is
+    // vc r - 48 + c_min_vactive, so rows with no line in this frame (0-7, 272-287 at 60 Hz) stay black; y, the
+    // layers' line, is unchanged
+    const int fx = x + FB_BORDER, fy = ((y + t.vactive) % t.vc_len + t.vc_len) % t.vc_len - t.vactive + FB_BORDER;
     if (fx < 0 || fx >= FB_W || fy < 0 || fy >= FB_H) return;
     uint8_t c = z.border;
     const bool next = z.nr[0x43] & 1, ulap = z.ulap_en && !next;     // ULANext wins over ULA+ (zxula:492-531)
@@ -1771,7 +1774,12 @@ inline void draw_pixel(ZXN& z) {
     // raw vc 0-7 (Pentagon 0-15), with the paper at raw (hactive, vactive)
     const bool pent = z.timing == 4;
     const int rawh = x + t.hactive, rawv = ((y + t.vactive) % t.vc_len + t.vc_len) % t.vc_len;
-    const bool blank = rawh <= (pent ? 63 : 95) || rawv <= (pent ? 15 : 7);
+    // and outside HDMI's window (c_hdmi_xmin-xmax, ymin-ymax: zxula_timing.vhd:172-175, 208-211, 242-245, 274-277,
+    // 302-305), since frame9 is the HDMI picture (§9.1 (14)): 360 wide, which covers frame9's columns, and vertically
+    // vc 16-303 at 50 Hz (all 288 rows), 16-255 at 60 Hz (rows 24-263), Pentagon 24-311 (rows 0-279)
+    const int hx0 = pent ? 76 : z.timing == 1 ? 80 : 88, hy0 = pent ? 24 : 16, hy1 = pent ? 311 : z.hz60 ? 255 : 303;
+    const bool blank = rawh <= (pent ? 63 : 95) || rawv <= (pent ? 15 : 7) ||
+                       rawh < hx0 || rawh > hx0 + 359 || rawv < hy0 || rawv > hy1;
     uint16_t srgb = 0;
     const bool st = !spr_pixel(z, x, y, srgb);                        // 7 MHz: the same for both samples
     for (int smp = 0; smp < 2; smp++) {
@@ -2511,6 +2519,11 @@ bool master_tick(ZXN& z) {
             if (++z.vc == t.vc_len) {
                 z.vc = 0;
                 z.frame++;
+                if (z.timing != z.pend_timing || z.hz60 != z.pend_hz60) {   // a new geometry: rows that no line
+                    memset(z.fb, 0, sizeof z.fb);                     // reaches stay black, not the old timing's
+                    memset(z.f9, 0, sizeof z.f9);                     // (0-7, 272-287 at 60 Hz; §9.1 (14))
+                    memset(z.f9raw, 0, sizeof z.f9raw);
+                }
                 z.timing = z.pend_timing;                             // timing and 50/60 Hz change here (ref §2.6)
                 z.hz60 = z.pend_hz60;
             }
