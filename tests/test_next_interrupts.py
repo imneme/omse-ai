@@ -191,5 +191,106 @@ class HardwareIM2(NextCase):
                         'the frozen request is served once it is (cl:3.02.00)')
 
 
+def assemble(items, org):
+    """Bytes and labels: str = a label here, ('jr', 'nz'|'z'|None, label) a
+    relative jump, ('w', label) a little-endian address."""
+    pc, labels = org, {}
+    for it in items:
+        if isinstance(it, str):
+            labels[it] = pc
+        elif isinstance(it, tuple):
+            pc += 2
+        else:
+            pc += len(it)
+    out, pc = [], org
+    for it in items:
+        if isinstance(it, str):
+            continue
+        if isinstance(it, tuple) and it[0] == 'jr':
+            op = {None: 0x18, 'nz': 0x20, 'z': 0x28}[it[1]]
+            out += [op, (labels[it[2]] - (pc + 2)) & 0xFF]
+            pc += 2
+        elif isinstance(it, tuple):
+            out += [labels[it[1]] & 0xFF, labels[it[1]] >> 8]
+            pc += 2
+        else:
+            out += it
+            pc += len(it)
+    return bytes(out)
+
+
+CTCN, LINEN, INSIDE, NEST = 0xA000, 0xA001, 0xA002, 0xA003
+
+
+def ld_a(a): return [0x3A, a & 0xFF, a >> 8]
+def st_a(a): return [0x32, a & 0xFF, a >> 8]
+
+
+@needs_next
+class RetiService(NextCase):
+    """Hardware IM2's daisy chain, line interrupt (source 0) above CTC 0 (source
+    3). reti_decode is high from ED's fetch (im2c:233), reti_seen comes as 4D's
+    T4 begins (im2c:171-172, 234), RETN gives retn_seen only (236). A device
+    requesting passes IEO = IEI and reti_decode (im2d:142); one acknowledged or
+    in service passes nothing (144); an in-service device leaves on reti_seen
+    with IEI (123-124). Scree's repro (realsoft/repro/reti_race.asm) and Ratio's
+    statement of it: a RETI while a higher device requests ends the service of
+    the highest in-service device below it; RETN never ends service; a device
+    with another in service above it never clears."""
+
+    def play(self, ctc_handler, frames=5):
+        zx = bare()
+        main = [[0xF3, 0x31, 0xF0, 0xBF, 0xAF], st_a(CTCN), st_a(LINEN), st_a(INSIDE), st_a(NEST),
+                [0x3E, 0x90, 0xED, 0x47, 0xED, 0x5E,                # LD I,90h; IM 2
+                 0xED, 0x91, 0xC0, 0x01,                            # hardware IM2
+                 0xED, 0x91, 0x22, 0x06, 0xED, 0x91, 0x23, 0x40,    # ULA off, line 64
+                 0xED, 0x91, 0xC4, 0x02, 0xED, 0x91, 0xC5, 0x01, 0xED, 0x91, 0xC6, 0x00,
+                 0x01, 0x3B, 0x18, 0x3E, 0x85, 0xED, 0x79, 0x3E, 200, 0xED, 0x79,   # CTC 0: int, /16, 200
+                 0xFB], 'idle', ('jr', None, 'idle')]
+        line = [[0xF5], ld_a(LINEN), [0x3C], st_a(LINEN), [0xF1, 0xFB, 0xED, 0x4D]]
+        zx.load(0x8000, assemble(main, 0x8000))
+        zx.load(0x8100, assemble(ctc_handler, 0x8100))
+        zx.load(0x8300, assemble(line, 0x8300))
+        zx.load(0x9000, bytes([0x00, 0x83, 0, 0, 0, 0, 0x00, 0x81]))   # vectors 00h line, 06h CTC 0
+        zx.set_regs(pc=0x8000)
+        zx.run_frames(frames)
+        return zx.peek(CTCN), zx.peek(LINEN), zx.peek(NEST)
+
+    def waiting_handler(self, tail):
+        """CTC 0's handler from reti_race.asm: count, clear the line's status,
+        poll NR C8h b1 with interrupts off until the line requests, then EI and
+        the tail."""
+        return [[0xF5, 0xC5], ld_a(CTCN), [0x3C], st_a(CTCN), [0xED, 0x91, 0xC8, 0x02],
+                'wait', [0x01, 0x3B, 0x24, 0x3E, 0xC8, 0xED, 0x79, 0x04, 0xED, 0x78, 0xE6, 0x02],
+                ('jr', 'z', 'wait'), [0xC1, 0xF1, 0xFB] + tail]
+
+    def test_reti_with_a_higher_request_ends_the_lower_service(self):
+        ctc, line, _ = self.play(self.waiting_handler([0xED, 0x4D]))
+        self.assertGreaterEqual(line, 4)
+        self.assertGreaterEqual(ctc, 4, f'CTC 0 left service at each RETI (got {ctc}, line {line})')
+        self.assertLessEqual(abs(ctc - line), 1, 'one CTC 0 per line interrupt')
+
+    def test_retn_never_ends_service(self):
+        ctc, line, _ = self.play(self.waiting_handler([0xED, 0x45]))
+        self.assertEqual(ctc, 1, 'RETN gives no reti_seen (im2c:236): CTC 0 stays in service')
+        self.assertGreaterEqual(line, 4, 'the line, above it, still comes and goes')
+
+    def test_a_device_with_another_in_service_above_it_doesnt_clear(self):
+        """CTC 0's handler enables interrupts, lets the line interrupt in and out
+        (its RETI ends the line's service; CTC 0 below sees IEI 0, im2d:144), then
+        waits through many CTC 0 periods. CTC 0 must not interrupt its own
+        handler: an entry while INSIDE is set would count in NEST."""
+        h = [[0xF5, 0xC5], ld_a(INSIDE), [0xB7], ('jr', 'z', 'fresh'), ld_a(NEST), [0x3C], st_a(NEST),
+             'fresh', [0x3E, 0x01], st_a(INSIDE), ld_a(CTCN), [0x3C], st_a(CTCN),
+             ld_a(LINEN), [0x47, 0xFB],                          # remember LINEN; EI
+             'w1', ld_a(LINEN), [0xB8], ('jr', 'z', 'w1'),       # until the line has come and gone
+             [0x01, 0xE8, 0x03], 'w2', [0x0B, 0x78, 0xB1], ('jr', 'nz', 'w2'),   # ~65 CTC 0 periods
+             [0xF3, 0xAF], st_a(INSIDE), [0xC1, 0xF1, 0xFB, 0xED, 0x4D]]
+        ctc, line, nest = self.play(h)
+        self.assertGreaterEqual(ctc, 2, 'CTC 0 came back after its own RETI')
+        self.assertGreaterEqual(line, 2)
+        self.assertEqual(nest, 0, 'never inside its own handler')
+
+
 if __name__ == '__main__':
     unittest.main()
