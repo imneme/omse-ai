@@ -58,6 +58,21 @@ class Registers(NextCase):
                 zx.run_ticks(2000)
                 self.assertEqual(zx.nr_read(0x80), after)
 
+    def test_a_reset_brings_the_bus_up_as_b3_0_said(self):
+        """The reset copy (zxnext:2144-2145) isn't only a read-back: with b3 set
+        the bus is on after the reset and carries the CPU's cycles. (Mutant
+        survivor 1, run 1.)"""
+        for nr80, on in [(0x08, True), (0x00, False)]:
+            with self.subTest(nr80=f'{nr80:02X}h'):
+                zx = bare()
+                zx.nr_write(0x80, nr80)
+                zx.reset()
+                zx.run_ticks(2000)
+                park(zx)
+                zx.bus_log(True)
+                zx.run_ticks(2000)
+                self.assertEqual(bool([e for e in zx.bus_events if e[1] == 'mr']), on)
+
     def test_nr81_keeps_three_bits_and_no_speed(self):
         """b6:4 stored; the speed bits are ignored in 3.02.02 (zxnext:5433); b3:2
         read 0 (6033)."""
@@ -141,6 +156,58 @@ class IOCycles(NextCase):
                 zx.bus_log(True)
                 run_code(zx, [0x3E, 0x02, 0xD3, 0xFE])
                 self.assertEqual(io_cycles(zx), want)
+
+    INTERNAL = {                                        # port family: an address that decodes, zxnext:2542-2649
+        'FE': 0x00FE, 'FF': 0x00FF, '7FFD': 0x7FFD, 'DFFD': 0xDFFD, '1FFD': 0x1FFD, 'EFF7': 0xEFF7,
+        'E3': 0x00E3, 'E7': 0x00E7, 'EB': 0x00EB, '243B': 0x243B, '253B': 0x253B, '103B': 0x103B,
+        '113B': 0x113B, '123B': 0x123B, 'UART Tx': 0x133B, 'UART Rx': 0x143B, 'UART sel': 0x153B,
+        'UART frame': 0x163B, 'DMA 6B': 0x006B, 'DMA 0B': 0x000B, 'FFFD': 0xFFFD, 'BFFD': 0xBFFD,
+        'FADF': 0xFADF, 'FBDF': 0xFBDF, 'FFDF': 0xFFDF, '57': 0x0057, '5B': 0x005B, '303B': 0x303B,
+        'BF3B': 0xBF3B, 'FF3B': 0xFF3B, **{f'CTC {i}': 0x183B + 0x100 * i for i in range(8)}}
+    SAFE = {0x00E7: 0xFF, 0x006B: 0x83, 0x000B: 0x83}   # deselect SPI; disable the DMA
+
+    def test_every_internal_port_family_stays_off_the_connector(self):
+        """Writes to every family in port_internal_response (zxnext:2654-2657)
+        keep IORQ off the bus while NR 8Ah propagates nothing (2179); a port no
+        family claims does reach it. (Mutant survivors 2-4, run 1, as a sweep.)"""
+        for name, port in list(self.INTERNAL.items()) + [('none', 0x5AF7)]:
+            with self.subTest(port=name):
+                zx = bare()
+                bus_on(zx)
+                zx.bus_log(True)
+                v = self.SAFE.get(port, 0x00)
+                run_code(zx, [0x01, port & 0xFF, port >> 8, 0x3E, v, 0xED, 0x79])   # OUT (C),A
+                want = [('iw', port, v)] if name == 'none' else []
+                self.assertEqual(io_cycles(zx), want)
+
+    def test_nr8a_b1_propagates_7ffd(self):
+        """NR 8Ah b1: a 7FFD write shows on the connector (zxnext:2168, 2177-2179)
+        and pages as well. (Mutant survivor 5, run 1.)"""
+        zx = bare()
+        zx.nr_write(0x8A, 0x02)
+        bus_on(zx)
+        zx.bus_log(True)
+        run_code(zx, [0x01, 0xFD, 0x7F, 0x3E, 0x01, 0xED, 0x79])
+        self.assertEqual(io_cycles(zx), [('iw', 0x7FFD, 0x01)])
+        self.assertEqual(zx.slot_page(6), 0x02, 'bank 1 at C000h')
+
+    def test_ula_override_frees_ports_00_to_0e(self):
+        """NR 81h b6 with FE propagated: an even port with A7:4 = 0 gets only the
+        bus's byte (port_fe_override, zxnext:2544, 3416-3419, 3426), FFh with
+        nothing attached; other even ports keep the ULA. Needs a key held so the
+        ULA's own answer isn't FFh. (Mutant survivor 8, run 1.)"""
+        zx = bare()
+        zx.nr_write(0x8A, 0x01)
+        bus_on(zx)
+        zx.press('SPACE')
+        zx.run_ticks(5000)
+        ula = zx.io_in(0x7FFE)
+        self.assertNotEqual(ula, 0xFF, 'SPACE shows in row 7Fh')
+        self.assertEqual(zx.io_in(0x7F0E), ula, 'no override: the ULA answers 0Eh too')
+        zx.nr_write(0x81, 0x40)
+        zx.run_ticks(64)
+        self.assertEqual(zx.io_in(0x7F0E), 0xFF, 'override: the bus only')
+        self.assertEqual(zx.io_in(0x7FFE), ula, 'A7:4 = 1111: still the ULA')
 
     def test_disabling_io_cycles(self):
         """NR 80h b5: I/O cycles don't reach the bus and reads give FFh (2179, 1832)."""
@@ -364,7 +431,7 @@ class Lines(NextCase):
         so a new fall isn't a new NMI. (Rustyback's reading; mine of the same lines.)"""
         zx = self.nmi_machine()
         zx.bus_lines(nmi=False)
-        zx.run_ticks(1_000_000)                         # under 7 x 2^18
+        zx.run_ticks(1_700_000)                         # under 7 x 2^18, over 4 x 2^18 (mutant 7: half)
         zx.bus_lines(nmi=True)
         self.assertFalse(zx.run_until_pc(0x0066, max_ticks=50_000), 'still held: no second NMI')
         zx.bus_lines(nmi=False)
