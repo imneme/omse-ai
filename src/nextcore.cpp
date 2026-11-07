@@ -2691,6 +2691,9 @@ void zxn_i2c_rtc(ZXN* z, int attach, int sec, int min, int hour, int dow, int da
     } else c = nserial::Rtc();
     i2c_update(*z);
 }
+// a byte of the DS1307's battery-backed RAM (08h-3Fh), set from the host as a module once set would hold it: NextZXOS's
+// signature at 3Eh-3Fh (DESIGN.md §9.1 (18) j). Nothing on the bus moves.
+void zxn_rtc_ram(ZXN* z, int addr, int v) { if (addr >= 8 && addr < 64) z->rtc.ram[addr - 8] = (uint8_t)v; }
 void zxn_i2c_logging(ZXN* z, int on) { z->i2c_logging = on; if (!on) z->i2c_log.clear(); }
 int zxn_i2c_log_len(ZXN* z) { return (int)z->i2c_log.size(); }
 void zxn_i2c_log_get(ZXN* z, int i, uint64_t* out) { for (int k = 0; k < 3; k++) out[k] = z->i2c_log[i][k]; }

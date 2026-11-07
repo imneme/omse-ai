@@ -55,7 +55,7 @@ def _load_lib():
         'zxn_io_in': ([P, I], I), 'zxn_io_out': ([P, I, I], None),
         'zxn_set_keys': ([P, ctypes.c_char_p], None), 'zxn_border': ([P], I),
         'zxn_framebuffer': ([P], P), 'zxn_fb_width': ([], I), 'zxn_fb_height': ([], I),
-        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_nr_peek': ([P, I], I), 'zxn_bus_rom': ([P, ctypes.c_char_p, I], None), 'zxn_bus_io_clear': ([P], None), 'zxn_bus_io_add': ([P, I, I, I], None), 'zxn_bus_lines': ([P, I, I, I], None), 'zxn_bus_wait': ([P, I], None), 'zxn_bus_logging': ([P, I], None), 'zxn_bus_log_len': ([P], I), 'zxn_bus_log_get': ([P, I, U64P], None), 'zxn_uart_feed': ([P, I, ctypes.c_char_p, I, U64, I, I, I], None), 'zxn_uart_sent_len': ([P, I], I), 'zxn_uart_sent_get': ([P, I, I, U64P], None), 'zxn_uart_sent_clear': ([P, I], None), 'zxn_uart_cts': ([P, I, I], None), 'zxn_uart_feed_levels': ([P, I, ctypes.c_char_p, U64P, I], None), 'zxn_uart_tx_logging': ([P, I, I], None), 'zxn_uart_tx_log_len': ([P, I], I), 'zxn_uart_tx_log_get': ([P, I, I, U64P], None), 'zxn_uart_rts': ([P, I], I), 'zxn_i2c_rtc': ([P, I, I, I, I, I, I, I, I], None), 'zxn_i2c_logging': ([P, I], None), 'zxn_i2c_log_len': ([P], I), 'zxn_i2c_log_get': ([P, I, U64P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
+        'zxn_sd_insert': ([P, ctypes.c_char_p, I, I], I), 'zxn_sd_eject': ([P], None), 'zxn_frame9': ([P, I], ctypes.c_void_p), 'zxn_f9_width': ([], I), 'zxn_button': ([P, I], None), 'zxn_set_joy': ([P, I, I], None), 'zxn_set_mouse': ([P, I, I, I, I], None), 'zxn_nr_peek': ([P, I], I), 'zxn_bus_rom': ([P, ctypes.c_char_p, I], None), 'zxn_bus_io_clear': ([P], None), 'zxn_bus_io_add': ([P, I, I, I], None), 'zxn_bus_lines': ([P, I, I, I], None), 'zxn_bus_wait': ([P, I], None), 'zxn_bus_logging': ([P, I], None), 'zxn_bus_log_len': ([P], I), 'zxn_bus_log_get': ([P, I, U64P], None), 'zxn_uart_feed': ([P, I, ctypes.c_char_p, I, U64, I, I, I], None), 'zxn_uart_sent_len': ([P, I], I), 'zxn_uart_sent_get': ([P, I, I, U64P], None), 'zxn_uart_sent_clear': ([P, I], None), 'zxn_uart_cts': ([P, I, I], None), 'zxn_uart_feed_levels': ([P, I, ctypes.c_char_p, U64P, I], None), 'zxn_uart_tx_logging': ([P, I, I], None), 'zxn_uart_tx_log_len': ([P, I], I), 'zxn_uart_tx_log_get': ([P, I, I, U64P], None), 'zxn_uart_rts': ([P, I], I), 'zxn_i2c_rtc': ([P, I, I, I, I, I, I, I, I], None), 'zxn_rtc_ram': ([P, I, I], None), 'zxn_i2c_logging': ([P, I], None), 'zxn_i2c_log_len': ([P], I), 'zxn_i2c_log_get': ([P, I, U64P], None), 'zxn_cvc': ([P], I), 'zxn_sd_timing': ([P, I, I, I, I], None), 'zxn_spi_state': ([P], I), 'zxn_spi_count': ([P], U64),
         'zxn_int_log_len': ([P], I), 'zxn_int_log_get': ([P, I, U64P], None),
         'zxn_io_logging': ([P, I], None), 'zxn_io_log_len': ([P], I), 'zxn_io_log_get': ([P, I, U64P], None),
         'zxn_audio_capture': ([P, I], None), 'zxn_audio_take': ([P, U16P, I], I), 'zxn_audio_cap_len': ([P], I),
@@ -185,12 +185,17 @@ class Next:
     boot_rom= gives bytes); timing/hz/speed are in effect from the start (DESIGN.md §9.1 (1))."""
 
     def __init__(self, timing='p3', hz=None, speed=0, boot='bare', boot_rom=None, issue=4, roms=None, settings=None,
-                 palette=None):
+                 palette=None, rtc='host'):
         """boot='fast' (NEXT-MACHINE.md §7.4 (2)): the firmware's work for timing's personality on MENU.DEF (p3: ZX
         Spectrum Next (standard); 48k, 128k, pentagon: those machines), with the distribution's CONFIG.INI (roms=, or
         $OMSE_AI_NEXT_ROMS, names its machines/next folder) and settings= (a dict of CONFIG.INI keys) over it, then the
         soft reset: the CPU is at 0 in the chosen ROM. hz= overrides CONFIG.INI's 50_60hz, speed= the 3.5 MHz the soft
-        reset leaves."""
+        reset leaves.
+
+        rtc= (DESIGN.md §9.1 (18) j, Melissa's ruling): 'host', the default, attaches the DS1307 set to the host's clock
+        when the machine is made; a datetime.datetime or an ISO 8601 string ('1990-01-01T00:00') sets it to exactly
+        that time, for reproducible runs; False is a board with no RTC. The time is the time at start plus emulated
+        time, never the host's clock re-read. An attached clock carries NextZXOS's "ZX" signature (see i2c_rtc)."""
         if boot not in ('bare', 'fast'):
             raise ValueError("boot is 'bare' or 'fast'")
         if timing not in TIMINGS:
@@ -220,6 +225,8 @@ class Next:
             self._fast_boot(d, mode, rom, div_rom, mf_rom, regs, st)
             if speed:
                 self.nr_write(0x07, speed & 3)
+        if rtc is not False:                           # the RTC, set as the machine starts (§9.1 (18) j)
+            self.i2c_rtc(None if rtc == 'host' else rtc)
 
     LOADER_COLOURS = [0x00, 0x02, 0xA0, 0xA2, 0x14, 0x16, 0xB4, 0xB6, 0x00, 0x03, 0xE0, 0xE7, 0x1C, 0x1F, 0xFC, 0xFF]
 
@@ -503,14 +510,23 @@ class Next:
         return None if v < 0 else bool(v)
 
     def i2c_rtc(self, datetime=None):
-        """Attach the DS1307 at 0x68 running from datetime (the host's now if None, 24-hour mode, day 1 = Sunday), or
-        detach it with False. None is attached by default. It keeps real seconds of the machine's time from then."""
+        """Attach the DS1307 at 0x68 (DESIGN.md §9.1 (18) j): None sets it to the host's clock at this call; a
+        datetime.datetime or an ISO 8601 string ('1990-01-01T00:00', '2000-01-01') to exactly that time; False
+        detaches it. From then on it counts emulated time only: the time is the time at start plus emulated time,
+        never the host's clock re-read. 24-hour mode, day 1 = Sunday. Its RAM is zero but for NextZXOS's signature,
+        3Eh 'Z' and 3Fh 'X' (rtcsig.asm:144-148), as a module once set would hold it. The year is kept as two digits
+        (mod 100), which NextZXOS reads as 20xx (rtcsig.asm:55): 1990 shows as 2090, and 2000-01-01 is the earliest
+        past it can show."""
         if datetime is False:
             self.lib.zxn_i2c_rtc(self.z, 0, 0, 0, 0, 0, 0, 0, 0)
             return
         import datetime as _dt
-        d = datetime or _dt.datetime.now()
+        d = datetime if datetime is not None else _dt.datetime.now()
+        if isinstance(d, str):
+            d = _dt.datetime.fromisoformat(d)
         self.lib.zxn_i2c_rtc(self.z, 1, d.second, d.minute, d.hour, d.isoweekday() % 7 + 1, d.day, d.month, d.year % 100)
+        self.lib.zxn_rtc_ram(self.z, 0x3E, ord('Z'))
+        self.lib.zxn_rtc_ram(self.z, 0x3F, ord('X'))
 
     def i2c_log(self, on=True):
         """Log the I2C bus: [(t28, scl, sda)] at each change of either line as the bus sees it (zx.i2c_events)."""
