@@ -2591,15 +2591,32 @@ int zxn_audio_take(ZXN* z, uint16_t* out, int max) {
 int zxn_audio_cap_len(ZXN* z) { return (int)z->audio.cap.size(); }
 void zxn_audio_point(ZXN* z, int on) { z->audio.point = on != 0; }   // HDMI's sampling (hdmidataencoder.v)
 void zxn_audio_rate(ZXN* z, int rate) {
-    if (rate != z->audio.rate) { z->audio.rate = rate; z->audio.acc = 0; z->audio.sumL = z->audio.sumR = z->audio.nsum = 0; }
+    if (rate < 0 || rate > 1750000) return;
+    if (rate != z->audio.rate) {
+        z->audio.rate = rate; z->audio.acc = 0;
+        z->audio.sumL = z->audio.sumR = z->audio.nsum = 0;
+        z->audio.reset_bias();
+    }
+}
+int zxn_audio_config(ZXN* z, double hold, double release, double attack) {
+    for (double ms : {hold, release, attack})
+        if (!std::isfinite(ms) || ms <= 0 || ms > 60000) return -1;
+    z->audio.hold_ms = hold; z->audio.release_ms = release; z->audio.attack_ms = attack;
+    z->audio.reset_bias();
+    return 0;
 }
 int zxn_audio_out_len(ZXN* z) { return (int)z->audio.outbuf.size(); }
-int zxn_audio_out(ZXN* z, int16_t* out, int max) {
-    const int n = (int)std::min<size_t>(z->audio.outbuf.size(), (size_t)max);
-    memcpy(out, z->audio.outbuf.data(), n * sizeof(int16_t));
+int zxn_audio_out_mode(ZXN* z, int16_t* out, int max, int raw) {
+    if (max <= 0) return 0;
+    // Samples are interleaved stereo; never split a frame across modes.
+    const int n = (int)std::min<size_t>(z->audio.outbuf.size(), (size_t)max) & ~1;
+    const auto& source = raw ? z->audio.rawbuf : z->audio.outbuf;
+    if (n) memcpy(out, source.data(), n * sizeof(int16_t));
     z->audio.outbuf.erase(z->audio.outbuf.begin(), z->audio.outbuf.begin() + n);
+    z->audio.rawbuf.erase(z->audio.rawbuf.begin(), z->audio.rawbuf.begin() + n);
     return n;
 }
+int zxn_audio_out(ZXN* z, int16_t* out, int max) { return zxn_audio_out_mode(z, out, max, 0); }
 void zxn_audio_level(ZXN* z, int* out) { out[0] = z->audio.L; out[1] = z->audio.R; }
 void zxn_ay_chan(ZXN* z, int c, int* out) { z->audio.ym[c].out(z->nr[0x06] & 1, out); }
 int zxn_ay_env(ZXN* z, int c) { return z->audio.ym[c].evol; }

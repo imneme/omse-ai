@@ -61,6 +61,8 @@ def _load_lib():
         'zxn_audio_capture': ([P, I], None), 'zxn_audio_take': ([P, U16P, I], I), 'zxn_audio_cap_len': ([P], I),
         'zxn_audio_rate': ([P, I], None), 'zxn_audio_point': ([P, I], None), 'zxn_audio_out_len': ([P], I),
         'zxn_audio_out': ([P, ctypes.POINTER(ctypes.c_int16), I], I),
+        'zxn_audio_out_mode': ([P, ctypes.POINTER(ctypes.c_int16), I, I], I),
+        'zxn_audio_config': ([P, ctypes.c_double, ctypes.c_double, ctypes.c_double], I),
         'zxn_audio_level': ([P, ctypes.POINTER(ctypes.c_int)], None),
         'zxn_ay_chan': ([P, I, ctypes.POINTER(ctypes.c_int)], None), 'zxn_ay_env': ([P, I], I),
         'zxn_busak': ([P], I), 'zxn_dma_logging': ([P, I], None), 'zxn_dma_log_len': ([P], I),
@@ -608,7 +610,7 @@ class Next:
         return res
 
     # the sound (src/next_audio.h, Slide Fern): the mixer's output at every 1.75 MHz enable, 13 bits a side (0-5998),
-    # as audio_mixer.vhd makes it; or resampled (a box filter) to a rate, scaled to 0-29990
+    # as audio_mixer.vhd makes it; resampled raw is 0-29990, default playback is bias-conditioned in C
     def audio_capture(self, on=True):
         """Start (or stop) keeping the mixer's (L, R) at every enable, for audio_take()."""
         self.lib.zxn_audio_capture(self.z, 1 if on else 0)
@@ -621,14 +623,31 @@ class Next:
         n = self.lib.zxn_audio_take(self.z, buf, n)
         return np.frombuffer(buf, np.uint16, n).reshape(-1, 2).astype(np.int32)
 
-    def audio(self, rate=48000):
-        """Stereo audio since the last call at `rate` (the first call at a rate starts it): int16, shape (n, 2)."""
+    def audio(self, rate=48000, *, raw=False):
+        """Stereo int16 (n, 2), conditioned in the native resampler by default.
+
+        raw=True gives the original 0-29990 samples. Either mode consumes
+        the same interval; the controller always advances, even on raw
+        reads. A new rate restarts its state for future samples; already
+        queued samples are returned at their old rate, as before.
+        """
         import numpy as np
+        if not isinstance(rate, int) or isinstance(rate, bool) or not 0 < rate <= 1750000:
+            raise ValueError('audio rate must be an integer in 1..1750000')
         self.lib.zxn_audio_rate(self.z, rate)
         n = self.lib.zxn_audio_out_len(self.z)
         buf = (ctypes.c_int16 * max(n, 1))()
-        n = self.lib.zxn_audio_out(self.z, buf, n)
+        n = self.lib.zxn_audio_out_mode(self.z, buf, n, int(raw))
         return np.frombuffer(buf, np.int16, n).reshape(-1, 2).copy()
+
+    def audio_config(self, *, hold_ms=250, release_ms=250, attack_ms=2):
+        """Set causal bias timings and restart the controller for future samples.
+
+        Existing queued samples are unchanged. No backwards end fade or
+        automatic tail; a deliberate cut during sound may still click.
+        """
+        if self.lib.zxn_audio_config(self.z, hold_ms, release_ms, attack_ms):
+            raise ValueError('audio timings must be finite milliseconds in (0, 60000]')
 
     def audio_hdmi(self, on=True):
         """From now on, audio() takes the mixer's value at each output instant, as the Next's HDMI encoder does
@@ -659,7 +678,11 @@ class Next:
 
     @staticmethod
     def write_wav(path, samples, rate=48000):
-        """Write audio() output (int16, shape (n, 2)) as a stereo WAV."""
+        """Write samples as supplied, with no second conditioning pass.
+
+        For a hardware-faithful file, obtain samples with audio(raw=True).
+        For listening, audio() is already conditioned by the native core.
+        """
         import wave
         with wave.open(str(path), 'wb') as w:
             w.setnchannels(2)

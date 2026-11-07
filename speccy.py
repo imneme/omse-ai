@@ -781,10 +781,17 @@ class Speccy:
             out.append(((t0 - self._audio_t0) / CLOCK, (t1 - t0) / CLOCK, CLOCK / (2 * half)))
         return out
 
-    def write_wav(self, path, rate=44100):
-        """Beeper output since record_audio() as a mono 16-bit WAV."""
+    def write_wav(self, path, rate=44100, *, raw=False, hold_ms=250, release_ms=250, attack_ms=2):
+        """Beeper output as a mono WAV, with causal bias restoration.
+
+        raw=True bypasses conditioning: box-filtered +/-12000 samples.
+        No backwards end fade or extra samples; an active cut can click.
+        """
         import wave
         import array
+        from zxaudio import BiasController, pcm16
+        controller = BiasController(rate, pole=0.995, initial=1 if self._audio_level0 else -1,
+                                    hold_ms=hold_ms, release_ms=release_ms, attack_ms=attack_ms)
         n = self.lib.zx_audio_len(self.z)
         buf = (ctypes.c_uint64 * max(n, 1))()
         self.lib.zx_audio_get(self.z, buf)
@@ -798,11 +805,12 @@ class Speccy:
         ei = 0
         # box-filter each sample period for a little anti-aliasing
         step = CLOCK / rate
-        prev_x = prev_y = 0.0
         for i in range(nsamp):
             a, b = t0 + i * step, t0 + (i + 1) * step
             acc, t = 0.0, a
+            activity = False
             while ei < len(edges) and edges[ei] < b:
+                activity = True
                 if edges[ei] > t:
                     acc += (edges[ei] - t) * (1 if level else -1)
                     t = edges[ei]
@@ -810,9 +818,10 @@ class Speccy:
                 ei += 1
             acc += (b - t) * (1 if level else -1)
             x = acc / step
-            y = x - prev_x + 0.995 * prev_y      # DC blocker: silence is silence
-            prev_x, prev_y = x, y
-            out[i] = max(-32000, min(32000, int(12000 * y)))
+            y = controller.step(x, activity=activity)
+            out[i] = pcm16(12000 * (x if raw else y), limit=32000)
+        if sys.byteorder != 'little':
+            out.byteswap()
         with wave.open(str(path), 'wb') as w:
             w.setnchannels(1)
             w.setsampwidth(2)
