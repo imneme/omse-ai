@@ -54,6 +54,13 @@ OPERANDS = {0x27: 1, 0x34: 2, 0x35: 2, 0x36: 2, 0x8A: 2, 0x91: 2, 0x92: 1}
 # The T80N decodes these as RETN (t80n_mcode.vhd), with its RETN_LSB/RETN_MSB commands on the two pops; ED 4D is
 # RETI, with none. (A Zilog's ED 55..7D are RETN too; floooh's z80.h runs them as RETI, the same but its RETI pin.)
 RETN_OPS = (0x45, 0x55, 0x5D, 0x65, 0x6D, 0x75, 0x7D)
+# The documented ED instructions whose flags the Next's CPU makes its own way (the T80N leaves a Zilog; the core's
+# idle t80n-complete is the T80N with those places fixed, and the diff between them names them): TestT80NFlags.
+T80N_INXR = (0xA2, 0xAA, 0xB2, 0xBA, 0xA3, 0xAB, 0xB3, 0xBB)     # INI IND INIR INDR OUTI OUTD OTIR OTDR
+T80N_CPXR = (0xA1, 0xA9, 0xB1, 0xB9)                             # CPI CPD CPIR CPDR
+T80N_LDAIR = (0x57, 0x5F)                                        # LD A,I  LD A,R
+T80N_INRC = (0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78)     # IN r,(C), IN (C)
+T80N_FLAG_OPS = T80N_INXR + T80N_CPXR + T80N_LDAIR + T80N_INRC
 
 
 # -- the bare Z80 ----------------------------------------------------------------------------------------
@@ -791,6 +798,88 @@ class TestBit(unittest.TestCase):
                 self.assertEqual(cpu.regs()['af'] & 0xFF, want)
 
 
+class TestT80NFlags(unittest.TestCase):
+    """The four other places the Next's CPU leaves a Zilog's flags, from the diff between t80n.vhd and the core's
+    idle t80n_complete.vhd ("with the memptr and xy flags fixes applied"):
+      INI/IND/OUTI/OUTD and repeats: F is the ALU's SUB B,1 (t80n_mcode.vhd M1: BusA B, BusB 1, ALU_Op 0010,
+          Save_ALU, no PreserveC): S Z X Y from the new B, H and C as borrows, V as overflow, N set;
+      CPI/CPD and repeats: X and Y are the byte's bits 3 and 5 (the ALU's CP takes them from BusB);
+      LD A,I and LD A,R: X and Y are left as they were (t80n.vhd's Special_LD sets S Z H P N only);
+      IN r,(C) and IN (C): X and Y are left as they were (its F update sets S Z P H N only).
+    Melissa's Next agreed in all five cells Z80NFLAG asked (sitting 5: INI 22, OUTI 22, CPI BE, LD A,I 00,
+    IN A,(C) 04). Those cells began from F = 00, so "left as they were", and INI's carry, rest on the VHDL; the
+    random cells here begin from any F. Everything else is as with the flag off, tick for tick; off, nothing
+    changes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpus = {True: Bare(z80n=True), False: Bare(z80n=False)}
+
+    def run_one(self, z80n, code, regs, mem, io):
+        cpu = self.cpus[z80n]
+        for a, v in mem.items():
+            cpu.mem[a & 0xFFFF] = v
+        for a, v in io.items():
+            cpu.io[a & 0xFFFF] = v
+        for i, v in enumerate(code):
+            cpu.mem[(regs['pc'] + i) & 0xFFFF] = v
+        cpu.set(regs)
+        ticks = cpu.step()
+        return cpu.regs(), bytes(cpu.mem), ticks
+
+    @staticmethod
+    def want_f(op, f_in, b_in, byte, off_f):
+        """The T80N's F, from what went in (and, for the bits it shares with a Zilog, the flag-off run's F)."""
+        if op in T80N_INXR:
+            b = (b_in - 1) & 0xFF
+            return ((b & 0xA8) | (0x40 if b == 0 else 0) | (0x10 if b_in & 0xF == 0 else 0)
+                    | (0x04 if b_in == 0x80 else 0) | 0x02 | (0x01 if b_in == 0 else 0))
+        if op in T80N_CPXR:
+            return (off_f & ~0x28) | (byte & 0x28)
+        return (off_f & ~0x28) | (f_in & 0x28)                  # LD A,I/R, IN r,(C)
+
+    def test_every_one(self):
+        rng = random.Random(64)
+        for k in range(4000):
+            op = rng.choice(T80N_FLAG_OPS)
+            regs = fill_regs(rng, pc=0x8000)
+            regs['iff2'] = rng.randrange(2)
+            if rng.randrange(4) == 0:                           # the edges: B = 00, 01, 80, 10h; BC = 1
+                regs['bc'] = (rng.choice((0x00, 0x01, 0x80, 0x10, 0x81)) << 8) | rng.randrange(256)
+            if rng.randrange(8) == 0:
+                regs['bc'] = 1
+            if 0x7FF0 <= regs['hl'] <= 0x8010:
+                continue                                        # (not over the code)
+            byte = rng.randrange(256)
+            code = [0xED, op]
+            on, mem_on, t_on = self.run_one(True, code, regs, {regs['hl']: byte}, {})
+            off, mem_off, t_off = self.run_one(False, code, regs, {regs['hl']: byte}, {})
+            label = f'ED {op:02X} af={regs["af"]:04X} bc={regs["bc"]:04X} byte={byte:02X}'
+            self.assertEqual(t_on, t_off, label)
+            self.assertEqual(mem_on, mem_off, label)
+            for r in REGS:
+                if r != 'af':
+                    self.assertEqual(on[r], off[r], f'{label}: {r}')
+            self.assertEqual(on['af'] >> 8, off['af'] >> 8, f'{label}: A')
+            want = self.want_f(op, regs['af'] & 0xFF, regs['bc'] >> 8, byte, off['af'] & 0xFF)
+            self.assertEqual(on['af'] & 0xFF, want, f'{label}: F with the Z80N')
+
+    def test_the_photographs_cells(self):
+        """Z80NFLAG's five cells as Melissa's Next printed them (the T80N column), and as a Zilog (the flag off)."""
+        cells = (  # code, regs, mem, io, T80N's F, a Zilog's F
+            ([0xED, 0xA2], {'hl': 0xBB90, 'bc': 0x253B, 'af': 0x0000}, {}, {0x253B: 0xD0}, 0x22, 0x33),
+            ([0xED, 0xA3], {'hl': 0xBBF0, 'bc': 0x253B, 'af': 0x0000}, {0xBBF0: 0x90}, {}, 0x22, 0x33),
+            ([0xED, 0xA1], {'hl': 0xBBA0, 'bc': 0x0002, 'af': 0x1000}, {0xBBA0: 0x28}, {}, 0xBE, 0xB6),
+            ([0xED, 0x57], {'ir': 0x2800, 'af': 0x0000}, {}, {}, 0x00, 0x28),
+            ([0xED, 0x78], {'bc': 0x253B, 'af': 0x0000}, {}, {0x253B: 0x28}, 0x04, 0x2C))
+        for code, regs, mem, io, t80n, zilog in cells:
+            for z80n, want in ((True, t80n), (False, zilog)):
+                with self.subTest(code=f'ED {code[1]:02X}', z80n=z80n):
+                    r = {**fill_regs(random.Random(65)), **regs, 'pc': 0x8000}
+                    got, _, _ = self.run_one(z80n, code, r, mem, io)
+                    self.assertEqual(got['af'] & 0xFF, want)
+
+
 class TestOthersUnchanged(unittest.TestCase):
     """The flag takes only the Z80N's own opcodes: every other instruction (unprefixed, CB, DD, FD, ED) runs
     exactly as with the flag off, tick for tick."""
@@ -801,11 +890,11 @@ class TestOthersUnchanged(unittest.TestCase):
         codes = [[op] for op in range(256) if op not in (0xCB, 0xDD, 0xED, 0xFD)]
         codes += [[pre, op] for pre in (0xCB, 0xDD, 0xED, 0xFD) for op in range(256)]
         for code in codes:
-            if code[0] == 0xED and (code[1] in Z80N_T or code[1] in RETN_OPS):
-                continue
+            if code[0] == 0xED and (code[1] in Z80N_T or code[1] in RETN_OPS or code[1] in T80N_FLAG_OPS):
+                continue                        # (T80N_FLAG_OPS: their flags are TestT80NFlags's)
             regs = fill_regs(rng)
             code = code + [rng.randrange(256) for _ in range(3)]
-            if code[0] in (0xDD, 0xFD) and code[1] == 0xED and code[2] in Z80N_T:
+            if code[0] in (0xDD, 0xFD) and code[1] == 0xED and (code[2] in Z80N_T or code[2] in T80N_FLAG_OPS):
                 code[2] = 0x00                  # DD ED op is ED op (below), so not one of the others
             if code[0] == 0xCB and 0x40 <= code[1] < 0x80 and code[1] & 7 == 6:
                 continue                        # BIT n,(HL): the Z80N's X and Y (TestBit)

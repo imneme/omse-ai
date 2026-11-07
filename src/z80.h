@@ -399,7 +399,7 @@ typedef struct {
     uint16_t af2, bc2, de2, hl2; // shadow register bank
     uint8_t im;
     bool iff1, iff2;
-    bool z80n;          // the ZX Spectrum Next's Z80N: its extra ED instructions (off: a Zilog Z80)
+    bool z80n;          // the ZX Spectrum Next's Z80N: its extra ED instructions and its flags (off: a Zilog Z80)
     uint16_t ran_step;  // the decoder step the last tick ran (for z80_mcycle_end)
 } z80_t;
 
@@ -665,7 +665,9 @@ static inline uint8_t _z80_cp_flags(uint8_t acc, uint8_t val, uint32_t res) {
 }
 
 static inline uint8_t _z80_sziff2_flags(z80_t* cpu, uint8_t val) {
-    return (cpu->f & Z80_CF) | _z80_sz_flags(val) | (val & (Z80_YF|Z80_XF)) | (cpu->iff2 ? Z80_PF : 0);
+    // LD A,I / LD A,R: the Z80N (the Next's T80N) leaves X and Y as they were (t80n.vhd's Special_LD)
+    const uint8_t xy = cpu->z80n ? cpu->f : val;
+    return (cpu->f & Z80_CF) | _z80_sz_flags(val) | (xy & (Z80_YF|Z80_XF)) | (cpu->iff2 ? Z80_PF : 0);
 }
 
 static inline void _z80_add8(z80_t* cpu, uint8_t val) {
@@ -876,12 +878,23 @@ static inline bool _z80_cpi_cpd(z80_t* cpu, uint8_t val) {
     }
     if (res & 2) { f |= Z80_YF; }
     if (res & 8) { f |= Z80_XF; }
+    if (cpu->z80n) {    // the Z80N (the Next's T80N): its ALU's CP takes X and Y from the byte
+        f = (f & ~(Z80_YF|Z80_XF)) | (val & (Z80_YF|Z80_XF));
+    }
     if (cpu->bc) { f |= Z80_VF; }
     cpu->f = f;
     return (cpu->bc != 0) && !(f & Z80_ZF);
 }
 
+// INI/IND/OUTI/OUTD on the Z80N (the Next's T80N): F is its ALU's SUB B,1 (t80n_mcode.vhd M1: ALU_Op 0010 on
+// B and 1, Save_ALU, no PreserveC): S Z Y X from the new B, H and C as borrows, V as overflow, N set.
+static inline uint8_t _z80n_bdec_flags(uint8_t b) {
+    return _z80_sz_flags(b) | (b & (Z80_YF|Z80_XF)) | Z80_NF | (((b & 0xF) == 0xF) ? Z80_HF : 0) |
+           ((b == 0x7F) ? Z80_VF : 0) | ((b == 0xFF) ? Z80_CF : 0);
+}
+
 static inline bool _z80_ini_ind(z80_t* cpu, uint8_t val, uint8_t c) {
+    if (cpu->z80n) { cpu->f = _z80n_bdec_flags(cpu->b); return cpu->b != 0; }
     const uint8_t b = cpu->b;
     uint8_t f = _z80_sz_flags(b) | (b & (Z80_XF|Z80_YF));
     if (val & Z80_SF) { f |= Z80_NF; }
@@ -893,6 +906,7 @@ static inline bool _z80_ini_ind(z80_t* cpu, uint8_t val, uint8_t c) {
 }
 
 static inline bool _z80_outi_outd(z80_t* cpu, uint8_t val) {
+    if (cpu->z80n) { cpu->f = _z80n_bdec_flags(cpu->b); return cpu->b != 0; }
     const uint8_t b = cpu->b;
     uint8_t f = _z80_sz_flags(b) | (b & (Z80_XF|Z80_YF));
     if (val & Z80_SF) { f |= Z80_NF; }
@@ -904,6 +918,10 @@ static inline bool _z80_outi_outd(z80_t* cpu, uint8_t val) {
 }
 
 static inline uint8_t _z80_in(z80_t* cpu, uint8_t val) {
+    if (cpu->z80n) {    // IN r,(C) on the Z80N (the Next's T80N) leaves X and Y as they were
+        cpu->f = (cpu->f & (Z80_CF|Z80_YF|Z80_XF)) | (_z80_szp_flags[val] & ~(Z80_YF|Z80_XF));
+        return val;
+    }
     cpu->f = (cpu->f & Z80_CF) | _z80_szp_flags[val];
     return val;
 }
@@ -980,6 +998,10 @@ static inline uint8_t _z80_srl(z80_t* cpu, uint8_t val) {
 // from reading it; tests/test_z80n.py holds every instruction to a reference written from the same source,
 // tick by tick. Where the VHDL and the documentation disagree this follows the VHDL (marked "VHDL:"); a probe
 // on a real Next decides. The Z80N instructions leave WZ (MEMPTR) alone: the T80N has none to copy.
+// The flag also gives five documented instructions the T80N's undocumented flags where it leaves a Zilog (the
+// places the core's idle t80n_complete.vhd fixes): BIT's X and Y (_z80_cb_action), INI/IND/OUTI/OUTD and
+// repeats (_z80n_bdec_flags), CPI/CPD and repeats, LD A,I/R and IN r,(C) (their flag helpers). Melissa's Next
+// agreed in every place it was asked (Z80NTIME, LDPIRX2, Z80NFLAG).
 
 // the first step of each Z80N instruction, by its opcode after ED (0: not one)
 static inline uint16_t _z80n_first_step(uint8_t op) {
