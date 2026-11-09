@@ -225,6 +225,7 @@ Code called from BASIC with `USR` must **preserve the alternate HL'**, which the
 ## Optional tools
 
 - **Pillow** is required (every picture). `pip install Pillow`.
+- **numpy** is required for the Next's pictures and sound (`Next.image`, `frame9_array`, `audio`) and by several test modules. `pip install numpy`.
 - **speccy-basic** (`pip install spectrum-basic`), Melissa O'Neill's BASIC toolkit, for `.bas` files: the `bas` command and the `basic`, `lint` and `tapbas` steps. It reads classic numbered BASIC and its own enhanced dialect (labels, `REPEAT`, multi-line `IF`), which it turns into classic numbered lines.
 - **tzxtools** (`pip install tzxtools`) for `zxdis.py`, and for looking inside tapes: `tzxls` lists blocks, `tzxcat -B` lists BASIC, `tzxcat -S` turns a SCREEN$ into a PNG.
 - **pasmo** for the `asm` step. It isn't packaged by Homebrew; build it from source, which takes a minute and needs only a C++ compiler:

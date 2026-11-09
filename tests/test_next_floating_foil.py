@@ -22,7 +22,6 @@ where a held IN released at the end of hc 255 latches as hc becomes 256: attribu
 CPU's edge, made from the same CLK_7 edge that steps hc, sees the counter from before it (a design meeting hold
 timing). If that's ever ruled the other way, test_line_end only needs its expected byte changed to FF.
 """
-import os
 import sys
 import unittest
 from pathlib import Path
@@ -32,8 +31,6 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import floating_ref as R                                # noqa: E402
 
-os.environ.setdefault('OMSE_AI_ROMS', str(Path.home() / 'omse-ai' / 'roms'))
-os.environ.setdefault('OMSE_AI_NEXT_ROMS', str(Path.home() / 'next-build/sources/tbblue/machines/next'))
 
 
 def _machine():
