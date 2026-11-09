@@ -105,6 +105,7 @@ curl -fLO "$base/48.rom" && curl -fLO "$base/128-0.rom" && curl -fLO "$base/128-
 | `next.py` | the `Next` class: a Spectrum Next (core 3.02.02) for Python, over `src/nextcore.cpp` |
 | `src/nextcore.cpp`, `src/next_*.h`, `src/next_dma_bus.inc` | the Next itself: the 28 MHz clock, the ULA and contention, memory and ports, the registers, video layers and sprites, the copper, CTC, DMA, UARTs, I2C and RTC, audio, divMMC and the multiface, written from the core's VHDL with line citations |
 | `docs/next-sources.md` | where the Next's distribution and VHDL come from, for the tests that use them |
+| `docs/hackers-guide.md` | *Under the Rubber Keys*: a hacker's guide to both machines, what's load-bearing and what not to disturb, with line references kept current by retrace |
 | `tools/mkfat.py` | SD-card images for the divMMC: FAT16 or FAT32 from a folder, and reading them back |
 | `docs/contention.md` | contention and the floating bus: the rule, its sources, how it's tested, and what's finessed |
 | `docs/divmmc.md` | the divMMC: how to drive it, the hardware it's held to, with sources, and its limits |
