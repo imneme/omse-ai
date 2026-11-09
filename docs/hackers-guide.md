@@ -1461,11 +1461,10 @@ The places a careful change is most likely to go wrong, gathered from the sectio
   - **SDPROBE**: a tape that measured a real SD card's timing on a real divMMC (`docs/divmmc.md:86`, `src/sdcard.h:22-24`);
   - **"The Card Is the Lever"**: the night the Next's SPI timing rule was found on the real machine (`tests/test_next_spi.py:8-9`).
 - **Breakspace, Shock.** Demos used as acceptance tests for the classic machine's floating bus and contention (`docs/contention.md:54`, `docs/contention.md:87`).
-- **TX-1696, CHEZ, Barleycorn, a demo.** Programs whose behaviour on the real machine exposed or confirmed something:
+- **TX-1696, CHEZ, Barleycorn.** Programs whose behaviour on the real machine exposed or confirmed something:
   - TX-1696: DMA'd sprite patterns (`tests/test_next_dma.py:691`);
   - CHEZ: HDMI audio (`tests/test_next_sound.py:451`);
   - Barleycorn: the films `examples/film.py` was written for;
-  - a demo: a speed measurement (`tests/test_next_image.py:4`).
 
 ### Testing words
 
@@ -1596,4 +1595,4 @@ The headers are `src/nextcore.cpp:3-6`, `src/next_dma.h:5`, `src/next_audio.h:1`
 
 Where the VHDL, the documents and the hardware disagreed or were silent, Melissa O'Neill ruled. Where a reading of the VHDL could be tested, she ran probe tapes on her real Next and photographed the screens, and the photographs decided.
 
-Melissa O'Neill holds the copyright and answers for the project, and the code is released under the MIT licence (`LICENSE.txt:3`, `README.md:127`). The repository records that this work was done while Fern inhabited Claude Opus 5.5 (`README.md:129`, `docs/divmmc.md:118`), except the audio bias controller, done while she inhabited gpt-6-astra-900k (`docs/audio-bias.md:116`). The files I read don't say which model the Next's crew inhabited.
+Melissa O'Neill holds the copyright and answers for the project, and the code is released under the MIT licence (`LICENSE.txt:3`, `README.md:127`). The repository records that this work was done while Fern inhabited Claude Opus 5.5 (`README.md:129`, `docs/divmmc.md:118`), except the audio bias controller, done while she inhabited gpt-6-astra-900k (`docs/audio-bias.md:116`). The Next's crew inhabited Claude Opus 5.5 too: no file says so, but each of their commits' trailers records it (`git log --format=%(trailers)`).
