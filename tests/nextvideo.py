@@ -6,10 +6,10 @@ imports the machine. Give a `Video` the same register writes, port writes and me
 machine, and `frame9()` returns the 704 x 288 grid of 9-bit colours the mixer would put out for a static
 frame (no mid-frame changes; those need the beam).
 
-Citations (paths under next-build/sources/fpga-30202/cores/zxnext/):
+Citations (paths under core 3.02.02's cores/zxnext/; docs/next-sources.md):
   zxnext:N   src/zxnext.vhd, line N             ula:N    src/video/zxula.vhd
   l2:N       src/video/layer2.vhd               ulat:N   src/video/zxula_timing.vhd
-  vdp:N      next-build/sources/tbblue/src/firmware/loader/src/vdp.c (the boot loader's palettes)
+  vdp:N      src/firmware/loader/src/vdp.c in the distribution (the boot loader's palettes)
 The hardware is by Alvin Albrecht, Victor Trucco, Fabio Belavenuto and others (GPL v3); the loader by
 Victor Trucco and Fabio Belavenuto. This file describes them and copies none of their code.
 

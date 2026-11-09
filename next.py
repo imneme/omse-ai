@@ -8,8 +8,8 @@ none).
     from next import Next
     zx = Next(timing='p3', hz=50, speed=0, boot='bare')
 
-Layer 1 so far: the clock, the counters, the ULA interrupt (pulse mode), memory and the MMU, the Next registers,
-ports 0x243B/0x253B, the logs. boot='fast' comes with a later layer.
+boot='bare' is the power-on state; boot='fast' is the state NextZXOS finds after the firmware's handover, built from
+the distribution's files (docs/next-sources.md). docs/hackers-guide.md maps the whole machine.
 """
 import ctypes
 import os

@@ -51,7 +51,7 @@ level. This fixes that upstream bug without a second filter. It can
 change the phase of late-started captures compared with the old paused
 chip, but does not change the oscillator rates or volume table.
 
-## Native Next path (on the next branch)
+## Native Next path
 
 `src/audio_bias.h` is the C++ double-precision implementation beside the
 resampler in `src/next_audio.h`. It runs once per output sample, not at
@@ -97,7 +97,7 @@ Tests cover actual idle and held-high recordings, cosine curves, resume
 mid-return, 26.71 Hz bass, one-LSB material, pauses of 10/50/250/2000 ms,
 separate stereo state, raw resampling checked against mixer captures,
 block-size invariance and unchanged prefixes when the future changes.
-The native branch's `tests/test_audio_conformance.py` compiles a small
+`tests/test_audio_conformance.py` compiles a small
 probe of the same header used by the emulator and compares every sample
 and state with the Python reference at 44.1, 48 and 96 kHz. Its receipt
 is `tests/out/audio/conformance.json`.

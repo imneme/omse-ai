@@ -25,7 +25,7 @@ struct NextDma {
     uint8_t a_mode = 0, b_mode = 0;     // b5:4: 00 decrement, 01 increment, 1x fixed
     uint8_t a_tim = 1, b_tim = 1;       // the timing byte's b1:0: 00 4 clocks, 01 3, 10 2, 11 4
     uint8_t presc = 0;                  // port B's prescaler (WR2's second follow-on byte)
-    uint8_t mode4 = 1;                  // WR4 b6:5: 00 byte, 01 continuous, 10 burst (only 10 is ever tested)
+    uint8_t mode4 = 1;                  // WR4 b6:5: 00 byte, 01 continuous, 10 burst (only 10 is ever looked at)
     bool ce_wait = false, auto_restart = false;
     uint8_t rmask = 0x7F;
     uint8_t reg_temp = 0;

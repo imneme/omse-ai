@@ -6,7 +6,7 @@
 // and through it to the VHDL. Nothing here is copied from the VHDL: it's a model of what the reference says it does.
 //
 // A machine of its own beside zxcore.cpp's 48K/128 (which this file doesn't touch). It shares z80.h (whose
-// implementation lives in zxcore.cpp's translation unit) and, later, ay38910.h and sdcard.h.
+// implementation lives in zxcore.cpp's translation unit) and sdcard.h; the Next's AYs are next_audio.h's own.
 //
 // Time: one tick is one cycle of the 28 MHz master clock (ref §0.1). The CPU clock is made from it: at 3.5 MHz
 // phase-locked to the ULA's counter hc_ula (a T-state is two hc_ula counts; contention holds the clock high for
@@ -17,10 +17,12 @@
 // Memory: a page table, one read and one write pointer per 8K slot, rebuilt whenever something that affects the map
 // changes (ref §3). 2 MB of SRAM; bank 5 (16K) and the first 8K of bank 7 in block RAM (ref §3.11).
 //
-// Layer 1 (this file, so far): the clock, the counters for every timing, the ULA interrupt in pulse mode, memory
-// with the boot ROM, config mode, the MMU and ROM selection by machine type, the Next registers (reset values
-// generated from machine/nextregs.tsv), ports 0x243B/0x253B, the logs. Contention, the other ports, the screen, the
-// SPI master and the fast boot are the next layers (machine-build-notes.md).
+// What's here: the clock and the counters for every timing; contention and the floating bus; memory with the boot
+// ROM, config mode, the MMU, ROM selection, Layer 2's map, divMMC and the multiface; every port; the Next registers
+// (reset values generated from the survey's nextregs.tsv by tools/gen_nextregs.py); the interrupt controller, the
+// copper and the CTC; the screen (the ULA and its modes, LoRes, Layer 2, the tilemap, sprites and the compositor);
+// the SPI master and the SD card; the expansion bus; the fast boot; and the glue for next_dma.h, next_serial.h and
+// next_audio.h. It was built in layers, each with its tests; docs/hackers-guide.md is the map.
 
 #include "next_audio.h"                // the sound (Slide Fern): generators, DACs, beeper, mixer
 #include "next_dma.h"                  // the zxnDMA (Kelp Fern)
@@ -1214,9 +1216,9 @@ uint8_t io_read(ZXN& z, uint16_t port) {
         if (dev >= 0) return (uint8_t)dev;                            // the device's IORQULA takes FE (zxnext:2183)
         uint8_t v = 0x1F;
         for (int r = 0; r < 8; r++) if (!(port & (0x100 << r))) v &= ~z.keys[r] & 0x1F;
-        v |= 0xE0;                                                    // (EAR in, bit 6: later)
-        if (z.bus_eff_en && (z.nr[0x8A] & 1)) {                       // FE propagated: the bus's data ANDed in, and
-            if ((z.nr[0x81] & 0x40) && !(port & 0xF0)) v = 0xFF;      // NR 0x81 b6's override on 00-0E (3411-3425)
+        v |= 0xE0;                                                    // bits 7:5 read 1 (EAR in, bit 6, isn't modelled)
+        if (z.bus_eff_en && (z.nr[0x8A] & 1)) {                       // FE propagated: NR 0x81 b6's override on 00-0E
+            if ((z.nr[0x81] & 0x40) && !(port & 0xF0)) v = 0xFF;      // (3411-3425); the bus's data isn't ANDed in
         }
         return v;
     }
@@ -1949,7 +1951,7 @@ bool mf_io(ZXN& z, uint16_t port, bool wr, uint8_t* out) {
     return answered;
 }
 
-// ---- the AYs (turbosound.vhd, ym2149.vhd): register files only, no sound yet. Reset leaves every register 0 but the
+// ---- the AYs (turbosound.vhd, ym2149.vhd): their register files (next_audio.h makes the sound). Reset leaves every register 0 but the
 // mixer (R7) at 0xFF, register 0 selected and AY 0 chosen (ym2149:166-187; turbosound:80-86).
 void ay_reset(ZXN& z) {
     memset(z.ay_reg, 0, sizeof z.ay_reg);
