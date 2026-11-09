@@ -81,6 +81,17 @@ class BiasContract(unittest.TestCase):
         xs = [-10, 10] * 100
         self.assertEqual(p.process(xs), xs)
 
+    def test_active_beeper_keeps_existing_filter_response(self):
+        p = BiasController(44100, pole=0.995, initial=-1)
+        previous, y = -1.0, 0.0
+        for i in range(10000):
+            x = 1.0 if i % 84 < 42 else -1.0
+            y = x - previous + 0.995 * y
+            previous = x
+            got = p.step(x)
+            if i > p.attack:
+                self.assertAlmostEqual(got, y, places=11)
+
     def test_edge_hint_avoids_false_idle_from_averaged_wave(self):
         p = BiasController(1000, initial=0)
         for _ in range(600):

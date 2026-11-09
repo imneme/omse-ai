@@ -143,7 +143,7 @@ def _load_lib():
         'zx_frame': ([P], U64), 'zx_render_static': ([P], None),
         'zx_frame_pos': ([P], I), 'zx_frame_len': ([P], I),
         'zx_make_128': ([P, ctypes.c_char_p, ctypes.c_char_p], None), 'zx_model': ([P], I),
-        'zx_clock': ([P], I), 'zx_paging': ([P], I), 'zx_bank': ([P, I], P),
+        'zx_clock': ([P], I), 'zx_paging': ([P], I), 'zx_bank': ([P, I], P), 'zx_poke': ([P, I, I], None),
         'zx_ay_record': ([P, I], None), 'zx_ay_rate': ([], I),
         'zx_ay_samples_len': ([P], I), 'zx_ay_samples_get': ([P, ctypes.POINTER(ctypes.c_float)], None),
         'zx_ay_samples_clear': ([P], None), 'zx_ay_log_len': ([P], I),
@@ -166,7 +166,7 @@ def _load_lib():
         'zx_sd_log_len': ([P], I), 'zx_sd_log_get': ([P, ctypes.POINTER(ctypes.c_uint64)], None),
         'zx_sd_log_clear': ([P], None),
         'zx_spi_gap': ([P, I], None), 'zx_spi_early': ([P], U64), 'zx_spi_early_at': ([P, I], I),
-        'zx_contention': ([P, I], None), 'zx_contention_on': ([P], I), 'zx_stalled': ([P], U64),
+        'zx_floating_bus': ([P, I], None), 'zx_contention': ([P, I], None), 'zx_contention_on': ([P], I), 'zx_stalled': ([P], U64),
     }
     for name, (args, res) in sigs.items():
         f = getattr(lib, name)
@@ -262,8 +262,7 @@ class Speccy:
         return self.mem[a] | (self.mem[(a + 1) & 0xFFFF] << 8)
 
     def poke(self, a, v):
-        if a >= 0x4000:
-            self.mem[a] = v & 0xFF
+        self.lib.zx_poke(self.z, a, v & 0xFF)       # as the CPU's write would land (128 mirrors)
 
     def read(self, a, n):
         return bytes(self.mem[a:a + n])
@@ -590,6 +589,11 @@ class Speccy:
         return bytes(buf[:n])
 
     # -- contention -----------------------------------------------------------
+    def floating_bus(self, on=True):
+        """Reads from a port nobody answers see what the ULA is fetching (on by
+        default, as a real 48K or 128): docs/contention.md says how and when."""
+        self.lib.zx_floating_bus(self.z, 1 if on else 0)
+
     def contention(self, on=True):
         """The ULA's contention, as a real 48K or 128 has it: on by default. While
         the ULA reads the screen, the CPU waits to reach contended memory
@@ -713,8 +717,8 @@ class Speccy:
     def spi_gap(self, clocks=16):
         """The Spectrum Next's SPI rule (found by Tally on a real Next): a
         transfer takes `clocks` of the CPU's own clock (16 on the Next), and an
-        access to port EB that comes sooner starts nothing and reads the last
-        finished byte again. 0 (the default) is a classic divMMC, where every
+        access to port EB that comes sooner starts nothing and reads the same
+        byte as the access before it. 0 (the default) is a classic divMMC, where every
         access starts a transfer at once. `spi_early` counts the early ones."""
         self.lib.zx_spi_gap(self.z, clocks)
 

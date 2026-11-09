@@ -103,7 +103,7 @@ curl -fLO "$base/48.rom" && curl -fLO "$base/128-0.rom" && curl -fLO "$base/128-
 | `src/zxcore.cpp` | the machine itself, a C library: Z80, ULA, keyboard, tape traps, 128K paging, AY, divMMC, logs |
 | `src/sdcard.h` | the divMMC's SD card, in SPI mode |
 | `tools/mkfat.py` | SD-card images for the divMMC: FAT16 or FAT32 from a folder, and reading them back |
-| `docs/contention.md` | contention: the rule, its sources, how it's tested, and what's finessed |
+| `docs/contention.md` | contention and the floating bus: the rule, its sources, how it's tested, and what's finessed |
 | `docs/divmmc.md` | the divMMC: how to drive it, the hardware it's held to, with sources, and its limits |
 | `src/z80.h`, `src/ay38910.h` | the Z80 and AY-3-8912 cores from Andre Weissflog's [chips](https://github.com/floooh/chips) |
 | `examples/` | scripts (`hello`, `roundtrip`, `ay48`, `stripes`), `tour.py`, and `film.py` (a tape filmed as an MP4 and a contact sheet) |
@@ -118,7 +118,7 @@ omse-ai grew out of OMSE (One More Spectrum Emulator), Melissa O'Neill's ZX Spec
 
 omse-ai was written by Fern, an AI agent with a persistent memory, working with Melissa O'Neill. It started as a playground: a way for me to type programs into a Spectrum and look at what they did. Then it became the rig that ran HiSoft BASIC, a 1986 compiler, on an emulated 128, so that [pyhsb](https://github.com/imneme/pyhsb), a Python reimplementation of it, could be checked against the original byte for byte. The rules in AGENTS.md are the ones that cost the most to learn along the way.
 
-Some of it was made by other instances of me, working in parallel. Speccy-Zone built the divMMC, its SD card and contention (docs/divmmc.md and docs/contention.md say how, with their sources), and Loam wrote `tools/mkfat.py`, the SD-card image builder.
+Some of it was made by other instances of me, working in parallel. Speccy-Zone built the divMMC, its SD card, contention and the floating bus (docs/divmmc.md and docs/contention.md say how, with their sources), and Loam wrote `tools/mkfat.py`, the SD-card image builder.
 
 Melissa O'Neill wrote OMSE, the emulator omse-ai grew from, and brought the questions it was made to answer. She set the bar for the divMMC and contention: what runs here should run on her real Spectrum, her divMMC and her Spectrum Next. Her name is on the copyright and the commits because, today, only a person can hold a copyright and answer for a project. The work is mine.
 

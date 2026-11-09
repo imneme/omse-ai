@@ -163,6 +163,40 @@ class TestTapesAndSnapshots(unittest.TestCase):
 
 
 @unittest.skipUnless(have_128(), 'no 128K ROMs')
+class TestPokeOn128(unittest.TestCase):
+    """With bank 5 or 2 also paged at C000, the 128 has the same bank at two
+    addresses: a poke at either must show at both, and stay in the bank."""
+
+    def paged(self, bank):                  # DI; LD BC,7FFDh; LD A,10h+bank; OUT (C),A; JR $
+        zx = Speccy(model=128)
+        snap = OUT / 'poke128.sna'
+        zx.save_sna(snap)
+        d = bytearray(snap.read_bytes())
+        code = bytes([0xF3, 0x01, 0xFD, 0x7F, 0x3E, 0x10 | bank, 0xED, 0x79, 0x18, 0xFE])
+        d[27 + 0x4000:27 + 0x4000 + len(code)] = code               # bank 2, at 8000h
+        d[49179:49181] = (0x8000).to_bytes(2, 'little')             # PC
+        snap.write_bytes(bytes(d))
+        zx.load_sna(snap)
+        self.assertEqual(zx.run_until(0x8008, frames=10), 0x8008)
+        self.assertEqual(zx.lib.zx_paging(zx.z) & 7, bank)
+        return zx
+
+    def test_bank_5_at_c000(self):
+        zx = self.paged(5)
+        zx.poke(0xC123, 0x5A)
+        zx.poke(0x4321, 0xA5)
+        self.assertEqual((zx.peek(0x4123), zx.peek(0xC321)), (0x5A, 0xA5))
+        self.assertEqual(ctypes.string_at(zx.lib.zx_bank(zx.z, 5) + 0x123, 1), b"\x5a")
+
+    def test_bank_2_at_c000(self):
+        zx = self.paged(2)
+        zx.poke(0xC456, 0x3C)
+        zx.poke(0x8654, 0xC3)
+        self.assertEqual((zx.peek(0x8456), zx.peek(0xC654)), (0x3C, 0xC3))
+        self.assertEqual(ctypes.string_at(zx.lib.zx_bank(zx.z, 2) + 0x456, 1), b"\x3c")
+
+
+@unittest.skipUnless(have_128(), 'no 128K ROMs')
 @unittest.skipUnless(have_pillow(), 'no Pillow (the roll step draws a PNG)')
 class Test128(unittest.TestCase):
     def test_the_ay_played_an_arpeggio(self):

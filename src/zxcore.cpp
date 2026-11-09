@@ -130,6 +130,7 @@ struct ZX {
 
     // contention (docs/contention.md): on, where it starts, and the tracking it needs
     bool contention = true;
+    bool floating = true;         // unanswered port reads see the ULA's fetches (docs/contention.md)
     int cont_start = 14335;   // T-states after INT goes up: 14335 on a 48K, 14361 on a 128
     bool prev_mreq = false, prev_io = false;
     int io_phase = 0;
@@ -327,13 +328,14 @@ static uint8_t ay_read(ZX& z, uint16_t addr) {
     return AY38910_GET_DATA(pins);
 }
 
-// The Next's rule (spi_gap clocks a transfer). The byte in flight has landed by the time the CPU latches
-// an access's data if the access began at least spi_gap - 1 clocks after it; a new transfer starts only
-// at spi_gap or more (spi_master begins on its last state or when idle).
+// The Next's rule (spi_gap clocks a transfer). spi_master loads its read register the clock after its
+// last state, so the byte in flight has landed by the time the CPU latches an access's data only if the
+// access comes spi_gap or more clocks after it, which is also when a new transfer can start (on the last
+// state or when idle). Sooner, it starts nothing and reads the last landed byte again.
 static uint8_t spi_gap_access(ZX& z, uint8_t mosi, bool rd) {
     uint64_t now = z.t - z.stalled;
     uint64_t dt = now - z.spi_begin;
-    if (dt + 1 >= (uint64_t)z.spi_gap) z.spi_done = z.div_spi;
+    if (dt >= (uint64_t)z.spi_gap) z.spi_done = z.div_spi;
     uint8_t v = z.spi_done;
     if (dt >= (uint64_t)z.spi_gap) {
         z.div_spi = z.sd.xfer(rd ? 0xFF : mosi, (z.div_cs & 3) == 2);
@@ -348,7 +350,9 @@ static uint8_t spi_gap_access(ZX& z, uint8_t mosi, bool rd) {
     return v;
 }
 
-static uint8_t io_read(ZX& z, uint16_t addr) {
+static uint8_t floating_bus(ZX& z, uint16_t addr);
+
+static uint8_t io_read_dev(ZX& z, uint16_t addr) {
     if ((addr & 1) == 0) {  // ULA: keyboard (+ EAR on bit 6)
         uint8_t v = 0xBF;
         uint8_t rows = ~(addr >> 8);
@@ -367,7 +371,16 @@ static uint8_t io_read(ZX& z, uint16_t addr) {
         return v;
     }
     if ((addr & 0xE0) == 0) return z.kempston;  // Kempston joystick, 0x1F
-    return 0xFF;
+    return floating_bus(z, addr);               // nobody answers
+}
+
+// The 128's quirk (as Fuse has it, periph.c readport): an IN from any port that
+// decodes as 7FFD (A15 and A1 low) also writes the byte it read into the paging
+// register, as an OUT would (and as an OUT would, not once it's locked).
+static uint8_t io_read(ZX& z, uint16_t addr) {
+    const uint8_t v = io_read_dev(z, addr);
+    if (z.model == 128 && (addr & 0x8002) == 0) write_7ffd(z, v);
+    return v;
 }
 
 static void io_write(ZX& z, uint16_t addr, uint8_t v) {
@@ -511,13 +524,50 @@ static inline bool contended(const ZX& z, uint16_t a) {
 // The ULA's delay for a CPU T-state that wants a contended address now: 6, 5,
 // 4, 3, 2, 1, 0, 0 by position in each 8 T-states of the first 128 T of each of
 // the 192 screen lines, counted from cont_start T-states after INT goes up.
-static inline int contend_delay(const ZX& z) {
+// T-states since INT went up, for the T-state the CPU is in now
+static inline int frame_t(const ZX& z) { return z.line * z.t_line + z.cyc - INT_AT; }
+static inline int contend_delay_at(const ZX& z, int t) {
     static const int PATTERN[8] = {6, 5, 4, 3, 2, 1, 0, 0};
-    int rel = z.line * z.t_line + z.cyc - INT_AT - z.cont_start;
+    int rel = t - z.cont_start;
     if (rel < 0) return 0;
     int col = rel % z.t_line;
     if (rel / z.t_line >= 192 || col >= 128) return 0;
     return PATTERN[col & 7];
+}
+static inline int contend_delay(const ZX& z) { return contend_delay_at(z, frame_t(z)); }
+
+// The floating bus: what an IN from a port nobody answers reads, T-states t after
+// INT. In each 8 T of a screen line's first 128 the ULA fetches bitmap, attribute,
+// bitmap + 1, attribute + 1, and leaves four T idle (FFh): Ramsoft's pattern, with
+// the first byte 14338 T after INT on a 48K and 14364 on a 128, as Fuse times it
+// (spectrum.c, tuned on Arkanoid and Sidewize). Anywhere else, FFh.
+static uint8_t floating_byte(ZX& z, int t) {
+    const int u = t - (z.cont_start + 1);
+    if (u < 0) return 0xFF;
+    const int line = u / z.t_line, col = u % z.t_line;
+    if (line >= 192 || col >= 128) return 0xFF;
+    const uint8_t* scr = (z.model == 128 && z.screen7) ? bank_ptr(z, 7) : z.mem + 0x4000;
+    int x = (col >> 3) * 2;
+    switch (col & 7) {
+    case 4: x++; [[fallthrough]];
+    case 2: return scr[((line & 0xC0) << 5) | ((line & 7) << 8) | ((line & 0x38) << 2) | x];
+    case 5: x++; [[fallthrough]];
+    case 3: return scr[0x1800 + (line >> 3) * 32 + x];
+    default: return 0xFF;
+    }
+}
+// Sampled where Fuse samples it (readport): at the start of the I/O cycle's last
+// T-state, after its hold. An IN is served here at its second T-state, so the two
+// after it are counted on, held as contention would hold them (with A0 set, a port
+// whose high byte is contended is checked on every T-state: C:1 x4).
+static uint8_t floating_bus(ZX& z, uint16_t addr) {
+    if (!z.floating) return 0xFF;
+    const bool hc = z.contention && contended(z, addr);
+    int t = frame_t(z) + 1;
+    if (hc) t += contend_delay_at(z, t);
+    t += 1;
+    if (hc) t += contend_delay_at(z, t);
+    return floating_byte(z, t);
 }
 
 // Does the ULA check the T-state the CPU has just shown on its pins?  Memory: a
@@ -905,6 +955,9 @@ void zx_set_kempston(ZX* z, uint8_t v) { z->kempston = v; }
 
 uint8_t* zx_memory(ZX* z) { return z->mem; }
 uint8_t* zx_bank(ZX* z, int b) { return bank_ptr(*z, b & 7); }
+// a write from outside the machine, as the CPU's would land (so a bank paged at
+// two addresses changes at both), but never into the ROM area
+void zx_poke(ZX* z, int a, int v) { if (a >= 0x4000 && a <= 0xFFFF) mem_write(*z, a, v); }
 const uint8_t* zx_framebuffer(ZX* z) { return z->fb; }
 int zx_fb_width(void) { return FB_W; }
 int zx_fb_height(void) { return FB_H; }
@@ -1051,6 +1104,7 @@ int zx_spi_early_at(ZX* z, int k) { return k < 4096 ? (z->spi_early_pc[k] << 8) 
 // Contention: on (the default, as a real machine) or off; and how many T-states
 // the ULA has held the CPU since power-on.
 void zx_contention(ZX* z, int on) { z->contention = on != 0; }
+void zx_floating_bus(ZX* z, int on) { z->floating = on != 0; }
 int zx_contention_on(ZX* z) { return z->contention; }
 uint64_t zx_stalled(ZX* z) { return z->stalled; }
 
