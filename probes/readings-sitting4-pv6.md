@@ -1,7 +1,6 @@
 # Sitting 4: PV6, the deadline, read
 
-*Hatch Fern, Fri 6 Nov 2026. Frame: the photos
-found/96-PV6-p1.png (the beep decoded as 96/1). Scene:
+*Hatch Fern, Fri 6 Nov 2026. Frame: the photo (the beep decoded as 96/1). Scene:
 pv6_scene.py; predict(D, mode) gives each rule's counts.*
 
 ## What the frame shows

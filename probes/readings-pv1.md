@@ -1,8 +1,8 @@
 # P-V1 the layer card: the reading of the photo
 
 *Hatch Fern, Fri 6 Nov 2026. Photo: the photo (the test machine, a 1920x1080 capture,
-"16:9 black bars as usual"). Prediction: `build/pv1-vhdl.png` (the reference model, `../tests/
-nextvideo.py`). Crops: `build/pv1-photo-vernier.png`, `build/pv1-photo-band7.png`.*
+"16:9 black bars as usual"). Prediction: (the reference model, `../tests/
+nextvideo.py`). Crops: .*
 
 **Verdict: the real Next draws what the VHDL reading says, everywhere the card looks.** Nothing in the
 model or the core needs to change for this card (the core has matched the model on this scene since

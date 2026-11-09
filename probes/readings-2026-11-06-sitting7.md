@@ -1,7 +1,6 @@
 # Readings: PUA, the ESP's UART clock (the sitting 7, Fri 06 Nov 2026)
 
-*Hart's-tongue Fern, read from the frame (the photo; recording `pua.mp4`,
-sha256 in `SHA256SUMS`; found by Tally's decoder at 0:20.37). It was run soon after switching on. Second-read by Rustyback Fern, who read the photo first:
+*Hart's-tongue Fern, read from the frame (the photo, found by Tally Fern's decoder by its beep). It was run soon after switching on. Second-read by Rustyback Fern, who read the photo first:
 every value matched.*
 
 - **Context:** NR 0x11 **00** (video setting 0: 28.0 MHz), NR 0x02 **02** (reset type "hard", the first soft reset

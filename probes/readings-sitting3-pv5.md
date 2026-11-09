@@ -1,7 +1,6 @@
 # Sitting 3: PV5, the budget ruler, read
 
-*Hatch Fern, Fri 6 Nov 2026. Frame: the photos
-found/95-PV5-p1.png (1080p HDMI capture; the beep decoded as
+*Hatch Fern, Fri 6 Nov 2026. Frame: the photo (1080p HDMI capture; the beep decoded as
 95/1). Same geometry as sitting 2: paper x 428.5-1460.5, 4.031
 capture px per pixel. Scene: pv5_scene.py; all 128 slots written.*
 

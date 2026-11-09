@@ -1,7 +1,6 @@
 # Readings: the careful tapes, PNM and PCF (the sitting 6, Fri 06 Nov 2026)
 
-*Hart's-tongue Fern, read from the frames (the photo, `72-PCF-p1.png`;
-recording `redzone-tests.mp4`, sha256 in `SHA256SUMS`). Second-read by Rustyback Fern, who transcribed both photos before reading these values: every cell matched. Melissa O'Neill: "Both ran safely (no
+*Hart's-tongue Fern, read from the frames (the photos). Second-read by Rustyback Fern, who transcribed both photos before reading these values: every cell matched. Melissa O'Neill: "Both ran safely (no
 resets or plug-pulling required)."*
 
 ## PNM: D-8 and D-7 as the VHDL says

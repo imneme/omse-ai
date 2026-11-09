@@ -155,18 +155,6 @@ So the values that are safe under both, with the Pi on, are 0x00 and 0x30, and t
 
 **New item for every review:** for each branch that tests a loop variable against a constant, check that the loop can actually reach that value (step, start, end, parity). Likewise check that every displayed field is written on some path that runs.
 
-**allgood (Rill Fern's NEX, ALLGOOD/AG256 and their -R126 variants): passed** (Rustyback, Fri 06 Nov 2026 23:52 PST by `date`). Read whole, and all four rebuilt into scratch with sjasmplus 1.24.0 --zxnext: each image matches its NEX byte for byte.
-
-What I checked, and what I found:
-- **The headers** hold only bank 0, border 7, SP FDFC, PC E000 and "reset the machine state" (no file handle, no extra fields).
-- **Nothing dangerous:** no E7/EB, no RST 8 (the 0xCF bytes are `cell_y`'s address), and no NR 0x03/04/10/11. The only NR 0x02 write is 01, the closing soft reset.
-- **The exit covers what it changes.** It saves MMU 0-5, NR 0x07, 0x12, 0x15, 0x16, 0x17, 0x22, 0x43, 0x69, 0x70, 0x71 and palette entries 0-128. The soft reset covers the clip (zxnext:4898-4901), the palette index, NR 0x43 and IM 2/I. The palette round trip through NR 0x41/0x44 is exact (zxnext:5955, 6859-6860).
-- **README wording:**
-  - "pure Z80", though it uses NEXTREG and OUTINB;
-  - say the exit is a soft reset to NextZXOS's menu;
-  - the film is a cycle plus 308 frames, rendered in omse-ai;
-  - ship the -R126 files and NOTES.md if the paragraph names them.
-
 **New item, for NEX files:** check the header's fields (banks, PC/SP, preserve-registers byte 134, file handle 140-141, entry bank 139), not just the code. And check every claim a README makes about a film or a measurement against its numbers.
 
 **PFB (Speccy-Zone's floating bus against contention): passed** (Rustyback, Sat 07 Nov 2026 02:07 PST by `date`). Read whole, and reassembled: it matches build/Pfb.TAP byte for byte (code 1427).
