@@ -20,7 +20,8 @@ import nextvideo as nv                                  # noqa: E402
 from nextref import setting as ref_setting              # noqa: E402
 
 DIFFS = ROOT / 'tests' / 'out' / 'video-diffs'          # pictures of a failure, beside the classic tests' own
-PROBES = ref_setting('OMSE_AI_NEXT_PROBES')               # the probes' scenes and models (docs/next-sources.md)
+PROBES = (ref_setting('OMSE_AI_NEXT_PROBES') if __import__('os').environ.get('OMSE_AI_NEXT_PROBES')
+          else Path(__file__).resolve().parent.parent / 'probes')   # the probes' scenes and models, shipped in probes/
 NO_PROBES = 'needs the probe scenes: set OMSE_AI_NEXT_PROBES (docs/next-sources.md)'
 
 
