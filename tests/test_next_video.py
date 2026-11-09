@@ -17,8 +17,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import nextvideo as nv                                  # noqa: E402
+from nextref import setting as ref_setting              # noqa: E402
 
-DIFFS = Path.home() / 'next-build/video-diffs'
+DIFFS = ROOT / 'tests' / 'out' / 'video-diffs'          # pictures of a failure, beside the classic tests' own
+PROBES = ref_setting('OMSE_AI_NEXT_PROBES')               # the probes' scenes and models (docs/next-sources.md)
+NO_PROBES = 'needs the probe scenes: set OMSE_AI_NEXT_PROBES (docs/next-sources.md)'
 
 
 def _machine():
@@ -225,9 +228,9 @@ class ModelSense(unittest.TestCase):
     def test_the_model_draws_what_her_next_drew(self):
         """Melissa's photos: PV2's strip stops after sprite 104 (whc 191); PV5's strips after 28, 78 and 104;
         PV6's rows draw 0, 2, 2, 3, 2, 2, 2 small squares (readings-sitting2/3/4)."""
-        probes = Path.home() / 'next-build/probes'
+        probes = PROBES
         if not (probes / 'pv6_scene.py').exists():
-            self.skipTest('needs next-build/probes')
+            self.skipTest(NO_PROBES)
         sys.path.insert(0, str(probes))
         import pv2_model, pv5_model, pv6_model, pv6_scene
         owners = [None] * 320
@@ -704,9 +707,8 @@ class Layer2(VideoCase):
 def pv1_scene():
     """P-V1 (next-build/probes/pv1.asm), the layer card: the same registers, Layer 2 and ULA screen, with the
     copper changing NR 0x15 in the blanking before each 16-line band. Returns (scene, schedule)."""
-    import os
-    rom = Path(os.environ.get('OMSE_AI_ROMS', Path.home() / 'omse-ai/roms')) / '48.rom'
-    font = rom.read_bytes()[0x3D00:0x4000]
+    from speccy import roms_dir                      # $OMSE_AI_ROMS, else roms/ here, as every Speccy() looks
+    font = (roms_dir() / '48.rom').read_bytes()[0x3D00:0x4000]
     s = Scene()
     for n, v in [(0x43, 0x00), (0x40, 0x00), (0x41, 0x00), (0x40, 0x07), (0x41, 0xFF), (0x40, 0x10),
                  (0x41, 0x00), (0x40, 0x11), (0x41, 0x02), (0x40, 0x15), (0x41, 0x1F), (0x40, 0x17),
@@ -1318,9 +1320,9 @@ class ProbeV2(VideoCase):
     model, the per-line strip cut where the line's time runs out (whc 152 on 128K/+3 timing)."""
 
     def test_pv2_sprite_card(self):
-        probes = Path.home() / 'next-build/probes'
+        probes = PROBES
         if not (probes / 'pv2_scene.py').exists():
-            self.skipTest('needs next-build/probes/pv2_scene.py')
+            self.skipTest(NO_PROBES)
         sys.path.insert(0, str(probes))
         import pv2_model as pm
         import pv2_scene as sc
@@ -1350,9 +1352,9 @@ class ProbeV3(VideoCase):
     model, band by band, and the read-backs the probe prints (NR 0x28, NR 0x34, the card's sprite status)."""
 
     def test_pv3_blend_card(self):
-        probes = Path.home() / 'next-build/probes'
+        probes = PROBES
         if not (probes / 'pv3_scene.py').exists():
-            self.skipTest('needs next-build/probes/pv3_scene.py')
+            self.skipTest(NO_PROBES)
         sys.path.insert(0, str(probes))
         import pv3_model as pm
         import pv3_scene as sc
@@ -1383,9 +1385,9 @@ class ProbeV4(VideoCase):
     a bank range past SRAM's end, palette offsets in 640 mode, and a Y scroll past 384 reading bank + 3."""
 
     def test_pv4_layer2_card(self):
-        probes = Path.home() / 'next-build/probes'
+        probes = PROBES
         if not (probes / 'pv4_scene.py').exists():
-            self.skipTest('needs next-build/probes/pv4_scene.py')
+            self.skipTest(NO_PROBES)
         sys.path.insert(0, str(probes))
         import pv4_model as pm
         import pv4_scene as sc
@@ -1413,9 +1415,9 @@ class ProbeV5(VideoCase):
     and 2x, with all 128 slots written, cut where the sprite renderer's line runs out."""
 
     def test_pv5_budget_ruler(self):
-        probes = Path.home() / 'next-build/probes'
+        probes = PROBES
         if not (probes / 'pv5_scene.py').exists():
-            self.skipTest('needs next-build/probes/pv5_scene.py')
+            self.skipTest(NO_PROBES)
         sys.path.insert(0, str(probes))
         import pv5_model as pm
         s = Scene()
@@ -1437,9 +1439,9 @@ class ProbeV6(VideoCase):
     six rows of wide blocks then four 1x sprites, all 128 slots written."""
 
     def test_pv6_deadline_card(self):
-        probes = Path.home() / 'next-build/probes'
+        probes = PROBES
         if not (probes / 'pv6_scene.py').exists():
-            self.skipTest('needs next-build/probes/pv6_scene.py')
+            self.skipTest(NO_PROBES)
         sys.path.insert(0, str(probes))
         import pv6_model as pm
         s = Scene()

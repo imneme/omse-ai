@@ -1,12 +1,13 @@
 # The Spectrum Next: bring your own sources
 
-omse-ai's Spectrum Next (`next.py`, over `src/nextcore.cpp`) needs none of these to build or to run most of its tests. Three kinds of test reach for files that aren't in this repository, and each skips, saying which, when they're missing.
+omse-ai's Spectrum Next (`next.py`, over `src/nextcore.cpp`) needs none of these to build or to run most of its tests. Four kinds of test reach for files that aren't in this repository, and each skips, saying which, when they're missing.
 
 | Setting | What | Needed for |
 |---|---|---|
 | `OMSE_AI_NEXT_ROMS` | the official distribution's `machines/next` folder | `Next(boot='fast')`, which starts NextZXOS from the firmware's handover, and the tests that use it |
 | `OMSE_AI_NEXT_VHDL` | the core 3.02.02 VHDL: its `cores/zxnext` folder | the tests that check the code's citations against the VHDL lines they cite |
 | `OMSE_AI_NEXT_SURVEY` | the folder with `nextregs.tsv` from the survey (see below) | one table check |
+| `OMSE_AI_NEXT_PROBES` | the probe tapes' scenes and models (see below) | the video tests that hold the model to photographs of a real Next |
 
 ## The distribution
 
@@ -34,3 +35,7 @@ Citations in the code and tests, such as `zxnext:5789` or `zxula.vhd:583`, are l
 ## The survey
 
 Tests and comments also cite `§N`: sections of NEXT-MACHINE.md, a cited survey of core 3.02.02 written during the build. It isn't in this repository yet, so those references point outside it, and the one test that reads its register table skips.
+
+## The probes
+
+The Next model was held to a real Next by probe tapes. Each runs a scene on the machine, someone photographs the screen, and the photograph is compared with what the model predicts. Some video tests import those scenes and models (`pv2_scene.py` to `pv6_scene.py`, and their `pvN_model.py`). They aren't in this repository yet either, so those tests skip.

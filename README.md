@@ -30,11 +30,11 @@ The contact sheet above is what `examples/hello.zx` makes: the program typed in,
 
 ## Quick start
 
-You need Python 3.10 or later with Pillow, `make`, and a C++20 compiler. The scripts run whichever `python3` is first on your `PATH`, so a virtual environment is the easy way to give them Pillow:
+You need Python 3.10 or later with Pillow and numpy, `make`, and a C++20 compiler. The scripts run whichever `python3` is first on your `PATH`, so a virtual environment is the easy way to give them both:
 
 ```sh
 cd omse-ai
-python3 -m venv .venv && . .venv/bin/activate && pip install Pillow
+python3 -m venv .venv && . .venv/bin/activate && pip install Pillow numpy
 make                                # builds lib/libzxcore (speccy.py also does it on first use)
 # put the ROMs in roms/: see "Bring your own ROMs" below
 ./speccy.py run examples/hello.zx   # -> out/hello/: a contact sheet, a PNG and a WAV; prints the screen as text
@@ -102,6 +102,9 @@ curl -fLO "$base/48.rom" && curl -fLO "$base/128-0.rom" && curl -fLO "$base/128-
 | `zxdis.py` | Z80 disassembly of the ROM or a file |
 | `src/zxcore.cpp` | the machine itself, a C library: Z80, ULA, keyboard, tape traps, 128K paging, AY, divMMC, logs |
 | `src/sdcard.h` | the divMMC's SD card, in SPI mode |
+| `next.py` | the `Next` class: a Spectrum Next (core 3.02.02) for Python, over `src/nextcore.cpp` |
+| `src/nextcore.cpp`, `src/next_*.h`, `src/next_dma_bus.inc` | the Next itself: the 28 MHz clock, the ULA and contention, memory and ports, the registers, video layers and sprites, the copper, CTC, DMA, UARTs, I2C and RTC, audio, divMMC and the multiface, written from the core's VHDL with line citations |
+| `docs/next-sources.md` | where the Next's distribution and VHDL come from, for the tests that use them |
 | `tools/mkfat.py` | SD-card images for the divMMC: FAT16 or FAT32 from a folder, and reading them back |
 | `docs/contention.md` | contention and the floating bus: the rule, its sources, how it's tested, and what's finessed |
 | `docs/divmmc.md` | the divMMC: how to drive it, the hardware it's held to, with sources, and its limits |

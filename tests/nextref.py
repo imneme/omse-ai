@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 
 
-def _setting(name):
+def setting(name):
     """A folder named by an environment variable, or one that never exists."""
     v = os.environ.get(name)
     return Path(v).expanduser() if v else Path(os.devnull) / name
@@ -27,8 +27,8 @@ def _setting(name):
 
 # For the tests that check citations against the source (docs/next-sources.md): the 3.02.02 core's cores/zxnext
 # folder, and the survey's folder. Without them those tests skip and say which is missing.
-SOURCES = _setting('OMSE_AI_NEXT_VHDL')
-SURVEY = _setting('OMSE_AI_NEXT_SURVEY')
+SOURCES = setting('OMSE_AI_NEXT_VHDL')
+SURVEY = setting('OMSE_AI_NEXT_SURVEY')
 
 # ----------------------------------------------------------------------------
 # What nr_read returns right after power-on (boot='bare'), register by register:
