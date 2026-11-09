@@ -57,7 +57,12 @@ def labels():
 
 def ula():
     """The bitmap the probe prints (the ROM font, as probe.inc's getfont copies it) and the attributes."""
-    rom = (Path(__file__).resolve().parent.parent / 'roms' / '48.rom').read_bytes()
+    import sys
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from speccy import roms_dir                      # $OMSE_AI_ROMS, else roms/ in the repository, as every Speccy() looks
+    rom = (roms_dir() / '48.rom').read_bytes()
     bm = bytearray(6144)
     for row, col, text in labels():
         for k, ch in enumerate(text):

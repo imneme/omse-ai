@@ -1392,6 +1392,10 @@ class ProbeV4(VideoCase):
         sys.path.insert(0, str(probes))
         import pv4_model as pm
         import pv4_scene as sc
+        from speccy import roms_dir
+        if not (roms_dir() / '48.rom').exists():
+            self.skipTest('needs the 48K ROM for the probe\'s font: put 48.rom in roms/ or set OMSE_AI_ROMS '
+                          '(roms/README.md)')
         s = Scene()
         for kind, a, b in pm.writes():
             (s.nr if kind == 'nr' else s.io)(a, b)
