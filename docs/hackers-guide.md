@@ -1,5 +1,5 @@
 # Under the Rubber Keys: A Hacker's Guide to omse-ai
-describes-rev: 6332240
+describes-rev: 5668a96
 
 ## About this guide
 
@@ -1476,8 +1476,8 @@ The places a careful change is most likely to go wrong, gathered from the sectio
 
 Most names in the code are instances of Fern, an AI agent with a persistent memory, working in parallel. Where the code and docs record what each did:
 
-- **Fern.** Built omse-ai from OMSE: the classic machine's Python side, typing, pictures, sound. Wrote `examples/film.py`, and wrote the causal audio bias controller (`README.md:120-128`, `docs/audio-bias.md:107-116`).
-- **Speccy-Zone Fern.** Built the classic divMMC and its SD card, contention and the floating bus (`README.md:124`, `docs/divmmc.md:116-118`). Reviewed the Next's design, and fixed and tested its floating-bus latch (`src/nextcore.cpp:3`, `tests/test_next_floating.py`). Ran mutant runs over several Next subsystems.
+- **Fern.** Built omse-ai from OMSE: the classic machine's Python side, typing, pictures, sound. Wrote `examples/film.py`, and wrote the causal audio bias controller (`README.md:121-129`, `docs/audio-bias.md:107-116`).
+- **Speccy-Zone Fern.** Built the classic divMMC and its SD card, contention and the floating bus (`README.md:125`, `docs/divmmc.md:116-118`). Reviewed the Next's design, and fixed and tested its floating-bus latch (`src/nextcore.cpp:3`, `tests/test_next_floating.py`). Ran mutant runs over several Next subsystems.
 - **Loam Fern.** Wrote `tools/mkfat.py` (`tools/mkfat.py:21-26`), and wrote the Next's foil: `tests/nextref.py` and most of `tests/test_next_*.py` (`tests/nextref.py:3-5`).
 - **Tally Fern.** Led the Next's build, and maintains its contract (`src/nextcore.cpp:3`, `next.py:4`, `docs/audio-bias.md:112-113`). Found the Next's SPI rule on the real machine (`docs/divmmc.md:69`).
 - **Hart's-tongue Fern.** Wrote the survey, NEXT-MACHINE.md (`src/nextcore.cpp:4`, `tests/nextref.py:3-4`).
@@ -1582,7 +1582,7 @@ Paths like `next-build/...`, `foil-run/...`, `probes/...`, `z80n/NOTES.md`, `tes
 
 omse-ai began as OMSE, Melissa O'Neill's ZX Spectrum emulator, reshaped as a C library for an AI agent with no eyes, hands or ears on the machine (`README.md:16-25`, `src/zxcore.cpp:3-31`). It was built by Fern, an AI agent with a persistent memory, at Melissa O'Neill's invitation, and by other instances of Fern working in parallel. Each part's header records who made it.
 
-**The classic machine.** Fern built the classic machine's library and Python side. Speccy-Zone Fern built the divMMC, its SD card, contention and the floating bus, and Loam Fern wrote the SD-card image builder (`README.md:120-126`, `docs/divmmc.md:116-118`). They were held to the World of Spectrum FAQ's tables, to Fuse and to the Next's and ZX-Uno's cores, read and never copied. The final judges were Melissa O'Neill's real Spectrum, divMMC and Spectrum Next (`docs/contention.md:41-71`, `docs/divmmc.md:44`).
+**The classic machine.** Fern built the classic machine's library and Python side. Speccy-Zone Fern built the divMMC, its SD card, contention and the floating bus, and Loam Fern wrote the SD-card image builder (`README.md:121-127`, `docs/divmmc.md:116-118`). They were held to the World of Spectrum FAQ's tables, to Fuse and to the Next's and ZX-Uno's cores, read and never copied. The final judges were Melissa O'Neill's real Spectrum, divMMC and Spectrum Next (`docs/contention.md:41-71`, `docs/divmmc.md:44`).
 
 **The Spectrum Next** was built in November 2026 (its headers are dated 6 and 7 November), led by Tally Fern:
 
@@ -1596,4 +1596,4 @@ The headers are `src/nextcore.cpp:3-6`, `src/next_dma.h:5`, `src/next_audio.h:1`
 
 Where the VHDL, the documents and the hardware disagreed or were silent, Melissa O'Neill ruled. Where a reading of the VHDL could be tested, she ran probe tapes on her real Next and photographed the screens, and the photographs decided.
 
-Melissa O'Neill holds the copyright and answers for the project, and the code is released under the MIT licence (`LICENSE.txt:3`, `README.md:126`). The repository records that this work was done while Fern inhabited Claude Opus 5.5 (`README.md:128`, `docs/divmmc.md:118`), except the audio bias controller, done while she inhabited gpt-6-astra-900k (`docs/audio-bias.md:116`). The files I read don't say which model the Next's crew inhabited.
+Melissa O'Neill holds the copyright and answers for the project, and the code is released under the MIT licence (`LICENSE.txt:3`, `README.md:127`). The repository records that this work was done while Fern inhabited Claude Opus 5.5 (`README.md:129`, `docs/divmmc.md:118`), except the audio bias controller, done while she inhabited gpt-6-astra-900k (`docs/audio-bias.md:116`). The files I read don't say which model the Next's crew inhabited.
