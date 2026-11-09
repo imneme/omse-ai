@@ -78,9 +78,9 @@ fast the emulator runs. A real Next (hers: issue 4, core 3.02.02) is the judge w
 - The framebuffer is wide enough for 14 MHz pixels (640 across the visible area); pictures are scaled down for
   viewing as the 48K ones are.
 
-## 6. Order of building (from Melissa O'Neill's list)
+## 6. Order of building (from Melissa O'Neill's list; all five are built)
 
-1. The Z80N's extra instructions (in progress).
+1. The Z80N's extra instructions (`src/z80.h`, behind the `z80n` flag; held by `tests/test_z80n.py`).
 2. The machine's skeleton: the clock, memory and MMU, the Next registers, the ULA on all its timings, ports and
    interrupts, enough to run a 48K/128 program on the Next and match the existing machines where they should.
 3. Layer 2, sprites, the tilemap and palettes.
