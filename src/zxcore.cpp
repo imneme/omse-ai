@@ -849,11 +849,12 @@ int zx_load_sna(ZX* z, const uint8_t* d, int len) {
     return 0;
 }
 
-// Write a SNA into out: 48K (49179 bytes), or on a 128 the 128K layout.
+// Write a SNA into out: 48K (49179 bytes), or on a 128 the 128K layout,
+// locked or not (a locked 128 still has its AY, its timing and eight banks).
 // First runs to an instruction boundary.  On a 48K the PC goes on the stack
 // *in the file only*; the live machine is left untouched.
 int zx_save_sna(ZX* z, uint8_t* out, int cap) {
-    bool is128 = z->model == 128 && !z->locked;
+    bool is128 = z->model == 128;
     int paged = z->slot3;
     int need = 49179 + (is128 ? 4 + ((paged == 5 || paged == 2) ? 6 : 5) * 0x4000 : 0);
     if (cap < need) return -1;
@@ -879,7 +880,7 @@ int zx_save_sna(ZX* z, uint8_t* out, int cap) {
         return 49179;
     }
     w(49179, pc);
-    out[49181] = (paged & 7) | (z->screen7 ? 8 : 0) | (z->rom_sel ? 0x10 : 0);
+    out[49181] = (paged & 7) | (z->screen7 ? 8 : 0) | (z->rom_sel ? 0x10 : 0) | (z->locked ? 0x20 : 0);
     out[49182] = 0;
     int off = 49183;
     for (int b = 0; b < 8; b++) {

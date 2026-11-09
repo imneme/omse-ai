@@ -326,12 +326,16 @@ def screen_text(zx, udg_as=None):
         bot = (0x0F if b & 4 else 0) | (0xF0 if b & 8 else 0)
         g = bytes([top] * 4 + [bot] * 4)
         glyphs.setdefault(g, UNICODE_BLOCKS[b] if b else ' ')
+    scr, at = mem, 0x4000                      # the screen the ULA shows: bank 7 on a 128 with 7FFD bit 3
+    if getattr(zx, 'model', 48) == 128 and zx.lib.zx_paging(zx.z) & 8:
+        import ctypes
+        scr, at = ctypes.string_at(zx.lib.zx_bank(zx.z, 7), 6144), 0
     lines = []
     for row in range(24):
         s = []
         for col in range(32):
-            base = 0x4000 | ((row & 0x18) << 8) | ((row & 7) << 5) | col
-            g = bytes(mem[base + (k << 8)] for k in range(8))
+            base = at | ((row & 0x18) << 8) | ((row & 7) << 5) | col
+            g = bytes(scr[base + (k << 8)] for k in range(8))
             ch = glyphs.get(g)
             if ch is None:
                 ch = glyphs.get(bytes(255 - x for x in g))

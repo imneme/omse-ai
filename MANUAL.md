@@ -33,7 +33,7 @@ loaded snaps/demo.sna
 
 Each call loads `snaps/NAME.sna` (or boots a fresh 48K), runs the steps, saves the machine back, writes `out/NAME/now.png` and prints that status line: frames so far, the program counter, the editor's cursor mode and the border colour. With a tape, `go game 'tape game.tap' 'enter LOAD ""' 'wait 100'` in one call and `go game 'key SPACE' 'wait 100'` in the next works the same way.
 
-A `.json` file next to the snapshot remembers which tape is in the deck and how far it has been read. Delete both files to start again. Snapshot round trips are exact: a machine reloaded from a snapshot does precisely what it would have done without stopping (the tests check this).
+A `.json` file next to the snapshot remembers which tape is in the deck and how far it has been read. Delete both files to start again. A reloaded machine carries on with the same memory, registers, paging and border. SNA holds nothing else, so the beam restarts at the top of a frame. Because `go` saves after whole frames, that's at most one instruction out (the tests check it), and a program that waits for the interrupt is back in step at its next HALT. The 128's AY registers and the FLASH phase also restart: see "Tapes and snapshots".
 
 This is the natural way for an agent to explore a program: one tool call per move, a picture and a status line after each.
 
@@ -185,7 +185,12 @@ You can't hear it, but you can measure it: pitch, timing, which channel, how lou
 
 **Only TAP files** are read. Convert a TZX with tzxtools' `tzxtap`; a `.z80` snapshot needs converting to SNA with another tool first.
 
-**Snapshots are SNA files**, 48K (49,179 bytes) or 128K (131,103 bytes). They load and save at any moment, and a reload carries on exactly. The only differences a reload leaves are a few bytes of dead stack below SP.
+**Snapshots are SNA files**, 48K (49,179 bytes) or 128K (131,103 bytes). A 128 always saves the 128K layout, even with paging locked (as `menu 48` leaves it), so it reloads as a 128 with its AY and all eight banks. They load and save at any moment, and a reload restores what SNA holds: memory, the registers, the paging and the border. It can't restore what SNA doesn't hold:
+- **The beam's position.** A reload starts its frame at the interrupt, so a snapshot saved mid-frame comes back that much out of step, until the program's next HALT. `go` saves after whole frames, so it's at most one instruction out.
+- **The 128's AY registers.** They come back silent, until the program writes them again (most music players rewrite every register each frame).
+- **The FLASH phase.**
+
+A 48K snapshot also leaves a few bytes of dead stack below SP, where the PC was pushed.
 
 ## The 128
 

@@ -39,7 +39,7 @@ make                                # builds lib/libzxcore (speccy.py also does 
 # put the ROMs in roms/: see "Bring your own ROMs" below
 ./speccy.py run examples/hello.zx   # -> out/hello/: a contact sheet, a PNG and a WAV; prints the screen as text
 python3 examples/tour.py            # the Python side: what a program did, as text and numbers
-./tests/run.sh                      # about 5 seconds
+./tests/run.sh                      # about half a minute
 ```
 
 A session that persists between commands, for exploring one step at a time:
