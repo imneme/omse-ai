@@ -5,19 +5,30 @@ independently of omse-ai's Next core, for tests that check the core through
 DESIGN.md §9 only. Nothing here imports the machine.
 
 Citations:
-  zxnext:N   cores/zxnext/src/zxnext.vhd, line N, in
-             next-build/sources/fpga-30202 (core 3.02.02, Melissa's machine)
+  zxnext:N   cores/zxnext/src/zxnext.vhd, line N, in core 3.02.02 (the core on
+             Melissa O'Neill's Next, which judges this work; docs/next-sources.md)
   top4:N     cores/zxnext/src/zxnext_top_issue4.vhd
   nr:N       cores/zxnext/nextreg.txt
   ulat:N     cores/zxnext/src/video/zxula_timing.vhd
-  §N         next-build/machine/NEXT-MACHINE.md (the survey)
+  §N         NEXT-MACHINE.md, Hart's-tongue Fern's survey of the core (not yet
+             in this repository)
 The hardware is by Alvin Albrecht, Victor Trucco, Fabio Belavenuto and others
 (GPL v3); this file describes it and copies none of it.
 """
+import os
 from pathlib import Path
 
-SOURCES = Path.home() / 'next-build/sources/fpga-30202/cores/zxnext'
-SURVEY = Path.home() / 'next-build/machine'
+
+def _setting(name):
+    """A folder named by an environment variable, or one that never exists."""
+    v = os.environ.get(name)
+    return Path(v).expanduser() if v else Path(os.devnull) / name
+
+
+# For the tests that check citations against the source (docs/next-sources.md): the 3.02.02 core's cores/zxnext
+# folder, and the survey's folder. Without them those tests skip and say which is missing.
+SOURCES = _setting('OMSE_AI_NEXT_VHDL')
+SURVEY = _setting('OMSE_AI_NEXT_SURVEY')
 
 # ----------------------------------------------------------------------------
 # What nr_read returns right after power-on (boot='bare'), register by register:

@@ -1,5 +1,5 @@
-"""next.py: a Spectrum Next (core 3.02.02) for Python, over nextcore.cpp. The contract is next-build/DESIGN.md §9
-(and §9.1): what the tests drive and the core implements.
+"""next.py: a Spectrum Next (core 3.02.02) for Python, over nextcore.cpp. The contract is DESIGN.md §9 and §9.1,
+written for the build and not yet in this repository: what the tests drive and the core implements.
 
 Ratio Fern, Fri 6 Nov 2026, for omse-ai's Next (led by Tally Fern). Units: `t28` is 28 MHz master ticks since
 power-on; `cpu_clocks` is rising edges of the CPU clock since power-on (a 28 MHz wait state is one; contention adds

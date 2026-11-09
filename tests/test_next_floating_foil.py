@@ -89,7 +89,10 @@ def slot_name(edge, timing):
 class FloatingSweep(unittest.TestCase):
 
     def machine(self, timing, contention):
-        zx = Next(timing=timing, boot='fast')
+        try:
+            zx = Next(timing=timing, boot='fast')
+        except (FileNotFoundError, OSError) as e:      # as test_next_fastboot does without the distribution
+            raise unittest.SkipTest(f'boot="fast" needs the Next\'s distribution (docs/next-sources.md): {e}')
         nr08 = zx.nr_read(0x08)
         zx.nr_write(0x08, (nr08 & ~0x44) | (0 if contention else 0x40))   # b6 off = contention; b2 off = no Timex read
         zx.write(0x4000, screen(pix, att))
