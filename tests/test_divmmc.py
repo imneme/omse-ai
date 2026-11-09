@@ -458,6 +458,15 @@ class TestCardKinds(unittest.TestCase):
                 names = [n for n, a, r in zx.sd_log()]
                 self.assertEqual(names[-1], 'CMD58')
 
+    def test_an_application_command_it_doesnt_know_is_illegal(self):
+        # CMD55 makes the next command an ACMD. ACMD17 isn't one (SD Physical Layer spec, the SPI-mode command
+        # list): an unsupported ACMD is an illegal command, not CMD17 read under another name
+        z = start(Z80(), 'sdhc').out(0xEB, *cmd(55)).in_(3).out(0xEB, *cmd(17, 0)).in_(12)
+        zx, got = self.card('sdhc', z)
+        self.assertEqual(zx.sd_log()[-1][0], 'ACMD17')
+        self.assertEqual(zx.sd_log()[-1][2], 0x04, 'R1: illegal command')
+        self.assertNotIn(0xFE, got[-11:], 'no data token: nothing was read')
+
     def test_an_mmc_has_no_cmd8_and_no_cmd55(self):
         zx, got = self.card('mmc', wake_and_select(Z80()).out(0xEB, *cmd(0)).in_(3)
                             .out(0xEB, *cmd(8, 0x1AA)).in_(3).out(0xEB, *cmd(55)).in_(3))

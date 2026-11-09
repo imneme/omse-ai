@@ -134,9 +134,11 @@ class TestTapesAndSnapshots(unittest.TestCase):
         zx2.run(20)
         self.assertIn('round trip', zx2.screen_text())
 
-    def test_a_snapshot_resumes_exactly(self):
+    def test_a_reloaded_program_finishes_the_same(self):
         # Sync on the program, not the frame count: both machines are compared
-        # when the program reaches its PAUSE 0.
+        # when the program reaches its PAUSE 0. This checks memory and registers
+        # survive; the drawing doesn't depend on timing, so it says nothing about
+        # the beam (test_go_reloads_within_an_instruction_of_the_beam does).
         zx = Speccy()
         zx.type('10 FOR i=0 TO 175: PLOT i,i: DRAW 80,0: NEXT i: PAUSE 0\n')
         zx.type('RUN\n')
@@ -147,6 +149,25 @@ class TestTapesAndSnapshots(unittest.TestCase):
         zx2 = Speccy(sna=snap)
         self.assertIsNotNone(zx2.wait_ready(pause=True))
         self.assertEqual(zx.read(0x4000, 6912), zx2.read(0x4000, 6912))
+
+    def test_go_reloads_within_an_instruction_of_the_beam(self):
+        # SNA holds no beam position: a reload starts its frame at INT. go saves
+        # after whole frames, so the saved machine is at most one instruction into
+        # its frame, and the reload is behind it by no more than that.
+        worst = 0
+        for n in range(1, 40):
+            zx = Speccy()
+            zx.type('10 PRINT AT 0,0;RND: GO TO 10\n')
+            zx.type('RUN\n')
+            zx.run(n)
+            snap = OUT / 'beam.sna'
+            zx.save_sna(snap)
+            zx2 = Speccy(sna=snap)
+            behind = zx.lib.zx_frame_pos(zx.z) - zx2.lib.zx_frame_pos(zx2.z)
+            self.assertGreaterEqual(behind, 0)
+            worst = max(worst, behind)
+        self.assertLessEqual(worst, 23, 'the longest Z80 instruction')
+        self.assertGreater(worst, 0, 'a save that never ran past the frame start would check nothing')
 
     @unittest.skipUnless(have_128(), 'no 128K ROMs')
     def test_128k_snapshot_keeps_every_bank(self):
@@ -161,6 +182,72 @@ class TestTapesAndSnapshots(unittest.TestCase):
             got = ctypes.string_at(zx2.lib.zx_bank(zx2.z, b) + 0x3000, 64)
             self.assertEqual(got, bytes([0x40 + b]) * 64, f'bank {b}')
 
+    @unittest.skipUnless(have_128(), 'no 128K ROMs')
+    def test_a_locked_128_saves_as_a_128(self):
+        # menu 48 and programs lock paging (7FFD bit 5); the machine is still a 128, with its AY, its
+        # 228-T lines and all eight banks, so the snapshot must be the 128 layout, the lock included
+        zx = Speccy(model=128)
+        for b in range(8):
+            ctypes.memset(zx.lib.zx_bank(zx.z, b) + 0x3000, 0x40 + b, 64)
+        snap = OUT / 'locked128.sna'
+        zx.save_sna(snap)
+        d = bytearray(snap.read_bytes())
+        code = bytes([0xF3, 0x01, 0xFD, 0x7F, 0x3E, 0x37, 0xED, 0x79, 0x18, 0xFE])   # OUT (7FFDh),37h; JR $
+        d[27 + 0x4000:27 + 0x4000 + len(code)] = code                              # bank 2, at 8000h
+        d[49179:49181] = (0x8000).to_bytes(2, 'little')
+        snap.write_bytes(bytes(d))
+        zx.load_sna(snap)
+        assert zx.run_until(0x8008, frames=10) == 0x8008
+        want = zx.lib.zx_paging(zx.z)
+        self.assertEqual(want & 0x3F, 0x37, 'bank 7, ROM 1, locked')
+        zx.save_sna(snap)
+        self.assertEqual(snap.stat().st_size, 131103, 'the 128 layout')
+        zx2 = Speccy(model=128, sna=snap)
+        self.assertEqual(zx2.lib.zx_paging(zx2.z), want, 'paging and the lock come back')
+        for b in range(8):
+            got = ctypes.string_at(zx2.lib.zx_bank(zx2.z, b) + 0x3000, 64)
+            self.assertEqual(got, bytes([0x40 + b]) * 64, f'bank {b}')
+
+    @unittest.skipUnless(have_128(), 'no 128K ROMs')
+    def test_a_128k_snapshot_picks_its_model(self):
+        zx = Speccy(model=128)
+        ctypes.memset(zx.lib.zx_bank(zx.z, 3) + 0x100, 0x5A, 16)
+        snap = OUT / 'pick.sna'
+        zx.save_sna(snap)
+        zx2 = Speccy(sna=snap)                     # no model given: the snapshot's
+        self.assertEqual(zx2.model, 128)
+        self.assertEqual(ctypes.string_at(zx2.lib.zx_bank(zx2.z, 3) + 0x100, 16), b'\x5a' * 16)
+        with self.assertRaisesRegex(ValueError, '128K snapshot'):
+            Speccy(model=48, sna=snap)             # asked for a 48K: say so, don't load garbage
+
+    def test_write_wav_before_recording_says_so(self):
+        zx = Speccy()
+        with self.assertRaisesRegex(RuntimeError, 'record_audio'):
+            zx.write_wav(OUT / 'none.wav')
+
+    @unittest.skipUnless(have_128(), 'no 128K ROMs')
+    def test_screen_text_reads_the_shadow_screen(self):
+        # ROM 1 in (so CHARS is 48 BASIC's) and the normal screen; read it; then the same text in bank 7
+        # and bank 5 blank, shown by a second OUT: screen_text must read what the ULA shows
+        zx = Speccy(model=128)
+        ctypes.memmove(zx.lib.zx_bank(zx.z, 7), zx.lib.zx_bank(zx.z, 5), 6912)
+        snap = OUT / 'shadow.sna'
+        zx.save_sna(snap)
+        d = bytearray(snap.read_bytes())
+        code = bytes([0xF3, 0x01, 0xFD, 0x7F, 0x3E, 0x10, 0xED, 0x79, 0x18, 0xFE,     # OUT (7FFDh),10h; JR $
+                      0x3E, 0x18, 0xED, 0x79, 0x18, 0xFE])                          # OUT (7FFDh),18h; JR $
+        d[27 + 0x4000:27 + 0x4000 + len(code)] = code                              # bank 2, at 8000h
+        d[49179:49181] = (0x8000).to_bytes(2, 'little')
+        snap.write_bytes(bytes(d))
+        zx.load_sna(snap)
+        assert zx.run_until(0x8008, frames=10) == 0x8008
+        normal = zx.screen_text()
+        self.assertIn('Ltd', normal, 'the menu screen, readable through ROM 1')
+        zx.poke(0x8009, 0x00)                                                      # JR $ becomes JR +0
+        assert zx.run_until(0x800E, frames=10) == 0x800E
+        self.assertEqual(zx.lib.zx_paging(zx.z) & 8, 8, 'showing bank 7')
+        ctypes.memset(zx.lib.zx_bank(zx.z, 5), 0, 6144)                            # bank 5's screen blank
+        self.assertEqual(zx.screen_text(), normal)
 
 @unittest.skipUnless(have_128(), 'no 128K ROMs')
 class TestPokeOn128(unittest.TestCase):

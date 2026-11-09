@@ -109,7 +109,7 @@ With `$OMSE_AI_ESXDOS` naming an esxDOS folder (holding `ESXMMC.BIN`, `SYS` and 
 
 - **Snapshots don't hold the divMMC.** SNA has no room for it, so loading one power-cycles the interface (its RAM is kept), and a `go` session doesn't carry esxDOS's state between calls. Keep a divMMC session in one Python process.
 - **One card.** No second slot, and no write-protect or card-detect switches. No SDXC either (it's SDHC to a driver in SPI mode, up to 2 TB).
-- **SPI transfers take no time.** A real one takes a few T-states, always done before the next IN or OUT can arrive.
+- **SPI transfers take no time, unless you ask for the gap.** On the original divMMC a transfer takes a few T-states, always done before the next IN or OUT can arrive, so by default omse-ai finishes each at once. `spi_gap(16)` gives the Next's rule instead (above).
 - **No divIDE**, and no Next extensions: it's the original divMMC, with 128K or 512K of RAM.
 - The EEPROM can be rewritten with the write-protect jumper off (`write_protect=False`), as on the real thing, but esxDOS's own flashing tool hasn't been tried.
 

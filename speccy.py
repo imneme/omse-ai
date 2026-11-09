@@ -26,7 +26,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LIB_PATH = HERE / 'lib' / ('libzxcore.dylib' if sys.platform == 'darwin' else 'libzxcore.so')
-LIB_SOURCES = [HERE / 'src' / n for n in ('zxcore.cpp', 'z80.h', 'ay38910.h', 'sdcard.h')]
+LIB_SOURCES = sorted(p for p in (HERE / 'src').iterdir() if p.suffix in ('.cpp', '.h', '.inc'))   # all of src/,
+                                                                                           # as make sees it
 
 # The ROMs: a folder holding 48.rom, 128-0.rom and 128-1.rom (the names OMSE
 # and most emulators use).  $OMSE_AI_ROMS, or roms/ next to this file.
@@ -51,6 +52,8 @@ def pil():
                           'pip install Pillow') from None
     return Image, ImageDraw, ImageFont
 
+
+SNA128 = 49179 + 4 + 5 * 16384               # the smallest 128K SNA (131,103 bytes; 147,487 with bank 5 or 2 paged twice)
 
 def roms_dir():
     """Where the ROMs are looked for: $OMSE_AI_ROMS, else roms/ in the repository."""
@@ -182,7 +185,9 @@ class Speccy:
     ($OMSE_AI_ROMS or roms/); rom= overrides the 48K ROM's path, and
     roms128=(rom0, rom1) the 128's."""
 
-    def __init__(self, sna=None, rom=None, boot_frames=None, model=48, roms128=None):
+    def __init__(self, sna=None, rom=None, boot_frames=None, model=None, roms128=None):
+        if model is None:             # a 48K, unless a 128K snapshot says otherwise
+            model = 128 if sna and Path(sna).stat().st_size >= SNA128 else 48
         if model not in (48, 128):
             raise ValueError(f'model is 48 or 128, not {model!r}')
         # read the ROMs first, so a missing one is reported before anything else happens
@@ -289,6 +294,8 @@ class Speccy:
     # -- snapshots -----------------------------------------------------------
     def load_sna(self, path):
         data = Path(path).read_bytes()
+        if len(data) >= SNA128 and self.model != 128:
+            raise ValueError(f'{path}: a 128K snapshot ({len(data)} bytes) needs Speccy(model=128)')
         if self.lib.zx_load_sna(self.z, data, len(data)) != 0:
             raise ValueError(f'{path}: not a SNA snapshot ({len(data)} bytes; a 48K SNA is 49,179, '
                              f'a 128K one 131,103 or 147,487)')
@@ -792,6 +799,8 @@ class Speccy:
         No backwards end fade or extra samples; an active cut can click.
         """
         import wave
+        if not hasattr(self, '_audio_level0'):
+            raise RuntimeError('write_wav: nothing recorded; call record_audio() before running')
         import array
         from zxaudio import BiasController, pcm16
         controller = BiasController(rate, pole=0.995, initial=1 if self._audio_level0 else -1,

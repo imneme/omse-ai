@@ -294,6 +294,9 @@ struct SDCard {
                 d[1] = 0x35;
                 block(d, 8);
             }
+        } else if (acmd && c != 55) {    // an ACMD this card doesn't have is an illegal command, not the CMD of the
+            r = r1() | 0x04;             // same number (SD spec, SPI mode's command list); CMD55 again re-arms it
+            respond({r});
         } else if (idle && !(c == 0 || c == 1 || c == 8 || c == 55 || c == 58 || c == 59)) {
             r = 0x05;                    // idle, illegal command
             respond({r});
