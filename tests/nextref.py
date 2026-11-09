@@ -10,8 +10,7 @@ Citations:
   top4:N     cores/zxnext/src/zxnext_top_issue4.vhd
   nr:N       cores/zxnext/nextreg.txt
   ulat:N     cores/zxnext/src/video/zxula_timing.vhd
-  §N         NEXT-MACHINE.md, Hart's-tongue Fern's survey of the core (not yet
-             in this repository)
+  §N         docs/next/NEXT-MACHINE.md, Hart's-tongue Fern's survey of the core
 The hardware is by Alvin Albrecht, Victor Trucco, Fabio Belavenuto and others
 (GPL v3); this file describes it and copies none of it.
 """
@@ -28,7 +27,8 @@ def setting(name):
 # For the tests that check citations against the source (docs/next-sources.md): the 3.02.02 core's cores/zxnext
 # folder, and the survey's folder. Without them those tests skip and say which is missing.
 SOURCES = setting('OMSE_AI_NEXT_VHDL')
-SURVEY = setting('OMSE_AI_NEXT_SURVEY')
+SURVEY = (setting('OMSE_AI_NEXT_SURVEY') if os.environ.get('OMSE_AI_NEXT_SURVEY')
+          else Path(__file__).resolve().parent.parent / 'docs' / 'next')   # the survey ships in docs/next
 
 # ----------------------------------------------------------------------------
 # What nr_read returns right after power-on (boot='bare'), register by register:

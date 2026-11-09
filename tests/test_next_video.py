@@ -20,7 +20,8 @@ import nextvideo as nv                                  # noqa: E402
 from nextref import setting as ref_setting              # noqa: E402
 
 DIFFS = ROOT / 'tests' / 'out' / 'video-diffs'          # pictures of a failure, beside the classic tests' own
-PROBES = ref_setting('OMSE_AI_NEXT_PROBES')               # the probes' scenes and models (docs/next-sources.md)
+PROBES = (ref_setting('OMSE_AI_NEXT_PROBES') if __import__('os').environ.get('OMSE_AI_NEXT_PROBES')
+          else Path(__file__).resolve().parent.parent / 'probes')   # the probes' scenes and models, shipped in probes/
 NO_PROBES = 'needs the probe scenes: set OMSE_AI_NEXT_PROBES (docs/next-sources.md)'
 
 
@@ -226,7 +227,7 @@ class ModelSense(unittest.TestCase):
             self.assertEqual(last(budget_deadline_slots(e)), want, f'e={e}')
 
     def test_the_model_draws_what_her_next_drew(self):
-        """Melissa's photos: PV2's strip stops after sprite 104 (whc 191); PV5's strips after 28, 78 and 104;
+        """The photos from a real Next: PV2's strip stops after sprite 104 (whc 191); PV5's strips after 28, 78 and 104;
         PV6's rows draw 0, 2, 2, 3, 2, 2, 2 small squares (readings-sitting2/3/4)."""
         probes = PROBES
         if not (probes / 'pv6_scene.py').exists():
@@ -1006,7 +1007,7 @@ def budget_deadline_slots(e):
 
 @needs_next
 class SpriteBudget(VideoCase):
-    """The renderer's time, as measured on Melissa's Next (PV2, PV5, PV6): one cycle per sprite qualified and
+    """The renderer's time, as measured on a real Next (PV2, PV5, PV6): one cycle per sprite qualified and
     one per pixel; a drawn sprite is drawn only if it can finish by SPRITE_DEADLINE (1282 cycles after the
     line reset, about whc 319), and the first that can't stops the line and sets port 0x303B bit 1.
     (sprites.vhd as read cuts mid-sprite at the line reset instead; her Next doesn't.)"""
@@ -1391,6 +1392,10 @@ class ProbeV4(VideoCase):
         sys.path.insert(0, str(probes))
         import pv4_model as pm
         import pv4_scene as sc
+        from speccy import roms_dir
+        if not (roms_dir() / '48.rom').exists():
+            self.skipTest('needs the 48K ROM for the probe\'s font: put 48.rom in roms/ or set OMSE_AI_ROMS '
+                          '(roms/README.md)')
         s = Scene()
         for kind, a, b in pm.writes():
             (s.nr if kind == 'nr' else s.io)(a, b)

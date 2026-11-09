@@ -1,0 +1,144 @@
+reg	name	access	soft_reset	hard_reset	side_effects	unit	doc	vhdl_write	vhdl_read	notes
+0x00	Machine ID	R	-	0x0A	none	identity	nr:17-29	-	zxnext:5791-5792	g_machine_id (top4:35); 0xFA = anti-brick core; emulators report 0x08 (nr:19)
+0x01	Core Version	R	-	0x32	none	identity	nr:31-35	-	zxnext:5794-5795	g_version 3.02 (top4:37); sub-minor in 0x0E
+0x02	Reset	R/W	b4:2=0; b7 unchanged; b1:0 see notes	b7=0; b1:0=00 (reset_type 100)	W b0=1 soft reset; b1=1 hard reset (core reload from flash, top4:1066-1081); b7 holds expansion bus + ESP reset; b3=1 multiface NMI, b2=1 divMMC NMI (only if NR06 b3/b4 enable them, zxnext:2049-2050); writing 0 to b4/b3/b2 clears the flag; copper writes reach this register too (incl. resets)	reset, NMI	nr:37-58	zxnext:5056-5058, 3770-3839, 6277-6278	zxnext:5797-5798	reset_type shifts on each soft reset (zxnext:1691-1698): power-on 100 reads 00; first soft reset (the firmware's) -> 010 reads 'hard'; later soft resets -> 001 reads 'soft'. Doc says copper cannot clear b4:2; VHDL lets it (see disagreements)
+0x03	Machine Type	R/W	unchanged	timing 011, lock 0, type 011, config mode on: reads 0x33	any write disables the boot ROM; b7=1 & lock=0 & b3=0 sets timing (000->48K, 101-111->+3); b3=1 toggles the user lock; b2:0 sets type only in config mode; b2:0=111 ENTERS config mode, 000 leaves it unchanged, other values leave it	machine	nr:60-83	zxnext:5060-5090	zxnext:5800-5801	read b7 = NR44 second-byte indicator (nr_palette_sub_idx). Timing takes effect at the next frame sync (zxnext:6601-6616). Doc says 000 = configuration mode (see disagreements)
+0x04	Config Mapping	W	unchanged	0x00	in config mode, 16K SRAM bank N (absolute SRAM address N*16K, not offset by 0x40000) appears at 0x0000-0x3FFF	memory	nr:85-90	zxnext:5092-5093	reads 0	decode at zxnext:3003-3009; boot ROM overlays it while bootrom_en (zxnext:1815)
+0x05	Peripheral 1	R/W	unchanged	0x41 (reads 0x40 for the first frame: see notes)	joystick modes (odd bit order: joy1 = b3,b7,b6; joy2 = b1,b5,b4); b2 50/60 Hz (applied at frame sync; Pentagon timing forces 50); b0 scandoubler (output only)	input, video	nr:92-119	zxnext:5095-5097, 5739-5761	zxnext:5803-5804	reads the effective (frame-synced) 50/60 and scandoubler bits; doc gives no reset values; F2/F3 hotkeys toggle b0/b2; bits 2 and 0 read eff_nr_05_5060 / eff_nr_05_scandouble_en, declared without initial values and first copied at the end of the first frame (zxnext:1371-1372, 6604-6611), so probably 0 until then on the FPGA (Loam Fern)
+0x06	Peripheral 2	R/W	b7=1, b5=1, rest unchanged	0xA0	b7 F8 + F5/F6 hotkeys; b6 beep-only speaker; b5 F3 hotkey; b4 DRIVE->divMMC NMI enable; b3 M1->multiface NMI enable; b2 PS/2 mode (config mode only); b1:0 AY mode (11 holds all AYs in reset)	input, audio, NMI	nr:121-129	zxnext:5100-5109, 4871-4872	zxnext:5806-5807	AY reset at zxnext:6286
+0x07	CPU Speed	R/W	0x00	0x00	b1:0 programmed speed 3.5/7/14/28; actual speed (b5:4) changes only between bus cycles (MREQ, IORQ, M1 high, DMA idle); forced to 3.5 MHz while the expansion bus is on; F8 increments	clock	nr:131-143	zxnext:5690-5701, 5716-5727	zxnext:5809-5810	CPU clock mux at top4:1005-1030
+0x08	Peripheral 3	R/W	b6=0, rest unchanged	reads 0x90	W b7=1 clears the 7FFD lock (reads: b7 = 1 if unlocked); b6 contention disable (taken only while hc(8)=1); b5 ACB stereo; b4 internal speaker; b3 DACs on; b2 port FF readback; b1 turbosound; b0 issue 2 keyboard	memory, audio, ULA	nr:145-154	zxnext:5114-5121, 3612-3614, 5729-5731	zxnext:5812-5813	b7 read is (not port_7ffd_locked); the lock itself is reset to 0 by soft reset (zxnext:3606)
+0x09	Peripheral 4	R/W	b4=0, rest unchanged	0x00	b7:5 AY mono; b4 sprite-number lockstep (NR34 <-> port 303B); b3=1 clears divMMC mapram (reads 0); b2 silence HDMI audio; b1:0 scanlines	audio, sprites, divMMC	nr:156-168	zxnext:5124-5127, 4125-4126, 5763-5772	zxnext:5815-5816	F7 hotkey steps scanlines
+0x0A	Peripheral 5	R/W	unchanged	0x01	b7:6 multiface type (config mode only) selects MF ports; b4 divMMC automap enable (0 also clears automap state); b3 mouse buttons swap; b1:0 mouse DPI	multiface, divMMC, mouse	nr:170-185	zxnext:5130-5136	zxnext:5818-5819	automap reset when b4=0 (zxnext:4053); 3.02.03+ adds b5 SD swap
+0x0B	Joystick I/O Mode	R/W	0x01	0x01	b7 I/O mode on; b5:4 bit-bang / CTC3 clock / UART on left or right port; b0 parameter	joystick, UART	nr:187-208	zxnext:5138-5141	zxnext:5821-5822	pin 7 logic zxnext:3470-3497 (clock mode toggles on CTC3 ZC/TO)
+0x0E	Core Version Sub-minor	R	-	0x02	none	identity	nr:210-213	-	zxnext:5824-5825	g_sub_version (top4:38)
+0x0F	Board ID	R	-	0x02 (issue 4) / 0x00 (issue 2)	none	identity	nr:215-221	-	zxnext:5827-5828	g_board_issue (top4:39, top2:39)
+0x10	Core Boot	R/W	unchanged	reads 0x04 + buttons	W b7=1 boots core 'core id' (FPGA reload); b4:0 core id (config mode only; issue 4: 4 bits, 1111 refused); R b6:2 core id, b1 DRIVE pressed, b0 M1 pressed	boot	nr:223-233	zxnext:5610-5644	zxnext:5830-5831	flashboot at top4:1066-1091
+0x11	Video Timing	R/W	unchanged	0x00 (g_video_def)	config mode only; selects the 28 MHz family member (28.0-33.0 MHz VGA 0-6); 7 (doc 'HDMI') is stored as 0; issue 2 HDMI build keeps only b0; a change re-programs the clock and puts the core through a hard reset (no flash reload)	clock, video	nr:235-247	zxnext:5146-5155	zxnext:5833-5834	top4:789-803 (video mode change restarts the power-on counter), top4:937-959; firmware writes b7 set too (config.c:212-213)
+0x12	Layer 2 Active RAM bank	R/W	0x08	0x08	16K bank of Layer 2 display and (b3=0) of the 0x123B mapping	Layer 2	nr:249-252	zxnext:5157-5158, 4882	zxnext:5836-5837	Layer 2 reads SRAM at 0x40000+bank*16K (layer2:172-173), never the bank 5/7 BRAM copies
+0x13	Layer 2 Shadow RAM bank	R/W	0x0B	0x0B	16K bank used by the 0x123B mapping when its b3=1	Layer 2	nr:254-257	zxnext:5160-5161, 4883	zxnext:5839-5840	
+0x14	Global Transparency Colour	R/W	0xE3	0xE3	compared with RGB bits 8:1 of ULA, LoRes, Layer 2, tilemap text mode	video mixer	nr:259-265	zxnext:5163-5164, 4885	zxnext:5842-5843	zxnext:7007, 7016, 7028
+0x15	Sprite and Layers System	R/W	0x00	0x00	b7 LoRes; b6 sprite 0 on top; b5 sprite clip in border; b4:2 layer order (SLU..., 110/111 blend); b1 sprites over border; b0 sprites on	video mixer, sprites	nr:267-282	zxnext:5166-5172, 4887-4892	zxnext:5845-5846	mixer zxnext:7100-7263
+0x16	Layer 2 X Scroll LSB	R/W	0x00	0x00		Layer 2	nr:284-286	zxnext:5174-5175, 4894	zxnext:5848-5849	
+0x17	Layer 2 Y Scroll	R/W	0x00	0x00		Layer 2	nr:288-290	zxnext:5177-5178, 4896	zxnext:5851-5852	
+0x18	Clip Window Layer 2	R/W	X1=0 X2=255 Y1=0 Y2=191, index 0	same	each write stores the indexed coordinate and advances the index (mod 4); reads show the indexed coordinate without advancing	Layer 2	nr:292-299	zxnext:5180-5187, 4898-4902	zxnext:5854-5860	
+0x19	Clip Window Sprites	R/W	0,255,0,191, index 0	same	as 0x18	sprites	nr:301-311	zxnext:5189-5196, 4904-4908	zxnext:5862-5868	
+0x1A	Clip Window ULA/LoRes	R/W	0,255,0,191, index 0	same	as 0x18; Y2 >= 0xC0 acts as 0xBF	ULA, LoRes	nr:313-321	zxnext:5198-5205, 4910-4914	zxnext:5870-5876	Y2 clamp zxnext:6686-6690
+0x1B	Clip Window Tilemap	R/W	0,159,0,255, index 0	same	as 0x18; X internally doubled	tilemap	nr:323-331	zxnext:5207-5214, 4916-4920	zxnext:5878-5884	
+0x1C	Clip Window Control	R/W	indices 0	same	W b3:0 reset the tilemap/ULA/sprite/Layer 2 indices; R the four indices	clip windows	nr:333-344	zxnext:5216-5228	zxnext:5886-5887	
+0x1E	Active Video Line MSB	R	-	-	b0 = cvc bit 8 (ULA line + NR64 offset)	video timing	nr:346-349	-	zxnext:5889-5890	cvc at ulat:457-470
+0x1F	Active Video Line LSB	R	-	-	cvc bits 7:0	video timing	nr:351-353	-	zxnext:5892-5893	
+0x20	Generate Maskable Interrupt	R/W	-	-	W sets b7 line, b6 ULA, b3:0 CTC3-0 as unqualified interrupts (ignore enables); R b7 line, b6 ULA, b3:0 CTC status	interrupts	nr:355-362	zxnext:1905-1906	zxnext:5895-5896	
+0x22	Line Interrupt Control	R/W	0x00	0x00	b2 ULA interrupt disable (alias of port FF b6 and of NR C4 b0 inverted); b1 line interrupt enable (alias NR C4 b1); b0 line MSB; R b7 = pulse INT currently asserted	interrupts	nr:364-371	zxnext:5233-5236, 3577-3578, 4922	zxnext:5898-5899	R b7 is (not pulse_int_n): any pulse-mode source, only when enabled (doc: ULA even if disabled; see disagreements)
+0x23	Line Interrupt Value LSB	R/W	0x00	0x00	line N fires at hc_ula=255 of cvc line N-1 (N=0: last line)	interrupts	nr:373-375	zxnext:5238-5239, 4924	zxnext:5901-5902	ulat:561-583
+0x24	Reserved	-	-	-	protection: the selected register resets to 0x24	nextreg	nr:377-379	-	reads 0	nr_register reset to 0x24 at zxnext:4537
+0x26	ULA X Scroll	R/W	0x00	0x00		ULA	nr:381-383	zxnext:5241-5242, 4926	zxnext:5904-5905	
+0x27	ULA Y Scroll	R/W	0x00	0x00		ULA	nr:385-387	zxnext:5244-5245, 4928	zxnext:5907-5908	
+0x28	PS/2 Keymap Address MSB	R/W	address unchanged; read value (stored palette byte) 0	0	W b7 0 keymap / 1 key-joystick map, b0 address bit 8; R = first byte stored by NR44	keyboard, palette	nr:389-395	zxnext:6205-6217	zxnext:5910-5911	stored palette byte reset at zxnext:4950; read = the first byte stored by an NR 0x44 pair (nr_stored_palette_value, zxnext:5910-5911, 5335-5337)
+0x29	PS/2 Keymap Address LSB	W	unchanged	0		keyboard	nr:397-399	zxnext:6211-6212	reads 0	
+0x2A	PS/2 Keymap Data MSB	W	-	-	ignored by hardware	keyboard	nr:401-405	commented out (zxnext:4789)	reads 0	
+0x2B	PS/2 Keymap Data LSB	W	-	-	writes keymap/joymap data, auto-increments address	keyboard	nr:407-409	zxnext:6213-6214, 6228-6231	reads 0	
+0x2C	DAC B Mirror (left)	R/W	W: DAC 0x80; R: Pi I2S input	W: DAC 0x80; R: 0x80 with I2S off	W 8-bit sample to DAC B; R I2S left MSB and latches LSB for 0x2D	audio	nr:411-416	zxnext:6359-6363 (soundrive)	zxnext:5913-5915	reads return the Pi I2S input, never the DAC; with I2S off that input is fixed at 10_0000_0000, so reads give 0x80 (zxnext:2317-2318, 5913-5922; Loam Fern). DACs reset to 0x80 and held there while NR08 b3=0 (soundrive.vhd:72-77, zxnext:6343)
+0x2D	DAC A+D Mirror (mono)	R/W	W: DACs 0x80; R: latched I2S LSBs	W: DACs 0x80; R: 0x00 with I2S off	W sample to DACs A and D; R latched I2S LSB in b7:6	audio	nr:418-422	zxnext:6359-6363	zxnext:5917-5918	reads return the I2S sample LSBs latched by reading 0x2C/0x2E (zxnext:5917-5918), 0x00 with I2S off; DACs reset to 0x80 and held there while NR08 b3=0 (soundrive.vhd:72-77, zxnext:6343)
+0x2E	DAC C Mirror (right)	R/W	W: DAC 0x80; R: Pi I2S input	W: DAC 0x80; R: 0x80 with I2S off	W sample to DAC C; R I2S right MSB	audio	nr:424-429	zxnext:6359-6363	zxnext:5920-5922	reads return the Pi I2S input, never the DAC; with I2S off that input is fixed at 10_0000_0000, so reads give 0x80 (zxnext:2317-2318, 5913-5922; Loam Fern). DACs reset to 0x80 and held there while NR08 b3=0 (soundrive.vhd:72-77, zxnext:6343)
+0x2F	Tilemap X Scroll MSB	R/W	0x00	0x00		tilemap	nr:431-435	zxnext:5268-5269, 4930	zxnext:5924-5925	
+0x30	Tilemap X Scroll LSB	R/W	0x00	0x00		tilemap	nr:437-440	zxnext:5271-5272	zxnext:5927-5928	
+0x31	Tilemap Offset Y	R/W	0x00	0x00		tilemap	nr:442-444	zxnext:5274-5275, 4932	zxnext:5930-5931	
+0x32	LoRes X Scroll	R/W	0x00	0x00		LoRes	nr:446-449	zxnext:5277-5278, 4934	zxnext:5933-5934	
+0x33	LoRes Y Scroll	R/W	0x00	0x00		LoRes	nr:451-454	zxnext:5280-5281, 4936	zxnext:5936-5937	
+0x34	Sprite Number	R/W	0	0	selects sprite for 0x35-0x39; tied to port 303B when NR09 b4	sprites	nr:456-467	zxnext:4794, 4855	zxnext:5939-5940	reset in sprites.vhd:598-599; read = 0 & 7-bit sprite number (zxnext:5939-5940); bit 7 written (pattern half in lockstep) is not read back
+0x35	Sprite Attribute 0	W	-	-		sprites	nr:469-472	zxnext:4796-4798	reads 0	0x75 same + increments sprite number
+0x36	Sprite Attribute 1	W	-	-		sprites	nr:474-477	zxnext:4800-4802	reads 0	0x76 with increment
+0x37	Sprite Attribute 2	W	-	-		sprites	nr:479-482	zxnext:4804-4806	reads 0	0x77 with increment
+0x38	Sprite Attribute 3	W	-	-		sprites	nr:484-487	zxnext:4808-4810	reads 0	0x78 with increment
+0x39	Sprite Attribute 4	W	-	-		sprites	nr:489-492	zxnext:4812-4814	reads 0	0x79 with increment
+0x40	Palette Index	R/W	0x00	0x00	resets the 0x44 byte phase	palette	nr:494-503	zxnext:5312-5314, 4938	zxnext:5942-5943	
+0x41	Palette Value (8 bit)	R/W	-	-	writes RRRGGGBB (blue LSB = B1 or B0), clears priority bits, auto-increments index unless NR43 b7	palette	nr:505-512	zxnext:5316-5321, 4857-4858	zxnext:5945-5946	read = selected entry bits 8:1, RRRGGGBB (zxnext:5945-5946)
+0x42	ULANext Attribute Byte Format	R/W	0x07	0x07	ink mask	ULA	nr:514-526	zxnext:5323-5324, 4941	zxnext:5948-5949	
+0x43	Palette Control	R/W	0x00	0x00	b7 no auto-increment; b6:4 palette to edit; b3:1 active second palettes (sprite, L2, ULA); b0 ULANext	palette	nr:528-543	zxnext:5326-5333, 4943-4948	zxnext:5951-5952	
+0x44	Palette Value (9 bit)	R/W	-	-	two writes: RRRGGGBB then b0 blue LSB (+ b7 L2 priority); increments after the second	palette	nr:545-561	zxnext:5335-5341, 4857-4859	zxnext:5954-5955	read = both priority bits (7:6, from the second write, zxnext:4859) & 00000 & blue LSB (zxnext:5954-5955); exact save/restore: read 0x41 and 0x44, write back as a 0x44 pair
+0x4A	Fallback Colour	R/W	0xE3	0xE3	shown where all layers are transparent	video mixer	nr:563-565	zxnext:5344-5345, 4953	zxnext:5957-5958	
+0x4B	Sprite Transparency Index	R/W	0xE3	0xE3		sprites	nr:567-570	zxnext:5347-5348, 4955	zxnext:5960-5961	
+0x4C	Tilemap Transparency Index	R/W	0x0F	0x0F		tilemap	nr:572-575	zxnext:5350-5351, 4957	zxnext:5963-5964	
+0x50	MMU slot 0	R/W	0xFF	0xFF	8K page at 0x0000; any value >= 0xE0 shows ROM (doc: 255)	memory	nr:577-581	zxnext:4627-4637	zxnext:5966-5967	reset zxnext:4551-4559; ports 7FFD etc. rewrite it (zxnext:4560-4625)
+0x51	MMU slot 1	R/W	0xFF	0xFF	8K page at 0x2000; >= 0xE0 shows ROM	memory	nr:583-587	zxnext:4627-4637	zxnext:5969-5970	
+0x52	MMU slot 2	R/W	0x0A	0x0A	8K page at 0x4000; >= 0xE0 maps nothing	memory	nr:589-592	zxnext:4627-4637	zxnext:5972-5973	pages 0x0A/0x0B (bank 5) and 0x0E live in BRAM only
+0x53	MMU slot 3	R/W	0x0B	0x0B	8K page at 0x6000	memory	nr:594-597	zxnext:4627-4637	zxnext:5975-5976	
+0x54	MMU slot 4	R/W	0x04	0x04	8K page at 0x8000	memory	nr:599-602	zxnext:4627-4637	zxnext:5978-5979	
+0x55	MMU slot 5	R/W	0x05	0x05	8K page at 0xA000	memory	nr:604-607	zxnext:4627-4637	zxnext:5981-5982	
+0x56	MMU slot 6	R/W	0x00	0x00	8K page at 0xC000	memory	nr:609-612	zxnext:4627-4637	zxnext:5984-5985	
+0x57	MMU slot 7	R/W	0x01	0x01	8K page at 0xE000	memory	nr:614-617	zxnext:4627-4637	zxnext:5987-5988	
+0x60	Copper Data 8-bit Write	W	-	-	writes one byte (even address held until odd), address +1	copper	nr:619-623	zxnext:5356-5362, 3918-3940	reads 0	
+0x61	Copper Address LSB	R/W	0x00	0x00		copper	nr:625-628	zxnext:5364-5365, 4960	zxnext:5990-5991	
+0x62	Copper Control	R/W	0x00	0x00	b7:6 stop / run from 0 / resume / run from 0 and restart at frame (0,0); b2:0 address MSB; rewriting the same mode does not restart	copper	nr:630-640	zxnext:5367-5369, 4959	zxnext:5993-5994	copper.vhd:69-85
+0x63	Copper Data 16-bit Write	W	-	-	MSB to even address held, whole word written on the odd write, address +1	copper	nr:642-648	zxnext:5371-5375, 3918-3940	reads 0	
+0x64	Vertical Line Count Offset	R/W	0x00	0x00	offset added to cvc (copper, line interrupt, NR1E/1F); reloaded only at ULA row 0	video timing	nr:650-658	zxnext:5379-5380, 4963	zxnext:5996-5997	ulat:457-470
+0x68	ULA Control	R/W	0x00	0x00	b7 ULA off; b6:5 blend source; b4 cancel extended-key matrix entries; b3 ULA+ (alias of port FF3B mode-group enable); b2 half-pixel scroll; b0 stencil	ULA, mixer, keyboard	nr:660-673	zxnext:5382-5388, 4491-4492, 4965-4969	zxnext:5999-6000	
+0x69	Display Control 1	R/W	0x00 (via port resets)	0x00	b7 alias port 123B b1 (L2 on); b6 alias port 7FFD b3 (shadow screen); b5:0 alias port FF b5:0 (Timex modes)	ULA, Layer 2	nr:675-679	zxnext:3865-3866, 3616-3618, 3575-3576	zxnext:6002-6003	
+0x6A	LoRes Control	R/W	0x00	0x00	b5 Radastan; b4 Radastan DFILE xor; b3:0 palette offset	LoRes	nr:681-686	zxnext:5393-5396, 4971-4973	zxnext:6005-6006	
+0x6B	Tilemap Control	R/W	0x00	0x00	b7 on; b6 80 columns; b5 no attributes; b4 palette; b3 text mode; b1 512 tiles; b0 tilemap over ULA	tilemap	nr:688-697	zxnext:5398-5400, 4975-4976	zxnext:6008-6009	
+0x6C	Default Tilemap Attribute	R/W	0x00	0x00		tilemap	nr:699-707	zxnext:5402-5403, 4978	zxnext:6011-6012	
+0x6E	Tilemap Base Address	R/W	0x2C	0x2C	b7 bank 7 (first 8K) else bank 5; b5:0 address MSB (0x2C = 0x6C00)	tilemap	nr:709-718	zxnext:5405-5407, 4980-4981	zxnext:6014-6015	doc gives the address (0x6c00), not the register value; read = bit 7 & 0 & bits 5:0 (zxnext:6014-6015): EB reads AB
+0x6F	Tile Definitions Base Address	R/W	0x0C	0x0C	as 0x6E (0x0C = 0x4C00)	tilemap	nr:720-729	zxnext:5409-5411, 4983-4984	zxnext:6017-6018	read = bit 7 & 0 & bits 5:0 (zxnext:6017-6018): EB reads AB
+0x70	Layer 2 Control	R/W	0x00	0x00	b5:4 256x192x8 / 320x256x8 / 640x256x4; b3:0 palette offset	Layer 2	nr:731-738	zxnext:5413-5415, 4986-4987	zxnext:6020-6021	
+0x71	Layer 2 X Scroll MSB	R/W	0x00	0x00		Layer 2	nr:740-743	zxnext:5417-5418, 4989	zxnext:6023-6024	
+0x75	Sprite Attribute 0 + increment	W	-	-	as 0x35 then sprite number +1	sprites	nr:745-747	zxnext:4796-4798, 4855	reads 0	
+0x76	Sprite Attribute 1 + increment	W	-	-		sprites	nr:749-751	zxnext:4800-4802	reads 0	
+0x77	Sprite Attribute 2 + increment	W	-	-		sprites	nr:753-755	zxnext:4804-4806	reads 0	
+0x78	Sprite Attribute 3 + increment	W	-	-		sprites	nr:757-759	zxnext:4808-4810	reads 0	
+0x79	Sprite Attribute 4 + increment	W	-	-		sprites	nr:761-763	zxnext:4812-4814	reads 0	
+0x7F	User Register 0	R/W	unchanged	0xFF	storage only	nextreg	nr:765-767	zxnext:5423-5424	zxnext:6026-6027	hard reset only (zxnext:1210; changelog 3.01.09); 3.02.02 doc says soft (see disagreements); soft reset keeps it, settled on a real Next (P-2 typed launch, sitting 3: 55 across W); NextZXOS browser loader tapload.bas leaves .metadata status here (FF first launch, 00 after)
+0x80	Expansion Bus Enable	R/W	b7:4 <- b3:0	0x00	b7 bus on; b6 ROMCS replaced by divMMC banks 14/15; b5 no I/O cycles; b4 no memory cycles; F5/F6 set/clear b7	expansion bus	nr:771-782	zxnext:2141-2159	zxnext:6029-6030	copper cannot reach 0x80+ (7-bit register field, zxnext:4672)
+0x81	Expansion Bus Control	R/W	unchanged	0x00	b6 ULA override on even ports 00-0E; b5 no NMI debounce; b4 keep 3.5 MHz bus clock; b1:0 speed fixed 00; R b7 = /ROMCS input	expansion bus	nr:784-790	zxnext:5429-5433	zxnext:6032-6033	
+0x82	Internal Port Enables 7:0	R/W	0xFF if NR85 b7=1, else unchanged	0xFF	disables internal devices per bit (see ports)	ports	nr:792-832	zxnext:5435-5436, 4991-4998	zxnext:6035-6036	enables decoded at zxnext:2351-2401
+0x83	Internal Port Enables 15:8	R/W	0xFF if NR85 b7=1	0xFF		ports	nr:792-832	zxnext:5438-5439	zxnext:6038-6039	
+0x84	Internal Port Enables 23:16	R/W	0xFF if NR85 b7=1	0xFF		ports	nr:792-832	zxnext:5441-5442	zxnext:6041-6042	
+0x85	Internal Port Enables 27:24 + reset type	R/W	b3:0=F if b7=1; b7 unchanged	0x8F	b7 = 1: soft reset re-enables all internal ports	ports	nr:792-832	zxnext:5444-5446	zxnext:6044-6045	the firmware writes b7=0 (boot.c:325-327)
+0x86	Expansion Bus Port Enables 7:0	R/W	0xFF if NR89 b7=0, else unchanged	0xFF	ANDed with internal enables while the bus is on	ports	nr:793-832	zxnext:5448-5449, 5000-5007	zxnext:6047-6048	note inverted sense of b7 vs NR85
+0x87	Expansion Bus Port Enables 15:8	R/W	0xFF if NR89 b7=0	0xFF		ports	nr:793-832	zxnext:5451-5452	zxnext:6050-6051	
+0x88	Expansion Bus Port Enables 23:16	R/W	0xFF if NR89 b7=0	0xFF		ports	nr:793-832	zxnext:5454-5455	zxnext:6053-6054	
+0x89	Expansion Bus Port Enables 27:24 + reset type	R/W	b3:0=F if b7=0	0x8F	b7 = 0: soft reset re-enables	ports	nr:793-832	zxnext:5457-5459	zxnext:6056-6057	
+0x8A	Expansion Bus IO Propagate	R/W	unchanged	0x00	copy I/O to FE/7FFD/DFFD/1FFD/FF/EFF7 onto the bus	expansion bus	nr:834-848	zxnext:5461-5462, 2171-2178	zxnext:6059-6060	
+0x8C	Alternate ROM	R/W	b7:4 <- b3:0	0x00	b7 alt ROM on; b6 visible on writes only; b5/b4 lock ROM1/ROM0	memory	nr:850-864	zxnext:2210-2224	zxnext:6062-6063	ROM selection zxnext:2940-2967, 3037, 3075-3082
+0x8E	Spectrum 128K Memory Mapping	R/W	reads 0x08	reads 0x08	writes ports 7FFD/DFFD/1FFD bits as listed and remaps at once; b3=0 leaves RAM bank and MMU6/7 alone; ignores the 7FFD lock	memory	nr:866-881	zxnext:3620-3628, 3654-3662, 3684-3692, 3754-3755	zxnext:6065-6066	
+0x8F	Memory Mapping Mode	R/W	unchanged	0x00	00 standard; 01 reserved (profi removed); 10 Pentagon 512; 11 Pentagon 1024 (with EFF7 b2=0)	memory	nr:883-894	zxnext:3728-3742	zxnext:6068-6069	
+0x90	PI GPIO Output Enable 7:0	R/W	0x00	0x00	GPIO 1:0 cannot be enabled	Pi GPIO	nr:896-899	zxnext:5473-5474, 5014	zxnext:6071-6072	
+0x91	PI GPIO Output Enable 15:8	R/W	0x00	0x00		Pi GPIO	nr:896-899	zxnext:5476-5477	zxnext:6074-6075	
+0x92	PI GPIO Output Enable 23:16	R/W	0x00	0x00		Pi GPIO	nr:896-899	zxnext:5479-5480	zxnext:6077-6078	
+0x93	PI GPIO Output Enable 27:24	R/W	0x00	0x00		Pi GPIO	nr:896-899	zxnext:5482-5483	zxnext:6080-6081	
+0x98	PI GPIO 7:0	R/W	out 0xFF	out 0xFF	R returns pin states	Pi GPIO	nr:901-904	zxnext:5485-5486, 5009	zxnext:6083-6084	
+0x99	PI GPIO 15:8	R/W	out 0x01	out 0x01		Pi GPIO	nr:901-904	zxnext:5488-5489, 5010	zxnext:6086-6087	
+0x9A	PI GPIO 23:16	R/W	out 0x00	out 0x00		Pi GPIO	nr:901-904	zxnext:5491-5492, 5011	zxnext:6089-6090	
+0x9B	PI GPIO 27:24	R/W	out 0x0	out 0x0		Pi GPIO	nr:901-904	zxnext:5494-5495, 5012	zxnext:6092-6093	
+0xA0	PI Peripheral Enable	R/W	0x00	0x00	b4 UART on GPIO14/15; b5 Rx/Tx swap (VHDL: zxnext:2237-2238, 2282-2293; nr.txt has b5/b4 the other way: D-20, Ratio Fern); b3 I2C on GPIO2/3; b0 SPI master on GPIO7-11	Pi GPIO	nr:906-915	zxnext:5497-5498, 5019	zxnext:6095-6096	
+0xA2	PI I2S Audio Control	R/W	0x00 (reads b1=1)	0x00	b7:6 I2S mode; b4 direction; b3/b2 mute; b0 I2S to EAR	Pi audio	nr:917-931	zxnext:5500-5501, 5020	zxnext:6098-6099	
+0xA8	ESP Wifi GPIO Output Enable	R/W	0x00	0x00	b0 GPIO0 output enable	ESP	nr:938-941	zxnext:5506-5507, 5023	zxnext:6104-6105	
+0xA9	ESP Wifi GPIO	R/W	out b0=1	out b0=1	R returns pins GPIO2, GPIO0	ESP	nr:943-946	zxnext:5509-5510, 5024	zxnext:6107-6108	
+0xB0	Extended Keys 0	R	-	-	; \" , . UP DOWN LEFT RIGHT	keyboard	nr:948-958	-	zxnext:6113-6115	
+0xB1	Extended Keys 1	R	-	-	DELETE EDIT BREAK INV TRUE GRAPH CAPSLOCK EXTEND	keyboard	nr:960-970	-	zxnext:6117-6119	
+0xB2	Extended MD Pad Buttons	R	-	-	X Z Y MODE for each pad	joystick	nr:972-981	-	zxnext:6121-6122	
+0xB8	Divmmc Entry Points 0	R/W	0x83	0x83	automap on fetch of 0x0000-0x0038 RSTs, per bit	divMMC	nr:983-992	zxnext:5521-5522, 5026	zxnext:6124-6125	decode zxnext:2807-2853
+0xB9	Divmmc Entry Points Valid 0	R/W	0x01	0x01	1 = always, 0 = only when ROM3 is present	divMMC	nr:994-1003	zxnext:5524-5525, 5027	zxnext:6127-6128	
+0xBA	Divmmc Entry Points Timing 0	R/W	0x00	0x00	1 = instant, 0 = delayed	divMMC	nr:1005-1014	zxnext:5527-5528, 5028	zxnext:6130-6131	
+0xBB	Divmmc Entry Points 1	R/W	0xCD	0xCD	3Dxx (TR-DOS), 1FF8-1FFF off, tape traps 056A/04D7/0562/04C6, NMI 0066 instant/delayed	divMMC	nr:1016-1025	zxnext:5530-5531, 5029	zxnext:6133-6134	decode zxnext:2855-2867
+0xC0	Interrupt Control	R/W	0x00	0x00	b7:5 IM2 vector top bits; b3 stackless NMI; b0 hardware IM2 mode; R b2:1 = Z80 IM mode (snooped)	interrupts	nr:1029-1053	zxnext:5533-5536, 5031-5033	zxnext:6136-6137	IM snoop im2_control.vhd:212-229
+0xC2	NMI Return Address LSB	R/W	0x00	0x00	captures the pushed PC low byte at every NMI acknowledge	NMI	nr:1055-1056	zxnext:2013-2029	zxnext:6139-6140	
+0xC3	NMI Return Address MSB	R/W	0x00	0x00	captures the pushed PC high byte	NMI	nr:1058-1061	zxnext:2013-2029	zxnext:6142-6143	
+0xC4	INT EN 0	R/W	0x81	0x81	b7 expansion bus INT; b1 line (alias NR22 b1); b0 ULA (writes port FF b6 inverted)	interrupts	nr:1065-1072	zxnext:5544-5547, 3579-3580, 5035	zxnext:6145-6146	
+0xC5	INT EN 1	R/W	0x00	0x00	CTC 3:0 interrupt enables (b7:4 always 0)	interrupts, CTC	nr:1074-1084	zxnext:4019-4020 (ctc_chan:263-276)	zxnext:6148-6149	only four CTC channels exist (zxnext:4005-4034)
+0xC6	INT EN 2	R/W	0x00	0x00	UART Tx empty / Rx near full / Rx available, per UART	interrupts, UART	nr:1087-1098	zxnext:5552-5554, 5037-5038	zxnext:6151-6152	
+0xC8	INT Status 0	R/W	0	0	R b1 line, b0 ULA; W 1 clears	interrupts	nr:1104-1111	zxnext:1911-1914	zxnext:6154-6155	in hw IM2 mode stays set while pending (im2_peripheral:180)
+0xC9	INT Status 1	R/W	0	0	CTC 7:0 (7:4 never set)	interrupts	nr:1113-1125	zxnext:1911-1914	zxnext:6157-6158	
+0xCA	INT Status 2	R/W	0	0	UART status (Rx bits read back in pairs)	interrupts	nr:1127-1139	zxnext:1911-1914	zxnext:6160-6161	
+0xCC	DMA INT EN 0	R/W	0x00	0x00	b7 NMI (any interrupt mode); b1 line, b0 ULA (hw IM2 mode) interrupt the DMA	interrupts, DMA	nr:1145-1150	zxnext:5565-5567, 5040-5041	zxnext:6163-6164	zxnext:1960-1969
+0xCD	DMA INT EN 1	R/W	0x00	0x00	CTC channels interrupt the DMA	interrupts, DMA	nr:1152-1162	zxnext:5569-5570, 5042	zxnext:6166-6167	
+0xCE	DMA INT EN 2	R/W	0x00	0x00	UARTs interrupt the DMA	interrupts, DMA	nr:1164-1174	zxnext:5572-5574, 5043-5044	zxnext:6169-6170	
+0xD8	I/O Traps	R/W	0x00	0x00	b0 trap +3 FDC ports 2FFD/3FFD as multiface NMI	NMI	nr:1184-1189	zxnext:5576-5577, 5046	zxnext:6172-6173	trap NMI also needs NR06 b3 (zxnext:2049, 3776-3778)
+0xD9	I/O Trap Write	R/W	0x00	0x00	byte of the trapped 3FFD write	NMI	nr:1191-1193	zxnext:3828-3839	zxnext:6175-6176	
+0xDA	I/O Trap Cause	R	0	0	1 2FFD read, 2 3FFD read, 3 3FFD write; cleared by writing NR02 b4=0	NMI	nr:1195-1200	zxnext:3807-3824	zxnext:6178-6179	
+0xF0	XDEV CMD	R/W	0x80 (issue 4)	0x80	select DNA / XADC; issue 4 only	Xilinx	nr:1204-1238	zxnext:7352-7391	zxnext:6181-6182	reads 0 on issue 2 (zxnext:7332)
+0xF8	XADC REG	R/W	unchanged	0x00	starts a DRP access (issue 4)	Xilinx	nr:1240-1246	zxnext:7458-7477	zxnext:6184-6185	
+0xF9	XADC D0	R/W	unchanged	0x00		Xilinx	nr:1248-1251	zxnext:7479-7488	zxnext:6187-6188	
+0xFA	XADC D1	R/W	unchanged	0x00		Xilinx	nr:1253-1256	zxnext:7490-7499	zxnext:6190-6191	
+0xFF	Reserved (ULA+ palette path)	-	-	-	port FF3B palette writes arrive as writes to register 0xFF, bits reordered GGGRRRBB -> RRRGGGBB	palette	nr:1258	zxnext:4682-4686, 4858, 6864-6865	reads 0	
+(other)	unassigned	-	-	-	writes ignored	nextreg	-	zxnext:5600-5601	reads 0x00 (zxnext:6193-6194)	

@@ -11,3 +11,8 @@ snaps/
 scratch/
 # bring your own ROMs: they are not part of this repository
 roms/*.rom
+
+# probe tapes built from probes/ (build_probes.py, build_pv.py, z80ntime/build_*.py)
+probes/build/
+probes/z80ntime/build/
+__pycache__/
