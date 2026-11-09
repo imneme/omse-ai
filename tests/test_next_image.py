@@ -1,7 +1,7 @@
 """image(): frame9's 9-bit colours widened 3 bits to 8 a channel as the Next's video output does (v << 5 | v << 2 |
 v >> 1), then scaled. image() takes them through a 512-entry table over a numpy copy of the frame buffer
 (frame9_array) rather than a Python generator; it must give the same bytes, for every colour and at every scale.
-Slide Fern, Fri 6 Nov 2026 (Tally's measurement: next-build/foil-run/speed/RESULTS.md)."""
+Slide Fern, Fri 6 Nov 2026 (after Tally Fern measured how long filming took)."""
 import sys
 import unittest
 from pathlib import Path

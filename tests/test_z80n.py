@@ -21,7 +21,7 @@ in bits 40-47, value in 48-55, on the T1 of the machine cycle where the T80N rai
 NEXTREGW command (zxnext.vhd writes on that signal's rising edge).
 
 Where the VHDL disagrees with the documented behaviour, these tests follow the VHDL (each place is marked
-"VHDL:"); a probe on Melissa's real Next decides (next-build/z80n/NOTES.md lists them).
+"VHDL:"); a probe on Melissa's real Next decides (the build's notes list them).
 """
 import ctypes
 import hashlib

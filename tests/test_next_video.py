@@ -5,7 +5,7 @@ The video foil (Hatch Fern): every scene is set up the same way on the machine a
 must equal the model's frame sample for sample. The scenes are drawn so mistakes are visible and
 countable: every palette index used gets its own 9-bit colour (none equal to the transparent E3), bitmaps
 encode their own addresses, and edges sit on distinct colours. On a mismatch the test names the count,
-the first samples, and writes got / want / difference pictures to next-build/video-diffs/.
+the first samples, and writes got / want / difference pictures to tests/out/video-diffs/.
 
 Until next.py exists these skip, naming the missing machine. Once it exists, anything missing fails.
 """
@@ -705,7 +705,7 @@ class Layer2(VideoCase):
 # ---------------------------------------------------------------------------- the probes' scenes
 
 def pv1_scene():
-    """P-V1 (next-build/probes/pv1.asm), the layer card: the same registers, Layer 2 and ULA screen, with the
+    """P-V1 (the probe tape pv1.asm), the layer card: the same registers, Layer 2 and ULA screen, with the
     copper changing NR 0x15 in the blanking before each 16-line band. Returns (scene, schedule)."""
     from speccy import roms_dir                      # $OMSE_AI_ROMS, else roms/ here, as every Speccy() looks
     font = (roms_dir() / '48.rom').read_bytes()[0x3D00:0x4000]
@@ -1316,7 +1316,7 @@ class Survivors(VideoCase):
 
 @needs_next
 class ProbeV2(VideoCase):
-    """P-V2's sprite card (next-build/probes/pv2_scene.py, the scene defined once): the machine against the
+    """P-V2's sprite card (pv2_scene.py among the probes, OMSE_AI_NEXT_PROBES; the scene defined once): the machine against the
     model, the per-line strip cut where the line's time runs out (whc 152 on 128K/+3 timing)."""
 
     def test_pv2_sprite_card(self):
@@ -1348,7 +1348,7 @@ class ProbeV2(VideoCase):
 
 @needs_next
 class ProbeV3(VideoCase):
-    """P-V3's blend card (next-build/probes/pv3_scene.py, the scene defined once): the machine against the
+    """P-V3's blend card (pv3_scene.py among the probes, OMSE_AI_NEXT_PROBES; the scene defined once): the machine against the
     model, band by band, and the read-backs the probe prints (NR 0x28, NR 0x34, the card's sprite status)."""
 
     def test_pv3_blend_card(self):
@@ -1381,7 +1381,7 @@ class ProbeV3(VideoCase):
 
 @needs_next
 class ProbeV4(VideoCase):
-    """P-V4's Layer 2 card (next-build/probes/pv4_scene.py, the scene defined once): resolutions 00/01/10/11,
+    """P-V4's Layer 2 card (pv4_scene.py among the probes, OMSE_AI_NEXT_PROBES; the scene defined once): resolutions 00/01/10/11,
     a bank range past SRAM's end, palette offsets in 640 mode, and a Y scroll past 384 reading bank + 3."""
 
     def test_pv4_layer2_card(self):
@@ -1411,7 +1411,7 @@ class ProbeV4(VideoCase):
 
 @needs_next
 class ProbeV5(VideoCase):
-    """P-V5's budget ruler (next-build/probes/pv5_scene.py, the scene defined once): three strips at 8x, 4x
+    """P-V5's budget ruler (pv5_scene.py among the probes, OMSE_AI_NEXT_PROBES; the scene defined once): three strips at 8x, 4x
     and 2x, with all 128 slots written, cut where the sprite renderer's line runs out."""
 
     def test_pv5_budget_ruler(self):
@@ -1435,7 +1435,7 @@ class ProbeV5(VideoCase):
 
 @needs_next
 class ProbeV6(VideoCase):
-    """P-V6's deadline card (next-build/probes/pv6_scene.py, the scene defined once): a skip-or-stop row and
+    """P-V6's deadline card (pv6_scene.py among the probes, OMSE_AI_NEXT_PROBES; the scene defined once): a skip-or-stop row and
     six rows of wide blocks then four 1x sprites, all 128 slots written."""
 
     def test_pv6_deadline_card(self):

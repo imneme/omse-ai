@@ -5,7 +5,7 @@
 // the seconds are written, the power-on state (p. 8); address 1101000, the pointer moving after each byte, a NACK
 // ending a read (p. 12). A pointer byte above 3Fh is masked to six bits (my choice; the datasheet doesn't say).
 // Plain state machines with explicit inputs; nextcore.cpp supplies the pins, the gating (NR 0xA0, NR 0x0B), the ports
-// and the interrupts (DESIGN.md §9.1 (18) and its rulings a-e).
+// and the interrupts (DESIGN.md §9.1 (18) and its rulings, a to j).
 #pragma once
 #include <cstdint>
 #include <deque>
