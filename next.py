@@ -663,12 +663,16 @@ class Next:
 
     def ay_chan(self, chip):
         """A chip's three channel outputs now (8 bits each, after its volume table)."""
+        if not 0 <= chip <= 2:
+            raise ValueError(f'no AY chip {chip}: there are three, 0-2')
         out = (ctypes.c_int * 3)()
         self.lib.zxn_ay_chan(self.z, chip, out)
         return tuple(out)
 
     def ay_env(self, chip):
         """A chip's envelope step now, 0-31."""
+        if not 0 <= chip <= 2:
+            raise ValueError(f'no AY chip {chip}: there are three, 0-2')
         return self.lib.zxn_ay_env(self.z, chip)
 
     def ay_log(self):

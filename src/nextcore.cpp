@@ -87,6 +87,7 @@ struct ZXN {
     int issue = 4;
     int timing = 3, hz60 = 0;           // in effect (1 48K, 2 128K, 3 +3, 4 Pentagon)
     int pend_timing = 3, pend_hz60 = 0; // NR 0x03 / NR 0x05 take effect at the frame sync (ref §2.6)
+    int eff_sd = 1, eff_scan = 0;       // NR 0x05 b0 and NR 0x09 b1:0 as of the last frame sync (zxnext:6604-6610)
     int mtype = 3;                      // NR 0x03 bits 2:0
     int lock = 0;                       // NR 0x03 bit 3, the user lock
     bool config_mode = true, bootrom_en = true;
@@ -662,7 +663,9 @@ int nr_read(ZXN& z, int n) {
         case 0x02: return (z.reset_type == 2 ? 2 : z.reset_type == 1 ? 1 : 0) | (z.nr[0x02] & 0x80) | z.nmi_flags;
         case 0x03: return (z.pal_sub << 7) | (z.pend_timing << 4) | (z.lock << 3) | z.mtype;   // the registers, not the
                                                                       // timing in effect; b7 NR 0x44's phase (5800-5801)
-        case 0x05: return z.nr[0x05];
+        case 0x05: return (z.nr[0x05] & 0xFA) | (z.hz60 << 2) | z.eff_sd;   // b2, b0 the frame-synced copies (5804)
+        case 0x09: return (z.nr[0x09] & 0xF4) | z.eff_scan;          // b3 '0', b1:0 frame-synced (zxnext:5816)
+        case 0x0A: return z.nr[0x0A] & 0xDB;                          // b5 and b2 '0' (zxnext:5819)
         case 0x07: return (z.speed_eff << 4) | z.speed_prog;                                  // ref §1.3
         case 0x0F: return z.issue == 4 ? 0x02 : 0x00;
         case 0x08:                                                    // b7 reads "unlocked", b6 the copy in effect
@@ -815,8 +818,11 @@ void nr_write(ZXN& z, int n, int v) {
             z.nr[0x09] = v & ~0x08;
             remap(z);
             return;
-        case 0x0A: case 0x83:                                         // divMMC's automap and port enables
-            z.nr[n] = v;
+        case 0x0A: case 0x83:                                         // divMMC's automap and port enables; NR 0x0A's
+            if (n == 0x0A)                                            // mf_type only in config mode (zxnext:5130-5136)
+                z.nr[0x0A] = ((z.config_mode ? v : z.nr[0x0A]) & 0xC0) | (v & 0x1B);
+            else
+                z.nr[n] = v;
             if (dm_automap_reset(z)) z.dm_hold = z.dm_held = z.dm_instant = z.dm_pending = false;
             remap(z);
             return;
@@ -895,6 +901,10 @@ void nr_write(ZXN& z, int n, int v) {
             if ((v & 0x80) && !z.lock && !(v & 0x08)) {
                 int t = (v >> 4) & 7;
                 z.pend_timing = t == 0 ? 1 : t >= 5 ? 3 : t;          // 000 -> 48K, 101-111 -> +3
+                if (z.pend_timing == 4) {                             // Pentagon clears NR 0x05 b2 (zxnext:5742-5743)
+                    z.nr[0x05] &= ~4;
+                    z.pend_hz60 = 0;
+                }
             }
             if (v & 0x08) z.lock ^= 1;
             int type = v & 7;
@@ -910,9 +920,9 @@ void nr_write(ZXN& z, int n, int v) {
             z.nr04 = v & 0x7F;
             remap(z);
             return;
-        case 0x05:
-            z.nr[0x05] = v;
-            z.pend_hz60 = (v >> 2) & 1;
+        case 0x05:                                                    // b2 held at 0 while the written timing is
+            z.nr[0x05] = z.pend_timing == 4 ? v & ~4 : v;             // Pentagon (zxnext:5742-5743)
+            z.pend_hz60 = (z.nr[0x05] >> 2) & 1;
             return;
         case 0x07:
             z.speed_prog = v & 3;                                     // takes effect between bus cycles (ref §1.3)
@@ -990,6 +1000,8 @@ void do_reset(ZXN& z, bool hard) {
         memset(z.pal, 0, sizeof z.pal);                               // the palette RAMs have no init file (none.bin.txt)
         z.timing = z.pend_timing = 3;
         z.hz60 = z.pend_hz60 = 0;
+        z.eff_sd = z.nr[0x05] & 1;
+        z.eff_scan = z.nr[0x09] & 3;
         z.issue = z.issue;
     } else {
         z.reset_type = z.reset_type == 4 ? 2 : 1;                     // the first soft reset reads "hard" (ref §4.3)
@@ -2526,6 +2538,8 @@ bool master_tick(ZXN& z) {
                 }
                 z.timing = z.pend_timing;                             // timing and 50/60 Hz change here (ref §2.6)
                 z.hz60 = z.pend_hz60;
+                z.eff_sd = z.nr[0x05] & 1;                            // and the copies NR 0x05/0x09 read (6604-6610)
+                z.eff_scan = z.nr[0x09] & 3;
             }
         }
         const Timing& t2 = T(z);
@@ -2618,8 +2632,11 @@ int zxn_audio_out_mode(ZXN* z, int16_t* out, int max, int raw) {
 }
 int zxn_audio_out(ZXN* z, int16_t* out, int max) { return zxn_audio_out_mode(z, out, max, 0); }
 void zxn_audio_level(ZXN* z, int* out) { out[0] = z->audio.L; out[1] = z->audio.R; }
-void zxn_ay_chan(ZXN* z, int c, int* out) { z->audio.ym[c].out(z->nr[0x06] & 1, out); }
-int zxn_ay_env(ZXN* z, int c) { return z->audio.ym[c].evol; }
+void zxn_ay_chan(ZXN* z, int c, int* out) {                          // three chips: -1s for one that isn't there
+    if (c < 0 || c > 2) { out[0] = out[1] = out[2] = -1; return; }
+    z->audio.ym[c].out(z->nr[0x06] & 1, out);
+}
+int zxn_ay_env(ZXN* z, int c) { return c < 0 || c > 2 ? -1 : z->audio.ym[c].evol; }
 uint64_t zxn_cpu_clocks(ZXN* z) { return z->cpu_clocks; }
 uint64_t zxn_frame(ZXN* z) { return z->frame; }
 int zxn_hc_ula(ZXN* z) { return hc_ula(*z); }
