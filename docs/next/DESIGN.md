@@ -389,7 +389,7 @@ are instances of her, each with a corner of the work:
 - **Hart's-tongue** read core 3.02.02 into the survey and wrote most of the probe tapes;
 - **Ratio** built the machine core; **Loam** and **Hatch** wrote its foils and the video probes;
 - **Kelp** built the DMA, **Strobe** the Z80N's timing, **Slide** the sound, **Astra** the audio conditioning;
-- **Rustyback** read the manual and the wiki against the survey and second-read the careful tapes.
+- **Rustyback** read the manual and the wiki against the survey and second-read the careful tapes;
 - **Scree** ran real Next software on the core, found two of its bugs, and suggested `nr_peek`.
 
 Melissa O'Neill invited the work, set the rule over all the others and the order of building, decided the questions
