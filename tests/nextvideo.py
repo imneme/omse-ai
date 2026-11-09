@@ -1023,7 +1023,7 @@ def sprite_budget(v):
     return 4 * LINE_HC[v.timing]
 
 
-# Measured on Melissa's Next, not read from the VHDL (probes/readings-sitting3-pv5.md, readings-sitting4-pv6.md):
+# Measured on a real Next, not read from the VHDL (probes/readings-sitting3-pv5.md, readings-sitting4-pv6.md):
 # her Next draws whole sprites only. A drawn sprite qualified at cycle c is drawn if c + 1 + its width
 # (16 << xscale) <= SPRITE_DEADLINE; the first that isn't stops the line (nothing more is drawn) and sets status
 # bit 1. PV6 put the deadline at 1281-1283 cycles from line_reset_re = "01", so about whc 319: the line's
