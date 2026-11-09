@@ -26,7 +26,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LIB_PATH = HERE / 'lib' / ('libzxcore.dylib' if sys.platform == 'darwin' else 'libzxcore.so')
-LIB_SOURCES = [HERE / 'src' / n for n in ('zxcore.cpp', 'z80.h', 'ay38910.h', 'sdcard.h')]
+LIB_SOURCES = sorted(p for p in (HERE / 'src').iterdir() if p.suffix in ('.cpp', '.h', '.inc'))   # all of src/,
+                                                                                           # as make sees it
 
 # The ROMs: a folder holding 48.rom, 128-0.rom and 128-1.rom (the names OMSE
 # and most emulators use).  $OMSE_AI_ROMS, or roms/ next to this file.
