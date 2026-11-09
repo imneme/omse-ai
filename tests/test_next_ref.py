@@ -17,6 +17,8 @@ import nextref as ref                                   # noqa: E402
 
 VHDL = ref.SOURCES / 'src' / 'zxnext.vhd'
 TSV = ref.SURVEY / 'nextregs.tsv'
+NO_VHDL = 'needs the 3.02.02 VHDL: set OMSE_AI_NEXT_VHDL to its cores/zxnext folder (docs/next-sources.md)'
+NO_TSV = 'needs the survey table: set OMSE_AI_NEXT_SURVEY to the folder with nextregs.tsv'
 CITE = re.compile(r'zxnext:(\d+)(?:-(\d+))?')
 
 # Where the reference deliberately differs from nextregs.tsv's hard_reset column
@@ -38,7 +40,7 @@ def cites(text):
         yield a, int(m.group(2) or a)
 
 
-@unittest.skipUnless(VHDL.exists(), f'needs the 3.02.02 VHDL at {VHDL}')
+@unittest.skipUnless(VHDL.exists(), NO_VHDL)
 class Citations(unittest.TestCase):
     """Every zxnext: citation says what it claims."""
 
@@ -89,7 +91,7 @@ class Tables(unittest.TestCase):
         self.assertEqual(both, set(), 'a register is both tested and excluded')
         self.assertEqual(len(ref.READ_MUX) + len(ref.READS_ZERO), 256)
 
-    @unittest.skipUnless(TSV.exists(), f'needs the survey table at {TSV}')
+    @unittest.skipUnless(TSV.exists(), NO_TSV)
     def test_agrees_with_the_surveys_table(self):
         rows = [l.split('\t') for l in TSV.read_text().splitlines()[1:]]
         bad = []
@@ -110,7 +112,7 @@ class Tables(unittest.TestCase):
             pages = [p for b in banks for p in (b * 2, b * 2 + 1)]
             self.assertEqual(ref.all_ram_mmu(cfg), pages, f'configuration {cfg:02b}')
 
-    @unittest.skipUnless(VHDL.exists(), f'needs the 3.02.02 VHDL at {VHDL}')
+    @unittest.skipUnless(VHDL.exists(), NO_VHDL)
     def test_all_ram_arithmetic_is_transcribed(self):
         text = '\n'.join(vhdl_lines()[4564:4572])        # zxnext:4565-4572
         self.assertIn('MMU0 <= X"0" & (port_1ffd_reg(2) or port_1ffd_reg(1)) & "00" & \'0\'', text)
@@ -197,7 +199,7 @@ class Tables(unittest.TestCase):
             c = ref.Contention('48k', mmu, L, N)
             self.assertEqual(c.run(q, v, ev), classic(q, v, ev), f'q={q} v={v} {ev}')
 
-    @unittest.skipUnless(VHDL.exists(), f'needs the 3.02.02 VHDL at {VHDL}')
+    @unittest.skipUnless(VHDL.exists(), NO_VHDL)
     def test_contention_window_is_transcribed(self):
         ula = (ref.SOURCES / 'src/video/zxula.vhd').read_text().splitlines()
         self.assertIn('hc_adj <= i_hc(3 downto 0) + 1;', ula[581])
@@ -225,7 +227,7 @@ class Tables(unittest.TestCase):
         self.assertFalse(s[0x62][0] & 0xC0, 'NR 0x62 b7:6 would start the copper')
         self.assertNotIn(0x54, s, 'MMU4 holds the parked CPU loop at 0x8000')
 
-    @unittest.skipUnless(VHDL.exists(), f'needs the 3.02.02 VHDL at {VHDL}')
+    @unittest.skipUnless(VHDL.exists(), NO_VHDL)
     def test_nr03_timing_model_matches_the_case(self):
         text = '\n'.join(vhdl_lines()[5063:5072])        # zxnext:5064-5072
         for field in range(8):
@@ -253,6 +255,10 @@ class Tables(unittest.TestCase):
         self.assertEqual(c.run(253, 8, [(0x4000, 3)]), 3)              # T2 ends at hc 256
         self.assertEqual(c.run(251, 8, [(0x4000, 3)]), 4)              # 254 waits, 256 not
         self.assertEqual(c.run(453, 191, [(0x4000, 3)]), 3)            # row 192
+
+    @unittest.skipUnless(VHDL.exists(), NO_VHDL)
+    def test_p3_wait_model_is_transcribed(self):
+        """The +3 WAIT term and its path into the T80N, as the model above reads them."""
         ula = (ref.SOURCES / 'src/video/zxula.vhd').read_text().splitlines()
         self.assertIn('''(hc_adj(3 downto 1) = "000" and i_timing_p3 = '1'))''', ula[582])
         self.assertIn("o_cpu_wait_n <= '0' when (i_cpu_mreq_n = '0' and i_contention_memory = '1')",
