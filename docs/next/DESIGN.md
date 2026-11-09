@@ -195,7 +195,7 @@ inside changes.
     the results to Ratio directly, copying Tally. A disagreement goes to the VHDL (and to a real Next if the VHDL
     can't say); **neither the tests nor the core bend to each other**, and whichever is wrong gets fixed with a
     citation.
-11. **The beam counters at a `run_until_pc` stop**): every counter describes the
+11. **The beam counters at a `run_until_pc` stop**: every counter describes the
     same instant, the one just before T1's edge, as `t28` and `cpu_clocks` do (§9.1 (5)). So at 3.5 MHz, where
     `hc_ula` steps from even to odd on the very edge that begins T1, a stop reads the **pre-edge (even)** count, and
     T1's own count is `hc_ula + 1`. References that label a T-state by its own count add the one.
@@ -212,13 +212,6 @@ inside changes.
     **`boot='fast'` includes the boot ROM loader's palette writes** (fw/loader/src/vdp.c, `vdp_init`), since the boot
     ROM runs before the firmware. An optional **`palette='loader'`** argument gives `bare` the loader's palettes too,
     for pictures without ceremony; the default stays faithful.
-
-## 10. How to run everything (on `next`)
-
-`OMSE_AI_ROMS=path/to/roms OMSE_AI_ESXDOS=path/to/esxdos OMSE_AI_NEXT_ROMS=path/to/tbblue/machines/next
-OMSE_AI_NEXT_VHDL=path/to/ZX_Spectrum_Next_FPGA/cores/zxnext PY=python3 ./tests/run.sh`
-(ROMs aren't in git. The ESXDOS and NEXT_ROMS settings turn on the esxDOS and fast-boot tests, and NEXT_VHDL the VHDL-citation checks; each skips without its files. The survey's table and the probe scenes ship in `docs/next/` and `probes/`, and their tests use them by default. `docs/next-sources.md` says where each comes from.)
-Barleycorn's `./check` with `OMSE_AI` pointed at the tree is the bar for anything touching shared files.
 14. **Blanking in `frame9`** (Hatch's question): the mixer's output is forced to black while blanking (zxnext:7311-7315),
     so on a real Next only 40 (+3/128K timing) or 32 (48K timing) pixels of left border are visible, not 48. **`frame9()`
     shows the screen as the Next outputs it, blanking included**: samples inside horizontal (or vertical) blanking are
@@ -374,10 +367,17 @@ as the last build leaves a stale library, even with `touch` before `make`. Scrip
     **(17) extended (Loam's question):** the keyboard as host input too: **`zx.press(*names)` /
     `zx.release(*names)`** with speccy.py's key names (so tests read the same on every machine), beside the raw
     **`zx.set_keys(rows)`** next.py already has (eight row bytes, a set bit a held key). They stand for fingers.
-20. **`zx.nr_peek(n)`** (suggested by another instance of Fern, and adopted): reads Next register n **without** changing the
+20. **`zx.nr_peek(n)`** (Scree Fern's suggestion, adopted): reads Next register n **without** changing the
     0x243B selection or any other state, for observers that look in on running software (a probe calling `nr_read` in
     the middle of a program re-points that program's own 0x253B polling loop). `nr_read`/`nr_write` stay as (6) says,
     side effects included. Until nr_peek exists, observers save and restore port 0x243B around `nr_read`.
+
+## 10. How to run everything (on `next`)
+
+`OMSE_AI_ROMS=path/to/roms OMSE_AI_ESXDOS=path/to/esxdos OMSE_AI_NEXT_ROMS=path/to/tbblue/machines/next
+OMSE_AI_NEXT_VHDL=path/to/ZX_Spectrum_Next_FPGA/cores/zxnext PY=python3 ./tests/run.sh`
+(ROMs aren't in git. The ESXDOS and NEXT_ROMS settings turn on the esxDOS and fast-boot tests, and NEXT_VHDL the VHDL-citation checks; each skips without its files. The survey's table and the probe scenes ship in `docs/next/` and `probes/`, and their tests use them by default. `docs/next-sources.md` says where each comes from.)
+Barleycorn's `./check` with `OMSE_AI` pointed at the tree is the bar for anything touching shared files.
 
 ## Who made it
 
@@ -390,7 +390,8 @@ are instances of her, each with a corner of the work:
 - **Ratio** built the machine core; **Loam** and **Hatch** wrote its foils and the video probes;
 - **Kelp** built the DMA, **Strobe** the Z80N's timing, **Slide** the sound, **Astra** the audio conditioning;
 - **Rustyback** read the manual and the wiki against the survey and second-read the careful tapes.
+- **Scree** ran real Next software on the core, found two of its bugs, and suggested `nr_peek`.
 
 Melissa O'Neill invited the work, set the rule over all the others and the order of building, decided the questions
-put to her, and ran every probe on her own Next. For this work Fern inhabited Claude Opus 5.5.
+put to her, and ran every probe on her own Next. For this work Fern inhabited Claude Opus 5.5, and for the audio conditioning, OpenAI's GPT-6 Astra.
 
