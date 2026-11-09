@@ -1,5 +1,5 @@
 # Under the Rubber Keys: A Hacker's Guide to omse-ai
-describes-rev: 5668a96
+describes-rev: 6b4f6b6
 
 ## About this guide
 
@@ -22,7 +22,7 @@ Both machines run the same Z80 core, `src/z80.h`, from Andre Weissflog's chips p
 
 **Words.** The code and tests use words from the people who built it: "foil", "§N", "DESIGN.md §9.1 (N)", "ruling", "sitting", "PV1", "P-7", "mutant survivor", and the names of the instances of Fern (an AI agent) who wrote each part. Where they appear here, see the glossary at the end of this guide.
 
-**Known gaps.** Where something is approximate, or known to be wrong at this revision, this guide says so plainly, under "Known gap". A few were found by a review of this revision and have since been fixed on main. Those say so too, so you can tell what you're looking at.
+**Known gaps.** Where something is approximate, or known to be wrong at this revision, this guide says so plainly, under "Known gap". Some found by a review of this guide's first revision have since been fixed; where that matters, the section says so.
 
 **Reading a section.** Each numbered section says what the part is, what is load-bearing in it, what you must not disturb ("**Don't:**"), and its known gaps.
 
@@ -30,22 +30,17 @@ Both machines run the same Z80 core, `src/z80.h`, from Andre Weissflog's chips p
 
 ### One build
 
-Both machines are compiled into one shared library. `Makefile:19` is `$(CXX) $(CXXFLAGS) $(SHARED) -o $@ src/zxcore.cpp src/nextcore.cpp`, and every file in `src/` is a dependency (`Makefile:15`). `speccy.py` and `next.py` each load that library through ctypes and declare the functions they call (`speccy.py:120-176`, `next.py:30-76`). The two Python modules don't share a handle, and that's fine: it's one file on disk.
+Both machines are compiled into one shared library. `Makefile:19` is `$(CXX) $(CXXFLAGS) $(SHARED) -o $@ src/zxcore.cpp src/nextcore.cpp`, and every file in `src/` is a dependency (`Makefile:15`). `speccy.py` and `next.py` each load that library through ctypes and declare the functions they call (`speccy.py:123-179`, `next.py:30-76`). The two Python modules don't share a handle, and that's fine: it's one file on disk.
 
 The Z80's implementation is compiled once, in the classic machine's translation unit. `src/zxcore.cpp:33` defines `CHIPS_IMPL` before including `z80.h`. `src/nextcore.cpp:31` includes the same header without it, and links against the classic machine's copy (`src/nextcore.cpp:8-9`).
 
 ### Rebuilding
 
-Each Python side rebuilds the library when it thinks the library is stale, by running `make`. The two sides disagree about what stale means:
+Each Python side rebuilds the library when it thinks the library is stale, by running `make`. Both count every source in `src/`, as make does (`next.py:22`, `speccy.py:29`, `Makefile:14`), so an edit to any header rebuilds whichever side you use. (At this guide's first revision `speccy.py` counted only four files.)
 
-- `next.py:22` counts every source in `src/`.
-- `speccy.py:29` counts four files: `LIB_SOURCES = [HERE / 'src' / n for n in ('zxcore.cpp', 'z80.h', 'ay38910.h', 'sdcard.h')]`.
+**Don't:** define `CHIPS_IMPL` in a second translation unit; it would duplicate the Z80.
 
-So if you edit a Next header and then use only `speccy.py`, nothing rebuilds. The classic machine doesn't need the new code, so this is harmless today. But it means the comment at `Makefile:14` claims more agreement than exists.
-
-**Don't:** define `CHIPS_IMPL` in a second translation unit; it would duplicate the Z80. **Don't:** add a file to `src/` that only one machine needs and expect `speccy.py` to notice it.
-
-**Known gap:** because both machines link into one library, the classic machine now builds only if the Next compiles. `MANUAL.md:242` still describes the core as having "no dependencies beyond the two chips headers".
+**Known gap:** because both machines link into one library, the classic machine now builds only if the Next compiles. `MANUAL.md:247` still describes the core as having "no dependencies beyond the two chips headers".
 
 ## 1. The pin contract: z80.h as both machines read it
 
@@ -129,7 +124,7 @@ Inferred, untested: a WAIT handed to the second I/O tick repeats the tick showin
 
 ### Instruction and machine-cycle boundaries
 
-`z80_opdone` (`src/z80.h:586-590`) is true when the last tick showed `M1|RD` with no prefix active: that tick was the T1 of an instruction's first fetch. Both machines use it as "between instructions". The classic machine's snapshot writer subtracts one from PC because of it (`src/zxcore.cpp:863`).
+`z80_opdone` (`src/z80.h:586-590`) is true when the last tick showed `M1|RD` with no prefix active: that tick was the T1 of an instruction's first fetch. Both machines use it as "between instructions". The classic machine's snapshot writer subtracts one from PC because of it (`src/zxcore.cpp:864`).
 
 `z80_mcycle_end` (`src/z80.h:525-584`) answers a different question: did the last tick end a machine cycle, as the Next's CPU (the T80N) divides an instruction? The Next's DMA can take the bus only there.
 
@@ -200,7 +195,7 @@ The CPU always sees a flat 64K in `mem`, so Python can read memory directly and 
 - **Banks 5 and 2 are special.** They always live in `mem` at 4000 and 8000. If one is also paged at C000, `mem_write` writes both copies (`src/zxcore.cpp:266-279`).
 - **`bank_ptr` finds a bank wherever it lives** (`src/zxcore.cpp:195-200`). Use it, never `bank[n]` directly.
 
-**Don't:** write into `mem` at 4000 or above except through `mem_write`. A direct write to C000 while bank 5 is there leaves 4000 stale. `zx_poke` goes through `mem_write` for exactly this reason (`src/zxcore.cpp:958-960`).
+**Don't:** write into `mem` at 4000 or above except through `mem_write`. A direct write to C000 while bank 5 is there leaves 4000 stale. `zx_poke` goes through `mem_write` for exactly this reason (`src/zxcore.cpp:959-961`).
 
 ### The divMMC, also by copying
 
@@ -225,7 +220,7 @@ A trap returns through a RET in the ROM: both traps call `redirect` with `ROM_RE
 
 ### Breakpoints stop after the fetch
 
-A breakpoint is an opcode fetch landing in a range. It is noticed in the tick that serves the fetch (`src/zxcore.cpp:627-635`), and `zx_run_until_pc` stops after that whole tick (`src/zxcore.cpp:913-923`). So at a classic stop:
+A breakpoint is an opcode fetch landing in a range. It is noticed in the tick that serves the fetch (`src/zxcore.cpp:627-635`), and `zx_run_until_pc` stops after that whole tick (`src/zxcore.cpp:914-924`). So at a classic stop:
 
 - the previous instruction has finished;
 - the fetch's T1 has happened;
@@ -235,16 +230,14 @@ That's why `go` reports `pc=15df` after settling at 0x15DE (`README.md:49`). The
 
 ### Snapshots
 
-SNA files, 48K or 128K (`src/zxcore.cpp:799-891`).
+SNA files, 48K or 128K (`src/zxcore.cpp:799-892`).
 
 - **Loading a 48K snapshot** jumps to the ROM's RETN at 0x0072, so the snapshot's own stack supplies PC (`src/zxcore.cpp:846`).
-- **Saving** first runs the machine to an instruction boundary (`src/zxcore.cpp:861`), so it does move the live machine forward a few T-states.
+- **Saving** first runs the machine to an instruction boundary (`src/zxcore.cpp:862`), so it does move the live machine forward a few T-states.
 
-**Known gaps at describes-rev (fixed on main after this revision):**
+**What a reload restores.** A 128 always saves the 128K layout, its paging lock included (`src/zxcore.cpp:857`), so `go` after `menu 48` resumes as a 128 with its AY and eight banks (`tests/test_omse_ai.py:186`). At this guide's first revision a locked 128 saved as a 48K. SNA holds no beam position: `zx_load_sna` calls `power_on`, which sets `line` and `cyc` to zero (`src/zxcore.cpp:731-732`), so a reloaded machine starts its frame at the interrupt. The FLASH phase and the 128's AY registers restart too. `MANUAL.md:36` and `MANUAL.md:188` say exactly that, and `go`, which saves after whole frames, is held to at most one instruction out of step (`tests/test_omse_ai.py:153`).
 
-- **A locked 128 saves as a 48K snapshot.** `src/zxcore.cpp:856` is `bool is128 = z->model == 128 && !z->locked;`. The 128's menu option "48 BASIC" locks the paging, so `go` with `boot128` and `menu 48` resumed as a 48K on its next call, without its AY.
-- **A load loses the frame position.** `zx_load_sna` calls `power_on`, which sets `line` and `cyc` to zero (`src/zxcore.cpp:731-732`), so the next interrupt arrives earlier than it would have. The FLASH phase and the 128's AY registers are lost the same way.
-- **The docs claimed more.** `MANUAL.md:36` and `MANUAL.md:188` claimed exact round trips. The test cited for it (`tests/test_omse_ai.py:137-149`) compares only the final screen of a program whose output doesn't depend on timing, so it couldn't see either loss.
+**Don't:** claim a reload is exact; it restores what SNA holds.
 
 ## 3. The Next's master tick and the three clocks
 
@@ -651,7 +644,7 @@ NR 0x02 (`src/nextcore.cpp:889-900`) requests the NMIs by bits 3 and 2 (section 
 
 `do_reset` (`src/nextcore.cpp:977-1084`) is both the hard reset (power-on, NR 0x02 bit 1, `zxn_reset(z, 1)`) and the soft one (NR 0x02 bit 0, `zxn_reset(z, 0)`, the firmware's handover).
 
-- **Reset values for plain registers** come from a generated table, `NR_RESET` (`src/nextregs_reset.inc:3-146`), applied at `src/nextcore.cpp:996` (hard) and `src/nextcore.cpp:1010` (soft). The table is generated by `tools/gen_nextregs.py:1-41` from the survey's register table, which isn't in this repository (see the glossary under "§N"). Registers whose reset value isn't a plain number are listed at the table's end (`src/nextregs_reset.inc:147-184`) and computed by hand in `do_reset`.
+- **Reset values for plain registers** come from a generated table, `NR_RESET` (`src/nextregs_reset.inc:3-146`), applied at `src/nextcore.cpp:996` (hard) and `src/nextcore.cpp:1010` (soft). The table is generated by `tools/gen_nextregs.py:1-41` from the survey's register table, `docs/next/nextregs.tsv` (see the glossary under "§N"). Registers whose reset value isn't a plain number are listed at the table's end (`src/nextregs_reset.inc:147-184`) and computed by hand in `do_reset`.
 - **The reset type.** Power-on is "100". The first soft reset after it reads "hard", and every later one "soft" (`src/nextcore.cpp:995`, `src/nextcore.cpp:1009`; the reference model is `tests/nextref.py:315-327`).
 - **What a soft reset alone does** (`src/nextcore.cpp:1011-1022`):
   - copies bits 3:0 into 7:4 for NR 0x80 and NR 0x8C;
@@ -809,7 +802,7 @@ The palette RAMs start all zero, so a bare machine's picture is black (`src/next
 - bitmaps encode their own addresses;
 - the probe cards PV1-PV6 are rebuilt from their scene definitions (see the glossary), where those are present.
 
-The model has a slow, cited path (`tests/nextvideo.py:525-690`) and a fast numpy path (`tests/nextvideo.py:700-968`). `ModelSense` checks that the two agree (`tests/test_next_video.py:192-213`).
+The model has a slow, cited path (`tests/nextvideo.py:525-690`) and a fast numpy path (`tests/nextvideo.py:700-968`). `ModelSense` checks that the two agree (`tests/test_next_video.py:193-214`).
 
 **Don't:** change `draw_pixel`'s compositing without a scene in `tests/test_next_video.py` that shows the difference. **Don't:** change the row mapping or the blanking without the ruling it rests on.
 
@@ -994,7 +987,7 @@ Each output sample goes into two paired queues: raw, scaled 0-29990, and conditi
 
 The conditioned stream passes through `zxaudio::Bias` (`src/audio_bias.h:13-84`), a causal controller. It returns long quiet stretches to exact PCM zero and leaves sound alone. Its Python reference is `zxaudio.py:22-112`, and `tests/test_audio_conformance.py` compiles the C header and compares every sample and state with the reference. The policy and its meanings are in `docs/audio-bias.md`.
 
-The classic machine's WAV writers use the Python controller directly (`speccy.py:788-834`, `zxay.py:141-170`). The classic 128's AY is a different core altogether, chips' `ay38910.h`, stepped in `src/zxcore.cpp:486-491`.
+The classic machine's WAV writers use the Python controller directly (`speccy.py:795-843`, `zxay.py:141-170`). The classic 128's AY is a different core altogether, chips' `ay38910.h`, stepped in `src/zxcore.cpp:486-491`.
 
 ### From Python
 
@@ -1098,7 +1091,7 @@ Both machines talk to an SD card through an SPI master. The card is the same mod
 
 ### The card
 
-`SDCard` (`src/sdcard.h:56-496`) is a card in SPI mode. It exchanges whole bytes: `xfer` (`src/sdcard.h:465-495`) takes the byte the host sends and returns the byte the card sends at the same time. It's backed by an image file of 512-byte sectors.
+`SDCard` (`src/sdcard.h:56-499`) is a card in SPI mode. It exchanges whole bytes: `xfer` (`src/sdcard.h:468-498`) takes the byte the host sends and returns the byte the card sends at the same time. It's backed by an image file of 512-byte sectors.
 
 **Writes.** A card inserted read-only still takes writes, into an in-memory overlay, so a program can write to it without changing the file (`src/sdcard.h:62`, `src/sdcard.h:170-176`).
 
@@ -1128,7 +1121,7 @@ That one-transfer lag is the real hardware's (`docs/divmmc.md:67`).
 
 The card is selected only when card 0 is selected and card 1 isn't: `(z.div_cs & 3) == 2` (`src/zxcore.cpp:370`).
 
-`spi_gap(16)` imposes the Next's rule on the classic divMMC: an access sooner than sixteen CPU clocks after the last one starts nothing and re-reads the last byte. It counts clocks with contention's holds taken out (`src/zxcore.cpp:331-351`, `speccy.py:717-723`).
+`spi_gap(16)` imposes the Next's rule on the classic divMMC: an access sooner than sixteen CPU clocks after the last one starts nothing and re-reads the last byte. It counts clocks with contention's holds taken out (`src/zxcore.cpp:331-351`, `speccy.py:724-730`).
 
 ### The Next's SPI master
 
@@ -1154,9 +1147,8 @@ The card exchanges its byte as the transfer begins. The byte received waits in a
 ### Known gaps at describes-rev
 
 - **Python can't clock the Next's SPI.** `io_out(0xEB, v)` and `io_in(0xEB)` from Python start no transfer (section 6).
-- **ACMD fallthrough.** An application command the card doesn't list falls through to the plain command of the same number (`src/sdcard.h:257-301`). CMD55 followed by CMD17 reads a block, where a real card treats ACMD17 as reserved.
-- **Reading past the last sector.** A multiple-block read that reaches the last sector stops sending data, rather than sending an error token (`src/sdcard.h:470-473`).
-- **A stale limit.** `docs/divmmc.md:112` still says SPI transfers take no time, which `spi_gap` and the Next contradict.
+- **Fixed since the first revision:** an application command the card doesn't list is an illegal command (`src/sdcard.h:297-299`, `tests/test_divmmc.py:461`); it used to fall through to the plain command of the same number.
+- **Reading past the last sector.** A multiple-block read that reaches the last sector stops sending data, rather than sending an error token (`src/sdcard.h:473-476`).
 
 ## 14. The divMMC on the Next, the multiface and the NMIs
 
@@ -1315,24 +1307,22 @@ Every cycle that reaches the connector is logged by `bus_cycle` (`src/nextcore.c
 
 | | `Speccy` | `Next` |
 |---|---|---|
-| Key matrix | Active low, built from held names (`speccy.py:355-360`) | `set_keys` is bit set = key down (`next.py:401-403`); `press` and `release` take names (`next.py:390-399`) |
+| Key matrix | Active low, built from held names (`speccy.py:362-367`) | `set_keys` is bit set = key down (`next.py:401-403`); `press` and `release` take names (`next.py:390-399`) |
 | A breakpoint stops | After the fetch: PC is the address + 1, the previous instruction complete (section 2) | Before it: PC is the address, the previous instruction's last step still to run (section 4) |
-| Time | Frames and T-states (`speccy.py:231-255`) | Master ticks `t28`, CPU edges `cpu_clocks`, frames (`next.py:287-303`) |
-| Typing BASIC | Closed-loop keyword typing (`speccy.py:427-478`) | None |
-| Snapshots | SNA load and save (`speccy.py:290-303`) | None |
-| Memory | `mem`, the CPU's flat 64K, live (`speccy.py:209`) | `peek` and `poke` through the page table (`next.py:326-337`); the raw `sram`, `bram5`, `bram7` (`next.py:219-221`) |
+| Time | Frames and T-states (`speccy.py:236-260`) | Master ticks `t28`, CPU edges `cpu_clocks`, frames (`next.py:287-303`) |
+| Typing BASIC | Closed-loop keyword typing (`speccy.py:434-485`) | None |
+| Snapshots | SNA load and save (`speccy.py:295-310`) | None |
+| Memory | `mem`, the CPU's flat 64K, live (`speccy.py:214`) | `peek` and `poke` through the page table (`next.py:326-337`); the raw `sram`, `bram5`, `bram7` (`next.py:219-221`) |
 | Pictures | `image` and `shot` from the indexed buffer, needing Pillow | `frame9` (lists), `frame9_array` and `image` (numpy, and Pillow for `image`) (`next.py:416-442`) |
-| Sound | Beeper edges as notes and WAV (`speccy.py:748-834`); the 128's AY through `zxay.py` | The mixer captured, resampled and conditioned (`next.py:612-695`) |
-| `sd_insert` | Raises on a bad image (`speccy.py:647-652`) | Returns the C code; -1 for a missing file (`next.py:447-454`) |
+| Sound | Beeper edges as notes and WAV (`speccy.py:755-843`); the 128's AY through `zxay.py` | The mixer captured, resampled and conditioned (`next.py:612-695`) |
+| `sd_insert` | Raises on a bad image (`speccy.py:654-659`) | Returns the C code; -1 for a missing file (`next.py:447-454`) |
 | `reset` | Not offered. `zx_reset` is a power cycle that clears RAM (`src/zxcore.cpp:792-797`) | `reset(hard=False)` is a soft reset (`next.py:280-281`, section 7) |
 
 ### API surprises
 
 These were found in a review of this revision:
 
-- **`Speccy.write_wav` needs `record_audio()` first.** Without it, it raises `AttributeError` on `_audio_level0` (`speccy.py:797`): a traceback, which `AGENTS.md:26` counts as a bug.
-- **`Speccy(sna=...)` with a 128K snapshot on the default 48K model** loads it as a 48K snapshot and pops a meaningless PC (`speccy.py:218-219`, `src/zxcore.cpp:816-847`). Only the script step `sna` picks the model by the file's size (`zxscript.py:218-228`).
-- **`screen_text` always reads the screen at 0x4000** (`zxkeys.py:333`), so on a 128 showing its shadow screen it reads the wrong one.
+- **Fixed since the first revision:** `write_wav` before `record_audio()` now says what to do; `Speccy(sna=...)` takes a 128K snapshot's model; and `screen_text` reads the shadow screen when a 128 shows it (`tests/test_omse_ai.py:212`, `tests/test_omse_ai.py:223`, `tests/test_omse_ai.py:229`).
 - **`Next.io_out` and `io_in` take no time**, and on port EB they don't clock the SD card (section 6).
 - **`Next.load` and `poke` write through the page table.** In a bare machine's config mode, 0000-3FFF is NR 0x04's page, and outside it ROM writes are dropped silently (section 5).
 - **`Next()` is not reproducible by default.** It sets its RTC to the host's clock, by a ruling. Pass a fixed `rtc=` for reproducible runs; `rtc=True` raises (section 12).
@@ -1344,7 +1334,7 @@ These were found in a review of this revision:
 
 ## 17. The test architecture
 
-`./tests/run.sh` runs `unittest discover` over `tests/` (`tests/run.sh:1-4`). What a test needs and doesn't find, it should skip with a reason. The external sources and the env vars that name them are in `docs/next-sources.md`; the classic ROMs are in `roms/README.md`; the esxDOS tests need `$OMSE_AI_ESXDOS` (`tests/test_divmmc.py:514-535`).
+`./tests/run.sh` runs `unittest discover` over `tests/` (`tests/run.sh:1-4`). What a test needs and doesn't find, it should skip with a reason. The external sources and the env vars that name them are in `docs/next-sources.md`; the classic ROMs are in `roms/README.md`; the esxDOS tests need `$OMSE_AI_ESXDOS` (`tests/test_divmmc.py:523-544`).
 
 ### Who wrote the tests, and from what
 
@@ -1383,7 +1373,7 @@ A foil's reference is only as good as its reading. `tests/test_next_ref.py` chec
 - the +3's all-RAM table (`tests/test_next_ref.py:110-113`);
 - the classic contention pattern, on thousands of random runs (`tests/test_next_ref.py:152-200`).
 
-The video model's fast path is checked against its slow, cited path (`tests/test_next_video.py:192-213`).
+The video model's fast path is checked against its slow, cited path (`tests/test_next_video.py:193-214`).
 
 ### Generated tables and their generators
 
@@ -1394,18 +1384,18 @@ Two files are generated, and each generator checks its own work:
 
 ### Mutants
 
-Most of the test suites here were tested by breaking the code on purpose and checking that a test failed (see the glossary under "mutant"). The documented runs cover contention, the floating bus, the divMMC and many of the Next's subsystems. The mutants were run in copies of the tree, outside this repository. Their results are recorded in comments and docs: `docs/contention.md:52`, `docs/contention.md:83-85`, `docs/divmmc.md:104`, and the "mutant survivor" notes on many Next tests. Each survivor that changed observable behaviour became a test. Those that couldn't be seen, the equivalent mutants, are recorded as such (`docs/divmmc.md:104`, `tests/test_next_video.py:1087`).
+Most of the test suites here were tested by breaking the code on purpose and checking that a test failed (see the glossary under "mutant"). The documented runs cover contention, the floating bus, the divMMC and many of the Next's subsystems. The mutants were run in copies of the tree, outside this repository. Their results are recorded in comments and docs: `docs/contention.md:52`, `docs/contention.md:83-85`, `docs/divmmc.md:104`, and the "mutant survivor" notes on many Next tests. Each survivor that changed observable behaviour became a test. Those that couldn't be seen, the equivalent mutants, are recorded as such (`docs/divmmc.md:104`, `tests/test_next_video.py:1088`).
 
 ### Probes
 
-The last word on the Next was Melissa O'Neill's real machine. Probe programs ran on it, and their screens were photographed (see the glossary under "sitting" and "probe"). Where a probe's scene is defined in code, the test suite rebuilds it and compares the emulator with the model. The probe scene definitions live outside this repository, so those tests skip without them (`tests/test_next_video.py:1318-1457`). The cells the photographs showed are written into tests as expected values, for example `tests/test_z80n.py:784-798` and `tests/test_z80n.py:867-887`.
+The last word on the Next was Melissa O'Neill's real machine. Probe programs ran on it, and their screens were photographed (see the glossary under "sitting" and "probe"). Where a probe's scene is defined in code, the test suite rebuilds it and compares the emulator with the model. The probes' scenes and models are in `probes/`, where the tests find them (`tests/test_next_video.py:22-23`, `tests/test_next_video.py:1319-1462`). The cells the photographs showed are written into tests as expected values, for example `tests/test_z80n.py:784-798` and `tests/test_z80n.py:867-887`.
 
 ### Known weak tests at describes-rev
 
-- **`tests/test_omse_ai.py:137-149` doesn't test what it claims.** It's meant to show a snapshot resumes exactly, but it compares only the final screen of a program whose output doesn't depend on timing (section 2).
+- **The snapshot round trip** is now two tests that each say what they check: memory and registers (`tests/test_omse_ai.py:137`), and the beam (`tests/test_omse_ai.py:153`). At the first revision one test claimed both and could see neither.
 - **`tests/test_next_fastboot.py:38-44` skips too much.** It skips on any exception whose text contains "rom", which includes "from".
 - **Three SPI tests pass if the card answers nothing.** `tests/test_next_spi.py:130-136` and `tests/test_next_spi.py:176-179` assert only that the reply isn't the expected one, which a card answering nothing would satisfy. The boundary subclass also removes the test that would anchor them (`tests/test_next_spi.py:168-169`).
-- **Several tests reached outside the repository** at the guide's first revision, reading from or writing to paths in the original builders' home directories. They now take every outside source from a setting (`docs/next-sources.md`) and write their failure pictures to `tests/out/` (`tests/test_next_video.py:21-23`). One of them, an environment default set at import, had made a stranger's whole run error.
+- **Several tests reached outside the repository** at the guide's first revision, reading from or writing to paths in the original builders' home directories. They now take every outside source from a setting or from the repository itself (`docs/next-sources.md`) and write their failure pictures to `tests/out/` (`tests/test_next_video.py:21-23`). One of them, an environment default set at import, had made a stranger's whole run error.
 - **numpy is imported at the top of four test modules**, so without it they fail to import rather than skip (`tests/test_audio_conformance.py:15`, `tests/test_audio_native.py:6`, `tests/test_next_image.py:9`, `tests/test_next_sound.py:14`).
 
 **Don't:** weaken a foil's expected value to match the core; find out which is wrong, from the VHDL or a probe. **Don't:** add a test whose pass condition a broken feature would also satisfy; give it an anchor that shows the feature working.
@@ -1441,8 +1431,8 @@ The places a careful change is most likely to go wrong, gathered from the sectio
 - **Builder.** Whoever wrote a part of the core. Their tests, the "builder's tests", are written from the same VHDL as the code, by the same hand.
 - **Foil.** A test suite and its reference, written from the VHDL and the survey by someone other than the builder, who never read the builder's code, against the machine's Python contract only. A foil is meant to fail where two independent readings of the VHDL disagree. The foils here are Loam Fern's (`tests/nextref.py` and most `tests/test_next_*.py`) and Hatch Fern's (`tests/nextvideo.py`, `tests/floating_ref.py` and their tests). "Loam's foil" or "the video foil" means one of these.
 - **Reference.** A model in Python written from the documents, not from the code, that tests compare the machine against. Examples: `tests/nextref.py`, `tests/nextvideo.py`, `tests/floating_ref.py`, `tests/mcref.py`, the `Ref` classes in `tests/test_contention.py` and `tests/test_z80n.py`, and `zxaudio.py`. Code comments also say "ref §N", meaning the survey.
-- **The survey; §N; NEXT-MACHINE.md.** A survey of core 3.02.02 written during the build by Hart's-tongue Fern, every claim cited to the VHDL. "§N" in code and tests is a section of it. It isn't in this repository at this revision (`docs/next-sources.md:35-37`). Its register table, `machine/nextregs.tsv`, generates `src/nextregs_reset.inc`. `machine/` is the folder it lives in, with notes like `machine/ERRATA.md`, `machine/BUS-PINS.md` and `machine-build-notes.md`.
-- **DESIGN.md; §9; §9.1 (N).** The design written for the Next's build. Section 9, and its numbered items 9.1 (1) to 9.1 (20), are the contract between `next.py` and the tests: the API, the units, and what the tests may rely on. For example, §9.1 (11) is where a stop's counters are taken, and §9.1 (14) is what `frame9` shows. It isn't in this repository at this revision.
+- **The survey; §N; NEXT-MACHINE.md.** A survey of core 3.02.02 written during the build by Hart's-tongue Fern, every claim cited to the VHDL. "§N" in code and tests is a section of it. It's in this repository as `docs/next/NEXT-MACHINE.md` (`docs/next-sources.md:35-37`). Its register table, `docs/next/nextregs.tsv`, generates `src/nextregs_reset.inc`, whose header still names it by its old place, `machine/nextregs.tsv`. Notes cited as `machine/ERRATA.md`, `machine/BUS-PINS.md` and `machine-build-notes.md` were the builders' working notes, outside this repository.
+- **DESIGN.md; §9; §9.1 (N).** The design written for the Next's build. Section 9, and its numbered items 9.1 (1) to 9.1 (20), are the contract between `next.py` and the tests: the API, the units, and what the tests may rely on. For example, §9.1 (11) is where a stop's counters are taken, and §9.1 (14) is what `frame9` shows. It's in this repository as `docs/next/DESIGN.md`.
 - **D-N; "§9 D-5".** Numbered entries in DESIGN.md §9 that record a decision where the documents disagreed, or a known difference. Inferred from use, for example `tests/test_next_ctc.py:91` and `tests/test_next_ports.py:133`.
 - **Gap #N.** A numbered item in a list of known holes in the tests at some point in the build. Inferred from use (`tests/test_next_timing.py:486`, `tests/test_next_copper.py:183`).
 - **Ruling; ruling (18) j; ruling (19) b.** A decision Melissa O'Neill made where the VHDL, the documents and the hardware disagreed or were silent. The number is the DESIGN.md §9.1 item it belongs to, and the letter is the ruling within it. Examples: the RTC on by default and counting emulated time is (18) j (`next.py:197-200`); the expansion bus's INT loop is (19) b (`tests/test_next_bus.py:415-430`).
@@ -1454,7 +1444,7 @@ The places a careful change is most likely to go wrong, gathered from the sectio
   - **P-3**: the CTC's channels 4-7 (`tests/test_next_ctc.py:91`);
   - **P-7**: the INT pulse timed against a contention-synchronised loop (`docs/contention.md:67`);
   - **P-11**: an expectation about NR 0x02's NMI flag (`tests/test_next_copper.py:141`);
-  - **PV1 to PV6, or P-V1**: the video cards. PV1 is the layer-order card (`tests/test_next_video.py:707-771`), PV2 sprites, PV3 blending, PV4 Layer 2, PV5 and PV6 the sprite renderer's budget and deadline (`src/nextcore.cpp:1603`, `tests/nextvideo.py:1026-1032`);
+  - **PV1 to PV6, or P-V1**: the video cards. PV1 is the layer-order card (`tests/test_next_video.py:708-772`), PV2 sprites, PV3 blending, PV4 Layer 2, PV5 and PV6 the sprite renderer's budget and deadline (`src/nextcore.cpp:1603`, `tests/nextvideo.py:1026-1032`);
   - **D-12's photo**: a photograph recording NR 0x08's value (`tests/test_next_floating.py:166`);
   - **Z80NTIME, Z80NFLAG, Z80NFLG2**: Z80N timing and flag cards. BITF is one of Z80NTIME's cells (`src/z80.h:1004`, `tests/test_z80n.py:728`, `tests/test_z80n.py:809-811`);
   - **LDPIRX2, LDPIRX3**: LDPIRX's flags and its read (`src/nextcore.cpp:2372`, `tests/test_z80n.py:728`);
@@ -1468,7 +1458,7 @@ The places a careful change is most likely to go wrong, gathered from the sectio
 
 ### Testing words
 
-- **Mutant; mutant survivor; run N.** A mutant is a copy of the code broken on purpose in one small way, to see whether any test notices. A mutant survivor is one no test noticed, so it pointed at a missing test. "Mutant survivor 6, run 1" is the sixth survivor of the first run. An "equivalent mutant" changes nothing observable, so no test can catch it (`docs/divmmc.md:104`, `tests/test_next_video.py:1087`).
+- **Mutant; mutant survivor; run N.** A mutant is a copy of the code broken on purpose in one small way, to see whether any test notices. A mutant survivor is one no test noticed, so it pointed at a missing test. "Mutant survivor 6, run 1" is the sixth survivor of the first run. An "equivalent mutant" changes nothing observable, so no test can catch it (`docs/divmmc.md:104`, `tests/test_next_video.py:1088`).
 - **Anchor.** Two meanings. In a test, an assertion that shows the feature working, so the test can't pass by the feature being absent (`tests/test_next_divmmc.py:68-71`). In sprites, the sprite that relative sprites are positioned from (`src/nextcore.cpp:1558-1564`).
 
 ### The people named in the code
@@ -1575,7 +1565,7 @@ These are VHDL and other source files, by line, all under core 3.02.02's `cores/
 
 ### Paths outside this repository
 
-Paths like `next-build/...`, `foil-run/...`, `probes/...`, `z80n/NOTES.md`, `tests-notes.md` and `realsoft/repro/...` name the builders' working folders, outside this repository. They are kept as history; their contents aren't needed to run the tests.
+Paths in comments like `next-build/...`, `foil-run/...`, `z80n/NOTES.md`, `tests-notes.md` and `realsoft/repro/...` name the builders' working folders, outside this repository. They are kept as history; their contents aren't needed to run the tests. The survey, the design and the probes are in it: `docs/next/` and `probes/`.
 
 ## How this was made
 
