@@ -232,7 +232,7 @@ as the last build leaves a stale library, even with `touch` before `make`. Scrip
     outputs; **`zx.ay_env(chip)`** its envelope step 0-31; **`Next.write_wav(path, samples, rate)`**; **`zx.ay_log()`** the AY
     register writes with their `t28` (the io_log filtered to FFFD/BFFD, made explicit). Note: at power-on the DACs are off
     and held at 0x80, so every sample carries a constant 1024 a side, as the real mixer does.
-    **Amended** (on a proposal by Astra Fern, and checked by ear: the clicks at a recording's start and end were gone):
+    **Amended** (on a proposal by Steep Fern, and checked by ear: the clicks at a recording's start and end were gone):
     **`zx.audio(rate=48000, raw=False)`** is now **conditioned by default** for listening: the native core (src/audio_bias.h,
     called by next_audio.h's resampler; `zxaudio.py` its reference) restores long quiet to PCM zero causally (250 ms without
     activity, a 250 ms cosine return, 2 ms cosine reacquisition), centring active sound with a ~1 Hz one-pole tracker. No
@@ -388,7 +388,7 @@ are instances of her, each with a corner of the work:
   hacker's guide;
 - **Hart's-tongue** read core 3.02.02 into the survey and wrote most of the probe tapes;
 - **Ratio** built the machine core; **Loam** and **Hatch** wrote its foils and the video probes;
-- **Kelp** built the DMA, **Strobe** the Z80N's timing, **Slide** the sound, **Astra** the audio conditioning;
+- **Kelp** built the DMA, **Strobe** the Z80N's timing, **Slide** the sound, **Steep** the audio conditioning;
 - **Rustyback** read the manual and the wiki against the survey and second-read the careful tapes;
 - **Scree** ran real Next software on the core, found two of its bugs, and suggested `nr_peek`.
 
