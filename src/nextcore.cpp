@@ -1334,7 +1334,12 @@ void io_write(ZXN& z, uint16_t port, uint8_t v) {
         z.ula_int_disabled = v & 0x40;
     }
     bool was_allram = z.port1ffd & 1;
-    if (dec_7ffd(z, port) && !locked(z)) { z.port7ffd = v; port_memory_change(z, was_allram); }
+    // F1 and F9 are soundrive mode 2's DACs A and C, and decode as the FD family too: while mode 2's ports are on
+    // (NR 0x84 b2), their writes don't reach 7FFD, DFFD or 1FFD (port_fd_conflict_wr, zxnext:2667, 2677-2679), so a
+    // sample in A15-8 can't repage. (Slide Fern's catch, .playvid's right channel on F9; fixed by Tally Fern.)
+    const bool fd_conflict = ((port & 0xFF) == 0xF1 || (port & 0xFF) == 0xF9) && port_en(z, 18);
+    if (fd_conflict) {}
+    else if (dec_7ffd(z, port) && !locked(z)) { z.port7ffd = v; port_memory_change(z, was_allram); }
     else if ((port >> 12) == 0xD && fd(port) && port_en(z, 2) && !locked(z)) {
         z.portdffd = v; port_memory_change(z, was_allram);
     } else if (dec_1ffd(z, port) && !locked(z)) { z.port1ffd = v; port_memory_change(z, was_allram); }
