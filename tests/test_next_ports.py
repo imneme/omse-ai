@@ -158,5 +158,50 @@ class Joysticks(NextCase):
         self.assertEqual(zx.io_in(0x0037), 0x00, 'zxnext:3434, 2634')
 
 
+
+@needs_next
+class SoundriveConflict(NextCase):
+    """F1 and F9 are soundrive mode 2's DACs A and C (NR 0x84 b2, zxnext:2389, 2620-2622), and both decode as the FD
+    family too (A1:0 = 01, zxnext:2537). While mode 2's ports are on, a write there doesn't reach 7FFD, DFFD, 1FFD
+    or 3FFD (port_fd_conflict_wr, zxnext:2667, 2677-2683), so a sample in A15-8 can't repage memory. With them off,
+    the write is an ordinary paging write. (The foil, Tally Fern, after Slide Fern's catch: .playvid's right channel
+    on F9.)"""
+
+    def test_mode_2_off_f9_pages_like_the_fd_family(self):
+        zx = bare()
+        disable_bit(zx, 0x84, 2)
+        out(zx, 0x1FF9, 0x01)
+        self.assertEqual(mmu(zx), ref.all_ram_mmu(0), '1FF9 is a 1FFD write (zxnext:2558, 2679)')
+        out(zx, 0x1FF9, 0x00)
+        out(zx, 0x7FF9, 0x07)
+        self.assertEqual(mmu(zx)[6], 0x0E, '7FF9 is a 7FFD write: bank 7 at C000h (zxnext:2552, 2677)')
+
+    def test_mode_2_on_f9_does_not_repage(self):
+        zx = bare()                                     # NR 0x84 = FF at power-on: mode 2's ports on
+        before = mmu(zx)
+        out(zx, 0x1FF9, 0x01)
+        out(zx, 0x7FF9, 0x07)
+        out(zx, 0xDFF9, 0x01)
+        self.assertEqual(mmu(zx), before, 'port_fd_conflict_wr (zxnext:2667, 2677-2679)')
+
+    def test_mode_2_on_f1_does_not_repage(self):
+        zx = bare()
+        before = mmu(zx)
+        out(zx, 0x1FF1, 0x01)
+        out(zx, 0x7FF1, 0x07)
+        out(zx, 0xDFF1, 0x01)
+        self.assertEqual(mmu(zx), before, 'port_fd_conflict_wr (zxnext:2667, 2677-2679)')
+
+    def test_the_fd_family_itself_still_pages(self):
+        zx = bare()                                     # mode 2 on, but FD itself isn't F1 or F9
+        out(zx, 0x7FFD, 0x07)
+        self.assertEqual(mmu(zx)[6], 0x0E, 'zxnext:2677')
+
+
+def disable_bit(zx, reg, bit):
+    zx.nr_write(reg, zx.nr_read(reg) & ~(1 << bit) & 0xFF)
+    zx.run_ticks(64)                                    # sampled in memory cycles (zxnext:2408)
+
+
 if __name__ == '__main__':
     unittest.main()
